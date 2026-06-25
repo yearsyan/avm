@@ -25,4 +25,10 @@ cmake -S "${ROOT}/external/qemu" -B "${BUILD_DIR}" \
   -DGFXSTREAM=ON \
   -DANDROID_TARGET_TAG=darwin-aarch64
 
-cmake --build "${BUILD_DIR}" --target qemu-system-aarch64-headless emulator
+# gfxstream_backend is dlopen'd at runtime by libgfxstream_backend.dylib; it is
+# not pulled in by the headless/emulator link line, so build it explicitly.
+# Conan shared runtime dylibs are copied into lib64 by CMake.
+cmake --build "${BUILD_DIR}" --target aemu-conan-shared-runtime qemu-system-aarch64-headless emulator gfxstream_backend
+
+# Populate ${BUILD_DIR}/distribution/emulator for packaging.
+cmake --build "${BUILD_DIR}" --target install

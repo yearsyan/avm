@@ -217,6 +217,16 @@ function(generate_qemu2_sources)
   set(AUTOGEN "${gen_DEST}/qemu2-auto-generated")
   file(MAKE_DIRECTORY ${gen_DEST})
   file(COPY qemu2-auto-generated DESTINATION ${gen_DEST})
+  execute_process(
+    COMMAND bash ${ANDROID_QEMU2_TOP_DIR}/scripts/hxtool -h
+    INPUT_FILE ${ANDROID_QEMU2_TOP_DIR}/qemu-options.hx
+    OUTPUT_FILE ${AUTOGEN}/qemu-options.def
+    RESULT_VARIABLE qemu_options_result
+    ERROR_VARIABLE qemu_options_error)
+  if(NOT qemu_options_result EQUAL 0)
+    message(FATAL_ERROR
+            "Failed to generate qemu-options.def: ${qemu_options_error}")
+  endif()
   generate_traces(BACKEND ${gen_TRACE_BACKEND} GENERATED trace_src DEST
                   ${AUTOGEN})
   generate_qapi_lib(DEST ${AUTOGEN})

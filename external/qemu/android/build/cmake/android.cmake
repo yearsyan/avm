@@ -625,6 +625,10 @@ function(android_add_library)
 
   _register_target(${ARGN})
 
+  if((DARWIN_X86_64 OR DARWIN_AARCH64) AND TARGET aemu-conan-shared-runtime)
+    add_dependencies(${build_TARGET} aemu-conan-shared-runtime)
+  endif()
+
   if(LINUX)
     target_link_options(${build_TARGET} PRIVATE "LINKER:--build-id=sha1")
   endif()
@@ -888,6 +892,11 @@ function(android_add_executable)
   else()
     add_executable(${build_TARGET} ${REGISTERED_SRC})
   endif()
+
+  if((DARWIN_X86_64 OR DARWIN_AARCH64) AND TARGET aemu-conan-shared-runtime)
+    add_dependencies(${build_TARGET} aemu-conan-shared-runtime)
+  endif()
+
   target_link_libraries(${build_TARGET} PRIVATE ${build_DEPS})
 
   if(LINUX)
@@ -1035,6 +1044,18 @@ function(protobuf_generate_with_plugin)
 
   separate_arguments(PROTOPATH)
 
+  set(_protobuf_protoc_command protobuf::protoc)
+  if(DARWIN_X86_64 OR DARWIN_AARCH64)
+    get_property(_aemu_conan_runtime_library_path GLOBAL
+                 PROPERTY AEMU_CONAN_RUNTIME_LIBRARY_PATH)
+    if(_aemu_conan_runtime_library_path)
+      set(_protobuf_protoc_command
+          ${CMAKE_COMMAND} -E env
+          "DYLD_LIBRARY_PATH=${_aemu_conan_runtime_library_path}"
+          $<TARGET_FILE:protobuf::protoc>)
+    endif()
+  endif()
+
   set(_generated_srcs_all)
   foreach(_proto ${protobuf_generate_with_plugin_PROTOS})
     get_filename_component(_abs_file ${_proto} ABSOLUTE)
@@ -1066,7 +1087,8 @@ function(protobuf_generate_with_plugin)
     add_custom_command(
       OUTPUT ${_generated_srcs}
       COMMAND
-        protobuf::protoc ARGS --${protobuf_generate_with_plugin_LANGUAGE}_out
+        ${_protobuf_protoc_command} ARGS
+        --${protobuf_generate_with_plugin_LANGUAGE}_out
         ${_dll_export_decl}${protobuf_generate_with_plugin_PROTOC_OUT_DIR}
         ${_protobuf_include_path} ${PROTOPATH} ${_abs_file}
         ${protobuf_generate_with_plugin_PLUGIN}
@@ -1430,6 +1452,12 @@ function(android_build_qemu_variant)
         RUNTIME_OUTPUT_DIRECTORY
         "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/qemu/${ANDROID_TARGET_OS_FLAVOR}-${ANDROID_TARGET_ARCH}"
     )
+    if(DARWIN_X86_64 OR DARWIN_AARCH64)
+      set_property(TARGET ${qemu_build_EXE} APPEND PROPERTY INSTALL_RPATH
+                   "@executable_path/../../lib64")
+      set_property(TARGET ${qemu_build_EXE} PROPERTY
+                   INSTALL_RPATH_USE_LINK_PATH OFF)
+    endif()
     android_install_exe(
       ${qemu_build_EXE}
       "./qemu/${ANDROID_TARGET_OS_FLAVOR}-${ANDROID_TARGET_ARCH}")
@@ -1623,12 +1651,12 @@ function(android_install_shared_library)
   # Account for lib prefix when signing
   android_sign(
     INSTALL
-      ${CMAKE_INSTALL_PREFIX}/lib64/lib${TGT}${CMAKE_SHARED_LIBRARY_SUFFIX})
+      ${CMAKE_INSTALL_PREFIX}/lib64/lib${inst_TARGET}${CMAKE_SHARED_LIBRARY_SUFFIX})
 
   if(LINUX_AARCH64)
     install(
       CODE "if(CMAKE_INSTALL_DO_STRIP)
-                execute_process(COMMAND ${CMAKE_STRIP_CMD} ${CMAKE_INSTALL_PREFIX}/lib64/lib${TGT}${CMAKE_SHARED_LIBRARY_SUFFIX})
+                execute_process(COMMAND ${CMAKE_STRIP_CMD} ${CMAKE_INSTALL_PREFIX}/lib64/lib${inst_TARGET}${CMAKE_SHARED_LIBRARY_SUFFIX})
             endif()"
     )
   endif()

@@ -15,7 +15,14 @@ class AemuConan(ConanFile):
     generators = "VirtualBuildEnv", "VirtualRunEnv"
 
     default_options = {
-        "abseil/*:shared": False,
+        # protobuf must be a single shared instance: the protos module
+        # (android/emu/protos) assumes protobuf registers its descriptors into
+        # one shared runtime. A static protobuf gets private-linked into both
+        # libandroid-emu-protos.dylib and the main binary, splitting the
+        # descriptor pool and crashing textproto parsing (e.g. verified boot).
+        # abseil is shared too so it is not duplicated across protobuf.dylib
+        # and the main binary.
+        "abseil/*:shared": True,
         "flatbuffers/*:shared": False,
         "libusb/*:shared": False,
         "libxml2/*:shared": False,
@@ -23,7 +30,7 @@ class AemuConan(ConanFile):
         "libxml2/*:zlib": False,
         "libxml2/*:lzma": False,
         "lz4/*:shared": False,
-        "protobuf/*:shared": False,
+        "protobuf/*:shared": True,
         "protobuf/*:lite": False,
         "protobuf/*:upb": False,
         "protobuf/*:with_rtti": False,

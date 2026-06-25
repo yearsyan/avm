@@ -44,3 +44,4 @@ rules.ninja
 # Build directories copied in with upstream dependencies
 /external/crashpad/build/
 /external/lz4/build/
+build/
