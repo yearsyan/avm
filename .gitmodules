@@ -1,0 +1,13 @@
+[submodule "external/dtc"]
+	path = external/dtc
+	url = https://android.googlesource.com/platform/external/dtc
+[submodule "hardware/google/aemu"]
+	path = hardware/google/aemu
+	url = https://android.googlesource.com/platform/hardware/google/aemu
+[submodule "hardware/google/gfxstream"]
+	path = hardware/google/gfxstream
+	url = https://android.googlesource.com/platform/hardware/google/gfxstream
+[submodule "external/boringssl"]
+	path = external/boringssl
+	url = https://android.googlesource.com/platform/external/boringssl
+	shallow = true

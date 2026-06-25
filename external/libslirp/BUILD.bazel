@@ -1,0 +1,114 @@
+# Copyright 2025 - The Android Open Source Project
+#
+# Licensed under the Apache License, Version 2.0 (the',  help='License');
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an',  help='AS IS' BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""libslirp bazel build rule."""
+
+load("@bazel_skylib//rules:expand_template.bzl", "expand_template")
+load("@rules_cc//cc:cc_library.bzl", "cc_library")
+
+package(default_visibility = ["//visibility:public"])
+
+expand_template(
+    name = "slirp_version_header",
+    out = "src/libslirp-version.h",
+    substitutions = {
+        "@SLIRP_MAJOR_VERSION@": "",
+        "@SLIRP_MINOR_VERSION@": "",
+        "@SLIRP_MICRO_VERSION@": "",
+        "@SLIRP_VERSION_STRING@": "\"4.7.0\"",
+    },
+    template = "src/libslirp-version.h.in",
+)
+
+cc_library(
+    name = "libslirp",
+    srcs = [
+        "src/arp_table.c",
+        "src/bootp.c",
+        "src/cksum.c",
+        "src/dhcpv6.c",
+        "src/dnssearch.c",
+        "src/if.c",
+        "src/ip6_icmp.c",
+        "src/ip6_input.c",
+        "src/ip6_output.c",
+        "src/ip_icmp.c",
+        "src/ip_input.c",
+        "src/ip_output.c",
+        "src/mbuf.c",
+        "src/misc.c",
+        "src/ncsi.c",
+        "src/ndp_table.c",
+        "src/sbuf.c",
+        "src/slirp.c",
+        "src/socket.c",
+        "src/state.c",
+        "src/stream.c",
+        "src/tcp_input.c",
+        "src/tcp_output.c",
+        "src/tcp_subr.c",
+        "src/tcp_timer.c",
+        "src/tftp.c",
+        "src/udp.c",
+        "src/udp6.c",
+        "src/util.c",
+        "src/version.c",
+        "src/vmstate.c",
+    ] + select({
+        "@bazel_tools//src/conditions:linux_x86_64": ["src/ip_icmp_ping.c"],
+        "@bazel_tools//src/conditions:darwin": ["src/ip_icmp_ping.c"],
+        "//conditions:default": [],
+    }),
+    hdrs = glob(["src/*.h"]) + [":slirp_version_header"],
+    copts = select({
+        "@bazel_tools//src/conditions:windows": [
+            "-Wno-format-nonliteral",
+            "-Wno-unused-but-set-variable",
+            "-Wno-implicit-function-declaration",
+        ],
+        "//conditions:default": [
+            "-Wmissing-prototypes",
+            "-Wstrict-prototypes",
+            "-Wredundant-decls",
+            "-Wundef",
+            "-Wwrite-strings",
+        ],
+    }),
+    defines = [
+        "BUILDING_LIBSLIRP",
+    ] + select({
+        "@bazel_tools//src/conditions:windows": [
+            "NDEBUG=1",
+            "_FILE_OFFSET_BITS=64",
+            "_GNU_SOURCE=1",
+            "_LARGEFILE_SOURCE",
+            "_NO_EXCEPTIONS",
+            "_USE_MATH_DEFINES",
+            "_WIN32_WINNT=0x0601",
+            "__STDC_FORMAT_MACROS=1",
+            "__STDC_LIMIT_MACROS=1",
+        ],
+        "//conditions:default": [],
+    }),
+    includes = [
+        "src",
+    ],
+    linkopts = select({
+        "@bazel_tools//src/conditions:windows": [
+            "ws2_32.lib",
+            "iphlpapi.lib",
+        ],
+        "//conditions:default": [],
+    }),
+    deps = ["@glib//glib"],
+)

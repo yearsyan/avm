@@ -1,0 +1,46 @@
+# macOS/editor noise
+.DS_Store
+*.swp
+*.swo
+.cache/
+
+# CMake/Ninja generated files
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+compile_commands.json
+install_manifest.txt
+.ninja_deps
+.ninja_log
+build.ninja
+rules.ninja
+
+# Android Emulator/QEMU build output
+/external/qemu/objs/
+
+# Local prebuilt toolchains and binary dependency bundles.
+# Keep these outside git; restore them through sync/download/build scripts.
+/prebuilts/
+
+# Binary/archive fixtures and vendored build artifacts. This repository tracks
+# the cropped source shape; restore generated or packaged blobs separately.
+*.apk
+*.a
+*.class
+*.dylib
+*.gz
+*.img
+*.jar
+*.o
+*.pyc
+*.qcow2
+*.so
+*.tar
+*.tar.gz
+*.tgz
+*.xz
+*.zip
+
+# Build directories copied in with upstream dependencies
+/external/crashpad/build/
+/external/lz4/build/

@@ -1,0 +1,3 @@
+# This file is intentionally empty to prevent confusion.
+# It is expected that this module will only be loaded via the local registry and
+# so the MODULE.bazel contained there overrides anything placed here.

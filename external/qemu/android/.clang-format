@@ -1,0 +1,5 @@
+BasedOnStyle: Chromium
+IndentWidth: 4
+ContinuationIndentWidth: 8
+AccessModifierOffset: -4
+BreakStringLiterals: false

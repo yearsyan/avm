@@ -1,0 +1,17 @@
+/*
+ * Copyright (C) 2026 The Android Open Source Project
+ *
+ * Copyright (C) 2026 Google LLC
+ * The contents of this package are proprietary, confidential information, and
+ * are subject to a license agreement between Google and your company.
+ */
+
+syntax = "proto2";
+option optimize_for = LITE_RUNTIME;
+
+package lights_conn_proto;
+
+message LightStatus{
+    required uint32 light_id = 1;
+    required uint32 light_color = 2; // Packed in ARGB order.
+}

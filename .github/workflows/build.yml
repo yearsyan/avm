@@ -1,0 +1,109 @@
+name: Build Emulator
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      prebuilts_url:
+        description: "Optional prebuilts artifact URL produced by scripts/bootstrap-prebuilts.sh --make-artifact"
+        required: false
+        type: string
+      prebuilts_sha256:
+        description: "Optional SHA-256 for the prebuilts artifact"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-macos-arm64:
+    name: macOS arm64 distribution
+    runs-on: macos-15
+    timeout-minutes: 180
+    env:
+      MACOS_DEPLOYMENT_TARGET: "11.0"
+      BUILD_DIR: build/cmake
+      CONAN_DIR: build/conan
+      CONAN_HOME: .cache/conan-home
+      PREBUILTS_CACHE_DIR: .cache/prebuilts-src
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          submodules: recursive
+
+      - name: Cache Conan packages
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CONAN_HOME }}
+          key: conan-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('conanfile.py') }}
+          restore-keys: |
+            conan-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Install build tools
+        run: |
+          set -euo pipefail
+          brew list cmake >/dev/null 2>&1 || brew install cmake
+          brew list ninja >/dev/null 2>&1 || brew install ninja
+          python3 -m pip install --user "conan>=2,<3"
+          python_version="$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
+          python_bin="$HOME/Library/Python/${python_version}/bin"
+          echo "$python_bin" >> "$GITHUB_PATH"
+          "$python_bin/conan" profile detect --force
+
+      - name: Bootstrap prebuilts
+        env:
+          INPUT_PREBUILTS_URL: ${{ inputs.prebuilts_url }}
+          INPUT_PREBUILTS_SHA256: ${{ inputs.prebuilts_sha256 }}
+          SECRET_PREBUILTS_URL: ${{ secrets.AEMU_PREBUILTS_URL }}
+          SECRET_PREBUILTS_SHA256: ${{ secrets.AEMU_PREBUILTS_SHA256 }}
+        run: |
+          set -euo pipefail
+          prebuilts_url="${INPUT_PREBUILTS_URL:-${SECRET_PREBUILTS_URL:-}}"
+          prebuilts_sha256="${INPUT_PREBUILTS_SHA256:-${SECRET_PREBUILTS_SHA256:-}}"
+
+          if [[ -n "$prebuilts_url" ]]; then
+            args=(--from-artifact "$prebuilts_url" --force)
+            if [[ -n "$prebuilts_sha256" ]]; then
+              args+=(--artifact-sha256 "$prebuilts_sha256")
+            fi
+            ./scripts/bootstrap-prebuilts.sh "${args[@]}"
+          else
+            ./scripts/bootstrap-prebuilts.sh --from-git --cache-dir "$PREBUILTS_CACHE_DIR" --force
+          fi
+
+          ./scripts/bootstrap-prebuilts.sh --verify
+
+      - name: Build emulator
+        run: ./scripts/build_headless_macos.sh
+
+      - name: Package distribution
+        run: |
+          set -euo pipefail
+          dist_dir="$BUILD_DIR/distribution/emulator"
+          test -x "$dist_dir/emulator"
+          tar -czf "$RUNNER_TEMP/aemu-emulator-darwin-aarch64.tar.gz" -C "$BUILD_DIR/distribution" emulator
+          shasum -a 256 "$RUNNER_TEMP/aemu-emulator-darwin-aarch64.tar.gz" | tee "$RUNNER_TEMP/aemu-emulator-darwin-aarch64.sha256"
+          du -sh "$dist_dir" "$RUNNER_TEMP/aemu-emulator-darwin-aarch64.tar.gz"
+
+      - name: Upload distribution
+        uses: actions/upload-artifact@v4
+        with:
+          name: aemu-emulator-darwin-aarch64
+          path: |
+            ${{ runner.temp }}/aemu-emulator-darwin-aarch64.tar.gz
+            ${{ runner.temp }}/aemu-emulator-darwin-aarch64.sha256
+          if-no-files-found: error
+          retention-days: 14

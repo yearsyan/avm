@@ -1,0 +1,14 @@
+# AEMU macOS arm64 prebuilt input lock.
+#
+# Format:
+# repo <name> <destination-root> <git-url> <revision> <content-digest> <paths...>
+#
+# content-digest is sha256 over sorted lines of:
+#   <file-sha256>  <relative-path>
+#
+# The destination-root is relative to the repository root. Paths are relative to
+# that destination-root and are the only payload copied into this repository.
+
+repo clang-darwin-x86 prebuilts/clang/host/darwin-x86 https://android.googlesource.com/platform/prebuilts/clang/host/darwin-x86 f004c65fcef4383dd0e6ed74128a38dbd5f68c14 74b4cfe8e2e8c512ed64a11ac78d4b3a713174b5474b370c58fc0fea0a27bc13 clang-r596125
+repo android-emulator-common prebuilts/android-emulator-build/common https://android.googlesource.com/platform/prebuilts/android-emulator-build/common b77a01d8d87213b37c7dce78b1262c903e0405d7 cce9d6b665088093a12093b2bca93546b3d71912715c464d4799733bfcf53d5f ANGLE/darwin-aarch64 e2fsprogs/darwin-aarch64 vulkan/darwin-aarch64
+repo qemu-android-deps prebuilts/android-emulator-build/qemu-android-deps https://android.googlesource.com/platform/prebuilts/android-emulator-build/qemu-android-deps b06aee625002d0738c5576bbf437b9378229bef0 12bc339441f28ecbe6cc62fc4c80ad1b347b91d7bde165aa91b3d061e9c5a5e3 darwin-aarch64/include/pixman-1 darwin-aarch64/lib/libpixman-1.a

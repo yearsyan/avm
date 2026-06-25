@@ -1,0 +1,76 @@
+# Stage 1: Clone the repository
+FROM arm64v8/ubuntu:18.04 AS cloner
+
+USER root
+
+ARG VULKAN_LOADER_GIT_SHA
+
+# Install git
+RUN apt-get update && apt-get install -y git && rm -rf /var/lib/apt/lists/*
+
+# Clone the Vulkan-Loader repository
+WORKDIR /src
+RUN git clone https://github.com/KhronosGroup/Vulkan-Loader.git
+WORKDIR /src/Vulkan-Loader
+RUN git checkout ${VULKAN_LOADER_GIT_SHA}
+
+# Stage 2: Build the loader
+FROM arm64v8/ubuntu:18.04
+
+USER root
+
+ENV DEBIAN_FRONTEND=noninteractive
+ARG VULKAN_LOADER_GIT_SHA
+
+# Copy the source code from the cloner stage
+COPY --from=cloner /src/Vulkan-Loader /src/Vulkan-Loader
+
+# Install all necessary build dependencies
+RUN apt-get update && apt-get install -y \
+    git \
+    gcc \
+    g++ \
+    make \
+    libx11-dev \
+    libxext-dev \
+    libxfixes-dev \
+    libxi-dev \
+    libxrandr-dev \
+    libxrender-dev \
+    libxcb1-dev \
+    libffi-dev \
+    unzip \
+    zlib1g-dev \
+    libbz2-dev \
+    libssl-dev \
+    libncurses5-dev \
+    libsqlite3-dev \
+    libreadline-dev \
+    tk-dev \
+    libgdbm-dev \
+    uuid-dev \
+    python3.8 \
+    python3.8-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install a modern version of cmake from the Kitware PPA
+RUN apt-get update && apt-get install -y software-properties-common wget && \
+    wget -qO - https://apt.kitware.com/keys/kitware-archive-latest.asc | apt-key add - && \
+    apt-add-repository 'deb https://apt.kitware.com/ubuntu/ bionic main' && \
+    apt-get update && \
+    apt-get install -y cmake && \
+    rm -rf /var/lib/apt/lists/*
+
+# Set working directory
+WORKDIR /src/Vulkan-Loader
+
+# Build the Vulkan-Loader using cmake
+RUN mkdir build
+WORKDIR /src/Vulkan-Loader/build
+RUN cmake .. -DUPDATE_DEPS=On -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/opt/vulkan_loader
+RUN make -j$(nproc)
+
+# Install to a predictable location inside the image
+RUN make install
+RUN ldd --version
+RUN ldd /opt/vulkan_loader/lib/libvulkan.so

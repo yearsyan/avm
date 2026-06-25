@@ -1,0 +1,241 @@
+# darwin-aarch64 PUBLIC os/darwin/aarch64) android_target_link_libraries( glib2
+# darwin-x86_64 PUBLIC "-framework CoreFoundation" "-framework AppKit")
+
+# Let's add in the library, we are appending the binary type, as we will ship
+# multiple versions on m1.
+message(STATUS "Building glib2 for ${ANDROID_TARGET_TAG}")
+android_add_library(
+  TARGET
+  glib2_${ANDROID_TARGET_TAG}
+  SHARED
+  LIBNAME
+  glib-2.0
+  URL
+  "https://android.googlesource.com/platform/external/bluetooth/glib/+/refs/heads/emu-master-dev/"
+  SPDX
+  "LGPL-2.1-only"
+  LICENSE
+  "https://android.googlesource.com/platform/external/bluetooth/glib/+/refs/heads/emu-master-dev/COPYING"
+  LOCAL
+  "${ANDROID_QEMU2_TOP_DIR}/LICENSES/LICENSE.LGPLv21"
+  SRC
+  garcbox.c
+  garray.c
+  gasyncqueue.c
+  gatomic.c
+  gbacktrace.c
+  gbase64.c
+  gbitlock.c
+  gbookmarkfile.c
+  gbytes.c
+  gcharset.c
+  gchecksum.c
+  gconvert.c
+  gdataset.c
+  gdate.c
+  gdatetime.c
+  gdir.c
+  genviron.c
+  gerror.c
+  gfileutils.c
+  # ggettext.c # This requires the gettext packages.
+  ghash.c
+  ghmac.c
+  ghook.c
+  ghostutils.c
+  giochannel.c
+  gkeyfile.c
+  glib-init.c
+  glib-private.c
+  glist.c
+  gmain.c
+  gmappedfile.c
+  gmarkup.c
+  gmem.c
+  gmessages.c
+  gnode.c
+  goption.c
+  gpathbuf.c
+  gpattern.c
+  gpoll.c
+  gprimes.c
+  gprintf.c
+  gqsort.c
+  gquark.c
+  gqueue.c
+  grand.c
+  grcbox.c
+  grefcount.c
+  grefstring.c
+  # gregex.c
+  gscanner.c
+  gsequence.c
+  gshell.c
+  gslice.c
+  gslist.c
+  gstdio.c
+  gstrfuncs.c
+  gstring.c
+  gstringchunk.c
+  gstrvbuilder.c
+  gtestutils.c
+  gthread.c
+  gthreadpool.c
+  gtimer.c
+  gtimezone.c
+  gtrace-private.h
+  gtrace.c
+  gtranslit.c
+  gtrashstack.c
+  gtree.c
+  gunibreak.c
+  gunicollate.c
+  gunidecomp.c
+  guniprop.c
+  guri.c
+  guriprivate.h
+  gutf8.c
+  gutils.c
+  gutilsprivate.h
+  # guuid.c # needs libintl.h from gettext
+  gvariant-core.c
+  gvariant-parser.c
+  gvariant-serialiser.c
+  gvariant.c
+  gvarianttype.c
+  gvarianttypeinfo.c
+  gversion.c
+  gwakeup.c
+  libcharset/localcharset.c
+  WINDOWS
+  dirent/dirent.c
+  giowin32.c
+  gnulib/isnan.c
+  gnulib/printf-args.c
+  gnulib/printf-frexp.c
+  gnulib/printf-frexpl.c
+  gnulib/printf-parse.c
+  gnulib/printf.c
+  gnulib/vasnprintf.c
+  gspawn-win32.c
+  gthread-win32.c
+  gwin32.c
+  POSIX
+  giounix.c
+  glib-unix.c
+  glib-unixprivate.h
+  gspawn.c
+  gthread-posix.c
+  DARWIN
+  gosxutils.m
+  LINUX
+  gjournal-private.c)
+
+target_compile_options(
+  glib2_${ANDROID_TARGET_TAG}
+  PRIVATE -fvisibility=hidden
+          -Winvalid-pch
+          -Wextra
+          -Wpedantic
+          -std=gnu99
+          -fno-strict-aliasing
+          -Wimplicit-fallthrough
+          -Wmisleading-indentation
+          -Wmissing-field-initializers
+          -Wnonnull
+          -Wunused
+          -Wno-unused-parameter
+          -Wno-cast-function-type
+          -Wno-pedantic
+          -Wno-format-zero-length
+          -Wno-variadic-macros
+          -Werror=format=2
+          -Werror=init-self
+          -Werror=missing-include-dirs
+          -Werror=pointer-arith
+          -Werror=unused-result
+          -Wstrict-prototypes
+          -Wno-bad-function-cast
+          -Werror=implicit-function-declaration
+          -Werror=missing-prototypes
+          -Wduplicate-decl-specifier
+          -Werror=pointer-sign
+          -Wno-string-plus-int)
+
+target_compile_definitions(
+  glib2_${ANDROID_TARGET_TAG}
+  PRIVATE GLIB_COMPILATION _GNU_SOURCE G_DISABLE_CAST_CHECKS
+          GLIB_CHARSETALIAS_DIR="")
+
+android_target_include_directories(
+  glib2_${ANDROID_TARGET_TAG}
+  linux
+  PUBLIC
+  ../os/linux/glib
+  ../glib
+  ../os/linux
+  ..)
+
+android_target_include_directories(
+  glib2_${ANDROID_TARGET_TAG}
+  darwin
+  PUBLIC
+  ../os/darwin/glib
+  ../glib
+  ../os/darwin
+  ..)
+android_target_link_libraries(
+  glib2_${ANDROID_TARGET_TAG}
+  darwin
+  PUBLIC
+  "-framework CoreFoundation"
+  "-framework AppKit"
+  iconv
+  c)
+
+android_target_include_directories(
+  glib2_${ANDROID_TARGET_TAG}
+  windows
+  PUBLIC
+  ../os/windows/glib
+  ../glib
+  ../os/windows
+  ..)
+android_target_compile_definitions(
+  glib2_${ANDROID_TARGET_TAG}
+  windows
+  PRIVATE
+  UNICODE
+  _UNICODE
+  HAVE_ISNAN_IN_LIBC
+  HAVE_ISNAND_IN_LIBC
+  HAVE_ISNANF_IN_LIBC
+  HAVE_ISNANL_IN_LIBC)
+android_target_compile_options(
+  glib2_${ANDROID_TARGET_TAG}
+  windows
+  PRIVATE
+  -Wno-unknown-argument
+  -Wno-format
+  -Wno-unused-but-set-variable
+  -Wno-implicit-fallthrough
+  -Wno-format-nonliteral)
+
+android_target_link_libraries(glib2_${ANDROID_TARGET_TAG} windows PUBLIC
+                              ws2_32::ws2_32)
+android_install_shared_library(TARGET glib2_${ANDROID_TARGET_TAG})
+
+add_library(glib2 ALIAS glib2_${ANDROID_TARGET_TAG})
+android_license(
+  TARGET
+  "glib2"
+  LIBNAME
+  glib-2.0
+  URL
+  "https://android.googlesource.com/platform/external/bluetooth/glib/+/refs/heads/emu-master-dev/"
+  SPDX
+  "LGPL-2.1-only"
+  LICENSE
+  "https://android.googlesource.com/platform/external/bluetooth/glib/+/refs/heads/emu-master-dev/COPYING"
+  LOCAL
+  "${ANDROID_QEMU2_TOP_DIR}/LICENSES/LICENSE.LGPLv21")
