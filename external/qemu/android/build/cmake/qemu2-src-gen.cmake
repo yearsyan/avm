@@ -29,8 +29,11 @@ function(generate_trace)
   endif()
   list(APPEND DEPENDENCIES
        ${ANDROID_QEMU2_TOP_DIR}/${trace_SRC_DIR}/trace-events)
+  get_filename_component(trace_DEST_DIR "${trace_DEST}" DIRECTORY)
   add_custom_command(
     OUTPUT ${trace_DEST}
+    COMMAND
+      ${CMAKE_COMMAND} -E make_directory ${trace_DEST_DIR}
     COMMAND
       ${Python_EXECUTABLE} ${ANDROID_QEMU2_TOP_DIR}/scripts/tracetool.py
       --group=${trace_GROUP} --format=${trace_FORMAT}

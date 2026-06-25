@@ -58,7 +58,7 @@ The intended configure line after dependency wiring is:
 
 ```sh
 conan install . -of build/conan -s os=Macos -s arch=armv8 -s build_type=Release -r conancenter --build=missing
-cmake -S external/qemu -B build/cmake -DCMAKE_TOOLCHAIN_FILE=build/conan/conan_toolchain.cmake -DOPTION_AEMU_NO_QT_UI=ON -DOPTION_MINBUILD=ON -DANDROID_TARGET_TAG=darwin-aarch64
+cmake -S external/qemu -B build/cmake -DCMAKE_TOOLCHAIN_FILE=build/conan/conan_toolchain.cmake -DANDROID_TARGET_TAG=darwin-aarch64
 cmake --build build/cmake --target emulator qemu-system-aarch64-headless
 ```
 

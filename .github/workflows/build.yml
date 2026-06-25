@@ -34,7 +34,7 @@ jobs:
       MACOS_DEPLOYMENT_TARGET: "11.0"
       BUILD_DIR: build/cmake
       CONAN_DIR: build/conan
-      CONAN_HOME: .cache/conan-home
+      CONAN_HOME: ${{ github.workspace }}/.cache/conan-home
       PREBUILTS_CACHE_DIR: .cache/prebuilts-src
 
     steps:
@@ -57,11 +57,12 @@ jobs:
           set -euo pipefail
           brew list cmake >/dev/null 2>&1 || brew install cmake
           brew list ninja >/dev/null 2>&1 || brew install ninja
-          python3 -m pip install --user "conan>=2,<3"
-          python_version="$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
-          python_bin="$HOME/Library/Python/${python_version}/bin"
-          echo "$python_bin" >> "$GITHUB_PATH"
-          "$python_bin/conan" profile detect --force
+          conan_venv="$RUNNER_TEMP/conan-venv"
+          python3 -m venv "$conan_venv"
+          "$conan_venv/bin/python" -m pip install --upgrade pip
+          "$conan_venv/bin/python" -m pip install "conan>=2,<3"
+          echo "$conan_venv/bin" >> "$GITHUB_PATH"
+          "$conan_venv/bin/conan" profile detect --force
 
       - name: Bootstrap prebuilts
         env:
