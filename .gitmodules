@@ -6,7 +6,7 @@
 	url = https://android.googlesource.com/platform/hardware/google/aemu
 [submodule "hardware/google/gfxstream"]
 	path = hardware/google/gfxstream
-	url = https://android.googlesource.com/platform/hardware/google/gfxstream
+	url = https://github.com/yearsyan/gfxstream.git
 [submodule "external/boringssl"]
 	path = external/boringssl
 	url = https://android.googlesource.com/platform/external/boringssl
