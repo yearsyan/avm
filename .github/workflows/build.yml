@@ -36,6 +36,8 @@ jobs:
       CONAN_DIR: build/conan
       CONAN_HOME: ${{ github.workspace }}/.cache/conan-home
       PREBUILTS_CACHE_DIR: .cache/prebuilts-src
+      MACOS_RELEASE_ENTITLEMENTS: scripts/macos-release-entitlements.plist
+      MACOS_SIGNING_ENABLED: ${{ secrets.MACOS_SIGNING_CERTIFICATE_P12_BASE64 != '' && secrets.MACOS_SIGNING_CERTIFICATE_PASSWORD != '' && secrets.MACOS_CODESIGN_IDENTITY != '' && secrets.APPLE_NOTARY_APPLE_ID != '' && secrets.APPLE_NOTARY_APP_PASSWORD != '' && secrets.APPLE_TEAM_ID != '' }}
 
     steps:
       - name: Checkout
@@ -90,21 +92,109 @@ jobs:
       - name: Build emulator
         run: ./scripts/build_headless_macos.sh
 
+      - name: Import Developer ID certificate
+        if: env.MACOS_SIGNING_ENABLED == 'true'
+        env:
+          MACOS_SIGNING_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_SIGNING_CERTIFICATE_P12_BASE64 }}
+          MACOS_SIGNING_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_SIGNING_CERTIFICATE_PASSWORD }}
+          MACOS_CODESIGN_IDENTITY: ${{ secrets.MACOS_CODESIGN_IDENTITY }}
+          APPLE_NOTARY_APPLE_ID: ${{ secrets.APPLE_NOTARY_APPLE_ID }}
+          APPLE_NOTARY_APP_PASSWORD: ${{ secrets.APPLE_NOTARY_APP_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          keychain_path="$RUNNER_TEMP/aemu-signing.keychain-db"
+          keychain_password="$(uuidgen)"
+          certificate_path="$RUNNER_TEMP/developer-id-application.p12"
+
+          printf '%s' "$MACOS_SIGNING_CERTIFICATE_P12_BASE64" | base64 --decode > "$certificate_path"
+
+          security create-keychain -p "$keychain_password" "$keychain_path"
+          security set-keychain-settings -lut 21600 "$keychain_path"
+          security unlock-keychain -p "$keychain_password" "$keychain_path"
+          security import "$certificate_path" \
+            -f pkcs12 \
+            -k "$keychain_path" \
+            -P "$MACOS_SIGNING_CERTIFICATE_PASSWORD" \
+            -T /usr/bin/codesign \
+            -T /usr/bin/security
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: \
+            -s \
+            -k "$keychain_password" \
+            "$keychain_path"
+
+          xcrun notarytool store-credentials aemu-notary \
+            --apple-id "$APPLE_NOTARY_APPLE_ID" \
+            --team-id "$APPLE_TEAM_ID" \
+            --password "$APPLE_NOTARY_APP_PASSWORD" \
+            --keychain "$keychain_path"
+
+          echo "MACOS_CODESIGN_IDENTITY=$MACOS_CODESIGN_IDENTITY" >> "$GITHUB_ENV"
+          echo "MACOS_CODESIGN_KEYCHAIN=$keychain_path" >> "$GITHUB_ENV"
+
+      - name: Sign distribution
+        if: env.MACOS_SIGNING_ENABLED == 'true'
+        run: |
+          set -euo pipefail
+          ./scripts/sign_macos_distribution.sh \
+            --dist-dir "$BUILD_DIR/distribution/emulator" \
+            --identity "$MACOS_CODESIGN_IDENTITY" \
+            --entitlements "$MACOS_RELEASE_ENTITLEMENTS" \
+            --keychain "$MACOS_CODESIGN_KEYCHAIN"
+          codesign -d --entitlements :- "$BUILD_DIR/distribution/emulator/emulator"
+
       - name: Package distribution
         run: |
           set -euo pipefail
           dist_dir="$BUILD_DIR/distribution/emulator"
+          archive="$RUNNER_TEMP/aemu-emulator-darwin-aarch64.zip"
           test -x "$dist_dir/emulator"
-          tar -czf "$RUNNER_TEMP/aemu-emulator-darwin-aarch64.tar.gz" -C "$BUILD_DIR/distribution" emulator
-          shasum -a 256 "$RUNNER_TEMP/aemu-emulator-darwin-aarch64.tar.gz" | tee "$RUNNER_TEMP/aemu-emulator-darwin-aarch64.sha256"
-          du -sh "$dist_dir" "$RUNNER_TEMP/aemu-emulator-darwin-aarch64.tar.gz"
+          ditto -c -k --sequesterRsrc --keepParent "$dist_dir" "$archive"
+          du -sh "$dist_dir" "$archive"
+
+      - name: Notarize distribution
+        if: env.MACOS_SIGNING_ENABLED == 'true'
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/aemu-emulator-darwin-aarch64.zip"
+          notary_result="$RUNNER_TEMP/notary-result.json"
+
+          set +e
+          xcrun notarytool submit "$archive" \
+            --keychain-profile aemu-notary \
+            --keychain "$MACOS_CODESIGN_KEYCHAIN" \
+            --wait \
+            --output-format json > "$notary_result"
+          notary_exit=$?
+          set -e
+
+          cat "$notary_result"
+          submission_id="$(plutil -extract id raw -o - "$notary_result" 2>/dev/null || true)"
+          notary_status="$(plutil -extract status raw -o - "$notary_result" 2>/dev/null || true)"
+
+          if [[ "$notary_exit" -ne 0 || "$notary_status" != "Accepted" ]]; then
+            if [[ -n "$submission_id" ]]; then
+              xcrun notarytool log "$submission_id" \
+                --keychain-profile aemu-notary \
+                --keychain "$MACOS_CODESIGN_KEYCHAIN" || true
+            fi
+            exit 1
+          fi
+
+          spctl -a -vv -t execute "$BUILD_DIR/distribution/emulator/emulator"
+
+      - name: Generate checksum
+        run: |
+          set -euo pipefail
+          shasum -a 256 "$RUNNER_TEMP/aemu-emulator-darwin-aarch64.zip" | tee "$RUNNER_TEMP/aemu-emulator-darwin-aarch64.sha256"
 
       - name: Upload distribution
         uses: actions/upload-artifact@v4
         with:
           name: aemu-emulator-darwin-aarch64
           path: |
-            ${{ runner.temp }}/aemu-emulator-darwin-aarch64.tar.gz
+            ${{ runner.temp }}/aemu-emulator-darwin-aarch64.zip
             ${{ runner.temp }}/aemu-emulator-darwin-aarch64.sha256
           if-no-files-found: error
           retention-days: 14
