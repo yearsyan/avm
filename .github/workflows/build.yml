@@ -69,14 +69,6 @@ jobs:
           restore-keys: |
             pip-${{ runner.os }}-${{ runner.arch }}-
 
-      - name: Cache prebuilt source checkouts
-        uses: actions/cache@v4
-        with:
-          path: ${{ env.PREBUILTS_CACHE_DIR }}
-          key: prebuilts-src-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('prebuilts.lock') }}
-          restore-keys: |
-            prebuilts-src-${{ runner.os }}-${{ runner.arch }}-
-
       - name: Cache ccache
         uses: actions/cache@v4
         with:
