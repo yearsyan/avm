@@ -208,7 +208,8 @@ jobs:
             exit 1
           fi
 
-          spctl -a -vv -t execute "$BUILD_DIR/distribution/emulator/emulator"
+          codesign --verify --strict --verbose=2 "$BUILD_DIR/distribution/emulator/emulator"
+          codesign -dvv "$BUILD_DIR/distribution/emulator/emulator"
 
       - name: Generate checksum
         run: |
