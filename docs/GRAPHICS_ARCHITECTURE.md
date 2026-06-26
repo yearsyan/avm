@@ -119,6 +119,22 @@ IOSurface-backed and remove this extra GPU blit.
 The shell is also responsible for child process lifetime. It launches qemu in a
 new process group and terminates that group when the app exits.
 
+## Skin and Cutout Handling
+
+MacMu treats the guest display as a framebuffer, not as an Android Studio device
+frame. The core-only runtime does not project Android Emulator skin semantics
+into the guest:
+
+- no `qemu.skin` / `androidboot.qemu.skin` boot property is emitted;
+- no Pixel/device skin overlay packages are enabled through adb;
+- no skin layout cutout or rounded-corner overlay is enabled from the emulator
+  `layout` file;
+- no Pixel/Fold skin files are copied into userdata for display configuration.
+
+AVD hardware settings such as LCD width, height, density, and multi-touch remain
+active. The shell may add its own optional host-side decoration later, but the
+guest framebuffer remains free of emulator device-frame policy by default.
+
 ## Packaging
 
 CI produces three artifacts:
