@@ -50,33 +50,20 @@ if(LINUX_X86_64)
       # Shaders
       ${VULKAN_COMMON_DEPENDENCIES})
 elseif(DARWIN_X86_64 OR DARWIN_AARCH64)
+  # AEMU core-only / macOS: host GPU acceleration via MoltenVK. The software
+  # Vulkan ICDs (lavapipe/libLLVM, swiftshader, kosmickrisp) and the host-side
+  # SPIR-V tooling (glslangValidator, libz3, libzstd) are intentionally not
+  # installed: -gpu host never loads them, and macOS forces swiftshader/llvmpipe
+  # requests to swangle anyway (see emugl_config.cpp). Only the Vulkan loader
+  # and MoltenVK (the Apple-GPU bridge) are needed for the host path.
   set(VULKAN_DEPENDENCIES
       # Vulkan Loader
       "${PREBUILT_ROOT}/libvulkan.dylib>lib64/vulkan/libvulkan.dylib"
-      # Swiftshader
-      "${PREBUILT_ROOT}/icds/libvk_swiftshader.dylib>lib64/vulkan/libvk_swiftshader.dylib"
-      "${PREBUILT_ROOT}/icds/vk_swiftshader_icd.json>lib64/vulkan/vk_swiftshader_icd.json"
-      # Lavapipe
-      "${PREBUILT_ROOT}/icds/libvulkan_lvp.dylib>lib64/vulkan/libvulkan_lvp.dylib"
-      "${PREBUILT_ROOT}/icds/lvp_icd.json>lib64/vulkan/lvp_icd.json"
-      # Lavapipe dependencies
-      "${PREBUILT_ROOT}/icds/libLLVM.dylib>lib64/vulkan/libLLVM.dylib"
-      "${PREBUILT_ROOT}/icds/libz3.4.15.dylib>lib64/vulkan/libz3.4.15.dylib"
-      "${PREBUILT_ROOT}/icds/libzstd.1.dylib>lib64/vulkan/libzstd.1.dylib"
-      # for translating shaders to SPIRV
-      "${PREBUILT_ROOT}/glslangValidator>lib64/vulkan/glslangValidator"
-      # MoltenVK
+      # MoltenVK (Vulkan -> Metal, exposes the Apple GPU as a Vulkan device)
       "${PREBUILT_ROOT}/icds/libMoltenVK.dylib>lib64/vulkan/libMoltenVK.dylib"
       "${PREBUILT_ROOT}/icds/MoltenVK_icd.json>lib64/vulkan/MoltenVK_icd.json"
       # Shaders
       ${VULKAN_COMMON_DEPENDENCIES})
-      # KosmicKrisp is only necessary for mac_aarch64
-      if(DARWIN_AARCH64)
-        list(APPEND VULKAN_DEPENDENCIES
-          "${PREBUILT_ROOT}/icds/libvulkan_kosmickrisp.dylib>lib64/vulkan/libvulkan_kosmickrisp.dylib"
-          "${PREBUILT_ROOT}/icds/libkosmickrisp_icd.json>lib64/vulkan/libkosmickrisp_icd.json"
-        )
-      endif()
   set(VULKAN_TEST_DEPENDENCIES
       # Loader (for testing)
       "${PREBUILT_ROOT}/libvulkan.dylib>testlib64/libvulkan.dylib"

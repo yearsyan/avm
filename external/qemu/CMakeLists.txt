@@ -578,15 +578,13 @@ if(LINUX_X86_64)
 endif()
 
 if(DARWIN_X86_64 OR DARWIN_AARCH64)
-  # On Mac, ANGLE directly read the ICD file and find the Vulkan library (libvk_swiftshader).
-  set(ANGLE_RENDERER_DEPENDENCIES
-      "${ANDROID_QEMU2_TOP_DIR}/../../prebuilts/android-emulator-build/common/ANGLE/${ANDROID_TARGET_OS_FLAVOR}-${ANDROID_TARGET_ARCH}/lib/libEGL${CMAKE_SHARED_LIBRARY_SUFFIX}>lib64/gles_angle/libEGL${CMAKE_SHARED_LIBRARY_SUFFIX}"
-      "${ANDROID_QEMU2_TOP_DIR}/../../prebuilts/android-emulator-build/common/ANGLE/${ANDROID_TARGET_OS_FLAVOR}-${ANDROID_TARGET_ARCH}/lib/libGLESv2${CMAKE_SHARED_LIBRARY_SUFFIX}>lib64/gles_angle/libGLESv2${CMAKE_SHARED_LIBRARY_SUFFIX}"
-      "${ANDROID_QEMU2_TOP_DIR}/../../prebuilts/android-emulator-build/common/ANGLE/${ANDROID_TARGET_OS_FLAVOR}-${ANDROID_TARGET_ARCH}/lib/libvk_swiftshader${CMAKE_SHARED_LIBRARY_SUFFIX}>lib64/gles_angle/libvk_swiftshader${CMAKE_SHARED_LIBRARY_SUFFIX}"
-      "${ANDROID_QEMU2_TOP_DIR}/../../prebuilts/android-emulator-build/common/ANGLE/${ANDROID_TARGET_OS_FLAVOR}-${ANDROID_TARGET_ARCH}/lib/libswiftshader_libEGL${CMAKE_SHARED_LIBRARY_SUFFIX}>lib64/gles_angle/libswiftshader_libEGL${CMAKE_SHARED_LIBRARY_SUFFIX}"
-      "${ANDROID_QEMU2_TOP_DIR}/../../prebuilts/android-emulator-build/common/ANGLE/${ANDROID_TARGET_OS_FLAVOR}-${ANDROID_TARGET_ARCH}/lib/libswiftshader_libGLESv2${CMAKE_SHARED_LIBRARY_SUFFIX}>lib64/gles_angle/libswiftshader_libGLESv2${CMAKE_SHARED_LIBRARY_SUFFIX}"
-      "${ANDROID_QEMU2_TOP_DIR}/../../prebuilts/android-emulator-build/common/ANGLE/${ANDROID_TARGET_OS_FLAVOR}-${ANDROID_TARGET_ARCH}/lib/vk_swiftshader_icd.json>lib64/gles_angle/vk_swiftshader_icd.json"
-  )
+  # AEMU core-only / macOS: only -gpu host is supported. The ANGLE software
+  # renderer (libEGL/libGLESv2 plus the libvk_swiftshader/libswiftshader_lib*
+  # Vulkan/SwiftShader backend that lives under gles_angle/) is only loaded by
+  # -gpu swangle, which emugl_config.cpp forces swiftshader/llvmpipe into on
+  # macOS. The host GL path does not touch any of these, so none are installed.
+  # The ANGLE shader translator is installed separately via ANGLE_DEPENDENCIES.
+  set(ANGLE_RENDERER_DEPENDENCIES "")
   # Angle executables licensing information.
   android_license(
     TARGET ANGLE_RENDERER_DEPENDENCIES
