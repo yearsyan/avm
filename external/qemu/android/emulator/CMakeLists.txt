@@ -18,46 +18,48 @@ function(aemu_core_only_install_prebuilt_files DEPENDENCIES_TARGET)
   endforeach()
 endfunction()
 
-android_add_executable(
-  TARGET emulator INSTALL .
-  LICENSE Apache-2.0
-  SRC main-emulator.cpp
-  DEPS aemu-gl-init
-  android-emu-agents-headers
-  android-emu-avd
-  android-emu-base
-  android-emu-base-headers
-  android-emu-crash-initializer
-  android-emu-crashreport
-  android-emu-crashreport-consent-never
-  android-emu-files
-  android-emu-launch
-  android-emu-utils
-  android-hw-config
-  qemu-host-common-headers
-  ui::common
-  ui::window)
+if(NOT OPTION_AEMU_CORE_ONLY)
+  android_add_executable(
+    TARGET emulator INSTALL .
+    LICENSE Apache-2.0
+    SRC main-emulator.cpp
+    DEPS aemu-gl-init
+    android-emu-agents-headers
+    android-emu-avd
+    android-emu-base
+    android-emu-base-headers
+    android-emu-crash-initializer
+    android-emu-crashreport
+    android-emu-crashreport-consent-never
+    android-emu-files
+    android-emu-launch
+    android-emu-utils
+    android-hw-config
+    qemu-host-common-headers
+    ui::common
+    ui::window)
 
 
-add_resource(TARGET emulator RESOURCE ../images/emulator_icon.rc)
-target_include_directories(
-  emulator # This is not right!, an implicit dependency..
-  PRIVATE ${ANDROID_QEMU2_TOP_DIR}/android/android-emu)
-target_compile_definitions(
-  emulator
-  PRIVATE "-DCRASHUPLOAD=${OPTION_CRASHUPLOAD}"
-  "-DANDROID_SDK_TOOLS_REVISION=${OPTION_SDK_TOOLS_REVISION}"
-  "-DANDROID_SDK_TOOLS_BUILD_NUMBER=${OPTION_SDK_TOOLS_BUILD_NUMBER}")
-if(NOT WINDOWS)
-  target_link_libraries(emulator PRIVATE android-emu-feature)
-endif()
-# Make sure we have the qemu dependencies available.
-# AEMU core-only / macOS-aarch64: only the aarch64 headless engine is built.
-if(BUILDING_FOR_AARCH64)
-  add_dependencies(emulator qemu-system-aarch64-headless)
-else()
-  add_dependencies(emulator qemu-system-x86_64-headless
-                          qemu-system-aarch64-headless)
+  add_resource(TARGET emulator RESOURCE ../images/emulator_icon.rc)
+  target_include_directories(
+    emulator # This is not right!, an implicit dependency..
+    PRIVATE ${ANDROID_QEMU2_TOP_DIR}/android/android-emu)
+  target_compile_definitions(
+    emulator
+    PRIVATE "-DCRASHUPLOAD=${OPTION_CRASHUPLOAD}"
+    "-DANDROID_SDK_TOOLS_REVISION=${OPTION_SDK_TOOLS_REVISION}"
+    "-DANDROID_SDK_TOOLS_BUILD_NUMBER=${OPTION_SDK_TOOLS_BUILD_NUMBER}")
+  if(NOT WINDOWS)
+    target_link_libraries(emulator PRIVATE android-emu-feature)
+  endif()
+  # Make sure we have the qemu dependencies available.
+  # AEMU core-only / macOS-aarch64: only the aarch64 headless engine is built.
+  if(BUILDING_FOR_AARCH64)
+    add_dependencies(emulator qemu-system-aarch64-headless)
+  else()
+    add_dependencies(emulator qemu-system-x86_64-headless
+                            qemu-system-aarch64-headless)
+  endif()
 endif()
 
 set(PC_BIOS "${ANDROID_QEMU2_TOP_DIR}/pc-bios")
@@ -91,23 +93,31 @@ set(EMULATOR_HW_DEPENDENCIES "${HW_PROPERTIES_INI}>lib/hardware-properties.ini")
 
 # Install all the depencies in the right place during build.
 # AEMU core-only / no-Qt: no QT5/VIRTUAL_SCENE/SKIN/MACROS dependencies.
-android_target_dependency(emulator all EMULATOR_FEATURE_DEPENDENCIES)
-android_target_dependency(emulator all EMULATOR_KEYMAP_DEPENDENCIES)
-android_target_dependency(emulator all EMULATOR_BIOS_DEPENDENCIES)
-android_target_dependency(emulator windows SWIFTSHADER_DEPENDENCIES)
-android_target_dependency(emulator linux SWIFTSHADER_DEPENDENCIES)
-android_target_dependency(emulator linux LLVMPIPE_DEPENDENCIES)
-if(NOT LINUX_AARCH64)
-  android_target_dependency(emulator all ANGLE_DEPENDENCIES)
-  android_target_dependency(emulator all ANGLE_RENDERER_DEPENDENCIES)
+if(TARGET emulator)
+  set(AEMU_RUNTIME_DEPENDENCY_TARGET emulator)
+else()
+  set(AEMU_RUNTIME_DEPENDENCY_TARGET aemu-headless-runtime-dependencies)
+  add_library(${AEMU_RUNTIME_DEPENDENCY_TARGET} ${ANDROID_QEMU2_TOP_DIR}/dummy.c)
+  android_license(TARGET ${AEMU_RUNTIME_DEPENDENCY_TARGET} LIBNAME None SPDX None
+    LICENSE None LOCAL None)
 endif()
-android_target_dependency(emulator all RUNTIME_OS_DEPENDENCIES)
-android_target_dependency(emulator all E2FSPROGS_DEPENDENCIES)
-android_target_dependency(emulator all CERT_DEPEPENDENCIES)
-android_target_dependency(emulator all EMULATOR_HW_DEPENDENCIES)
-android_target_dependency(emulator all VULKAN_DEPENDENCIES)
-android_target_dependency(emulator linux TCMALLOC_OS_DEPENDENCIES)
-android_target_dependency(emulator windows_msvc-x86_64 MSVC_DEPENDENCIES)
+android_target_dependency(${AEMU_RUNTIME_DEPENDENCY_TARGET} all EMULATOR_FEATURE_DEPENDENCIES)
+android_target_dependency(${AEMU_RUNTIME_DEPENDENCY_TARGET} all EMULATOR_KEYMAP_DEPENDENCIES)
+android_target_dependency(${AEMU_RUNTIME_DEPENDENCY_TARGET} all EMULATOR_BIOS_DEPENDENCIES)
+android_target_dependency(${AEMU_RUNTIME_DEPENDENCY_TARGET} windows SWIFTSHADER_DEPENDENCIES)
+android_target_dependency(${AEMU_RUNTIME_DEPENDENCY_TARGET} linux SWIFTSHADER_DEPENDENCIES)
+android_target_dependency(${AEMU_RUNTIME_DEPENDENCY_TARGET} linux LLVMPIPE_DEPENDENCIES)
+if(NOT LINUX_AARCH64)
+  android_target_dependency(${AEMU_RUNTIME_DEPENDENCY_TARGET} all ANGLE_DEPENDENCIES)
+  android_target_dependency(${AEMU_RUNTIME_DEPENDENCY_TARGET} all ANGLE_RENDERER_DEPENDENCIES)
+endif()
+android_target_dependency(${AEMU_RUNTIME_DEPENDENCY_TARGET} all RUNTIME_OS_DEPENDENCIES)
+android_target_dependency(${AEMU_RUNTIME_DEPENDENCY_TARGET} all E2FSPROGS_DEPENDENCIES)
+android_target_dependency(${AEMU_RUNTIME_DEPENDENCY_TARGET} all CERT_DEPEPENDENCIES)
+android_target_dependency(${AEMU_RUNTIME_DEPENDENCY_TARGET} all EMULATOR_HW_DEPENDENCIES)
+android_target_dependency(${AEMU_RUNTIME_DEPENDENCY_TARGET} all VULKAN_DEPENDENCIES)
+android_target_dependency(${AEMU_RUNTIME_DEPENDENCY_TARGET} linux TCMALLOC_OS_DEPENDENCIES)
+android_target_dependency(${AEMU_RUNTIME_DEPENDENCY_TARGET} windows_msvc-x86_64 MSVC_DEPENDENCIES)
 # And install them for a release.
 android_install_dependency(all EMULATOR_FEATURE_DEPENDENCIES)
 android_install_dependency(all EMULATOR_KEYMAP_DEPENDENCIES)
@@ -147,7 +157,9 @@ android_license(TARGET "EMULATOR_FEATURE_DEPENDENCIES" LIBNAME None SPDX None
   LICENSE None LOCAL None)
 
 # And set the os specific properties
-android_target_properties(emulator all "${RUNTIME_OS_PROPERTIES}")
+if(TARGET emulator)
+  android_target_properties(emulator all "${RUNTIME_OS_PROPERTIES}")
+endif()
 
 # Install files we need.
 install(FILES ${ANDROID_QEMU2_TOP_DIR}/LICENSES/LICENSE.APACHE2 DESTINATION .

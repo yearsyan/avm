@@ -456,8 +456,8 @@ EOF
             $CROSS_PREFIX_FLAG \
             --target-list="$QEMU_TARGET_LIST" \
             --prefix=$PREFIX \
-            --extra-cflags="$EXTRA_CFLAGS -I/Users/lfy/emu/prebuilts/android-emulator-build/common/virglrenderer/darwin-aarch64/include/virgl -w" \
-            --extra-ldflags="$EXTRA_LDFLAGS -L/Users/lfy/emu/prebuilts/android-emulator-build/common/virglrenderer/darwin-aarch64/lib" \
+            --extra-cflags="$EXTRA_CFLAGS -I$AOSP_DIR/prebuilts/android-emulator-build/common/virglrenderer/darwin-aarch64/include/virgl -w" \
+            --extra-ldflags="$EXTRA_LDFLAGS -L$AOSP_DIR/prebuilts/android-emulator-build/common/virglrenderer/darwin-aarch64/lib" \
             --python=$PYTHON2 \
             $DEBUG_FLAGS \
             $LIBUSB_FLAGS \

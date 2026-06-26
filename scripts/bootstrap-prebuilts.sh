@@ -10,7 +10,7 @@ CACHE_DIR="${ROOT}/.cache/prebuilts-src"
 MODE=""
 LOCAL_ROOT=""
 ARTIFACT=""
-ARTIFACT_SHA256="${AEMU_PREBUILTS_ARTIFACT_SHA256:-}"
+ARTIFACT_SHA256="${MACMU_PREBUILTS_ARTIFACT_SHA256:-${AEMU_PREBUILTS_ARTIFACT_SHA256:-}}"
 MAKE_ARTIFACT=""
 FORCE=0
 SKIP_DIGEST=0
@@ -31,6 +31,9 @@ Options:
   --skip-digest           Skip content digest verification.
   --force                 Replace locked prebuilt paths if they already exist.
   -h, --help              Show this help.
+
+Environment:
+  MACMU_PREBUILTS_ARTIFACT_SHA256
 EOF
 }
 

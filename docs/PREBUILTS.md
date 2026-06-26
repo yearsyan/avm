@@ -36,7 +36,7 @@ machine.
 If a full Android Emulator checkout is already available, initialize from it:
 
 ```sh
-./scripts/bootstrap-prebuilts.sh --from-local /Users/u/workspace/android-emu --force
+./scripts/bootstrap-prebuilts.sh --from-local <android-emu-checkout> --force
 ```
 
 The script checks that each source prebuilt repository is at the locked

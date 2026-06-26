@@ -6,9 +6,9 @@ usage() {
 Usage:
   sign_macos_distribution.sh --dist-dir DIR --identity IDENTITY --entitlements FILE [--keychain KEYCHAIN]
 
-Signs every Mach-O file in an emulator distribution with a Developer ID
-identity. Libraries are signed first without process entitlements; the emulator
-launcher and qemu executables are signed last with the supplied entitlements.
+Signs every Mach-O file in a MacMu distribution with a Developer ID
+identity. Libraries and the external shell are signed first without process
+entitlements; qemu executables are signed last with the supplied entitlements.
 
 Environment fallbacks:
   MACOS_CODESIGN_IDENTITY
@@ -79,7 +79,7 @@ is_macho() {
 
 needs_process_entitlements() {
   local rel="$1"
-  [[ "$rel" == "emulator" || "$rel" == qemu/* ]]
+  [[ "$rel" == qemu/* ]]
 }
 
 macho_files=()
