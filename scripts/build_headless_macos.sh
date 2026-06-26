@@ -69,10 +69,14 @@ fi
 
 cmake "${cmake_args[@]}"
 
+# Runtime data files are installed from the build tree, and install-all
+# dependencies are disabled for this core-only build, so build the aggregate
+# runtime dependency target explicitly before cmake --install.
 # gfxstream_backend is dlopen'd at runtime by libgfxstream_backend.dylib; it is
 # not pulled in by the qemu headless link line, so build it explicitly.
 # Conan shared runtime dylibs are copied into lib64 by CMake.
 cmake_build --target \
+  aemu-headless-runtime-dependencies \
   aemu-conan-shared-runtime \
   glib2_darwin-aarch64 \
   mksdcard \
