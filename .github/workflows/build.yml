@@ -106,12 +106,21 @@ jobs:
           keychain_path="$RUNNER_TEMP/aemu-signing.keychain-db"
           keychain_password="$(uuidgen)"
           certificate_path="$RUNNER_TEMP/developer-id-application.p12"
+          echo "::add-mask::$keychain_password"
 
           printf '%s' "$MACOS_SIGNING_CERTIFICATE_P12_BASE64" | base64 --decode > "$certificate_path"
 
           security create-keychain -p "$keychain_password" "$keychain_path"
           security set-keychain-settings -lut 21600 "$keychain_path"
           security unlock-keychain -p "$keychain_password" "$keychain_path"
+          current_keychains=()
+          while IFS= read -r keychain; do
+            keychain="${keychain#\"}"
+            keychain="${keychain%\"}"
+            current_keychains+=("$keychain")
+          done < <(security list-keychains -d user | sed 's/^[[:space:]]*//')
+          security list-keychains -d user -s "$keychain_path" "${current_keychains[@]}"
+          security default-keychain -d user -s "$keychain_path"
           security import "$certificate_path" \
             -f pkcs12 \
             -k "$keychain_path" \
@@ -126,8 +135,15 @@ jobs:
 
           identity_report="$RUNNER_TEMP/codesigning-identities.txt"
           security find-identity -v -p codesigning "$keychain_path" | tee "$identity_report"
-          if ! grep -Fq "$MACOS_CODESIGN_IDENTITY" "$identity_report"; then
+          identity_matches="$(grep -F "$MACOS_CODESIGN_IDENTITY" "$identity_report" || true)"
+          identity_match_count="$(printf '%s\n' "$identity_matches" | sed '/^$/d' | wc -l | tr -d ' ')"
+          if [[ "$identity_match_count" != "1" ]]; then
             echo "::error::MACOS_CODESIGN_IDENTITY was not found in the imported signing keychain. Check that the P12 includes the Developer ID Application private key and that the identity secret matches one of the listed identities."
+            exit 1
+          fi
+          resolved_codesign_identity="$(printf '%s\n' "$identity_matches" | awk 'NR == 1 { print $2 }')"
+          if [[ -z "$resolved_codesign_identity" ]]; then
+            echo "::error::Unable to resolve a codesign identity SHA-1 from the imported signing keychain."
             exit 1
           fi
 
@@ -137,13 +153,16 @@ jobs:
             --password "$APPLE_NOTARY_APP_PASSWORD" \
             --keychain "$keychain_path"
 
-          echo "MACOS_CODESIGN_IDENTITY=$MACOS_CODESIGN_IDENTITY" >> "$GITHUB_ENV"
+          echo "MACOS_CODESIGN_IDENTITY=$resolved_codesign_identity" >> "$GITHUB_ENV"
           echo "MACOS_CODESIGN_KEYCHAIN=$keychain_path" >> "$GITHUB_ENV"
+          echo "MACOS_CODESIGN_KEYCHAIN_PASSWORD=$keychain_password" >> "$GITHUB_ENV"
 
       - name: Sign distribution
         if: env.MACOS_SIGNING_ENABLED == 'true'
         run: |
           set -euo pipefail
+          security unlock-keychain -p "$MACOS_CODESIGN_KEYCHAIN_PASSWORD" "$MACOS_CODESIGN_KEYCHAIN"
+          security find-identity -v -p codesigning "$MACOS_CODESIGN_KEYCHAIN"
           ./scripts/sign_macos_distribution.sh \
             --dist-dir "$BUILD_DIR/distribution/emulator" \
             --identity "$MACOS_CODESIGN_IDENTITY" \
