@@ -35,6 +35,13 @@ jobs:
       BUILD_DIR: build/cmake
       CONAN_DIR: build/conan
       CONAN_HOME: ${{ github.workspace }}/.cache/conan-home
+      CMAKE_GENERATOR: Ninja
+      CCACHE_BASEDIR: ${{ github.workspace }}
+      CCACHE_COMPILERCHECK: content
+      CCACHE_DIR: ${{ github.workspace }}/.cache/ccache
+      CCACHE_MAXSIZE: 2G
+      CCACHE_NOHASHDIR: "1"
+      PIP_CACHE_DIR: ${{ github.workspace }}/.cache/pip
       PREBUILTS_CACHE_DIR: .cache/prebuilts-src
       MACOS_RELEASE_ENTITLEMENTS: scripts/macos-release-entitlements.plist
       MACOS_SIGNING_ENABLED: ${{ secrets.MACOS_SIGNING_CERTIFICATE_P12_BASE64 != '' && secrets.MACOS_SIGNING_CERTIFICATE_PASSWORD != '' && secrets.MACOS_CODESIGN_IDENTITY != '' && secrets.APPLE_NOTARY_APPLE_ID != '' && secrets.APPLE_NOTARY_APP_PASSWORD != '' && secrets.APPLE_TEAM_ID != '' }}
@@ -54,17 +61,44 @@ jobs:
           restore-keys: |
             conan-${{ runner.os }}-${{ runner.arch }}-
 
+      - name: Cache pip downloads
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.PIP_CACHE_DIR }}
+          key: pip-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.github/workflows/build.yml') }}
+          restore-keys: |
+            pip-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Cache prebuilt source checkouts
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.PREBUILTS_CACHE_DIR }}
+          key: prebuilts-src-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('prebuilts.lock') }}
+          restore-keys: |
+            prebuilts-src-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ccache-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ runner.os }}-${{ runner.arch }}-
+
       - name: Install build tools
         run: |
           set -euo pipefail
           brew list cmake >/dev/null 2>&1 || brew install cmake
           brew list ninja >/dev/null 2>&1 || brew install ninja
+          brew list ccache >/dev/null 2>&1 || brew install ccache
           conan_venv="$RUNNER_TEMP/conan-venv"
           python3 -m venv "$conan_venv"
           "$conan_venv/bin/python" -m pip install --upgrade pip
           "$conan_venv/bin/python" -m pip install "conan>=2,<3"
           echo "$conan_venv/bin" >> "$GITHUB_PATH"
           "$conan_venv/bin/conan" profile detect --force
+          ccache --set-config=max_size="$CCACHE_MAXSIZE"
+          ccache --zero-stats
 
       - name: Bootstrap prebuilts
         env:
@@ -91,6 +125,14 @@ jobs:
 
       - name: Build emulator
         run: ./scripts/build_headless_macos.sh
+
+      - name: Show ccache stats
+        if: always()
+        run: |
+          set -euo pipefail
+          if command -v ccache >/dev/null 2>&1; then
+            ccache --show-stats
+          fi
 
       - name: Import Developer ID certificate
         if: env.MACOS_SIGNING_ENABLED == 'true'
