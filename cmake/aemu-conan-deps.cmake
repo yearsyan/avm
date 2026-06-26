@@ -83,7 +83,6 @@ set(_AEMU_CONAN_RUNTIME_DYLIBS)
 if(DARWIN_X86_64 OR DARWIN_AARCH64)
   aemu_collect_conan_runtime_dylibs(_AEMU_PROTOBUF_RUNTIME_DYLIBS protobuf
                                     "libprotobuf*.dylib"
-                                    "libprotoc*.dylib"
                                     "libutf8_*.dylib")
   aemu_collect_conan_runtime_dylibs(_AEMU_ABSL_RUNTIME_DYLIBS abseil
                                     "libabsl_*.dylib")

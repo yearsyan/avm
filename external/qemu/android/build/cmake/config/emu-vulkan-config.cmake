@@ -56,11 +56,58 @@ elseif(DARWIN_X86_64 OR DARWIN_AARCH64)
   # installed: -gpu host never loads them, and macOS forces swiftshader/llvmpipe
   # requests to swangle anyway (see emugl_config.cpp). Only the Vulkan loader
   # and MoltenVK (the Apple-GPU bridge) are needed for the host path.
+  set(AEMU_MOLTENVK_DYLIB "${PREBUILT_ROOT}/icds/libMoltenVK.dylib")
+  if(DARWIN_AARCH64)
+    find_program(AEMU_LIPO lipo)
+    if(NOT AEMU_LIPO)
+      message(FATAL_ERROR "lipo is required to thin MoltenVK for macOS arm64")
+    endif()
+
+    set(AEMU_THIN_MOLTENVK_DYLIB
+        "${CMAKE_BINARY_DIR}/thin-prebuilts/vulkan/${ANDROID_TARGET_TAG}/icds/libMoltenVK.dylib")
+    file(MAKE_DIRECTORY
+         "${CMAKE_BINARY_DIR}/thin-prebuilts/vulkan/${ANDROID_TARGET_TAG}/icds")
+    execute_process(
+      COMMAND "${AEMU_LIPO}" -info "${AEMU_MOLTENVK_DYLIB}"
+      OUTPUT_VARIABLE AEMU_MOLTENVK_LIPO_INFO
+      ERROR_VARIABLE AEMU_MOLTENVK_LIPO_INFO
+      RESULT_VARIABLE AEMU_MOLTENVK_LIPO_INFO_RESULT)
+    if(NOT AEMU_MOLTENVK_LIPO_INFO_RESULT EQUAL 0)
+      message(
+        FATAL_ERROR
+          "Unable to inspect MoltenVK architecture slices: ${AEMU_MOLTENVK_LIPO_INFO}"
+      )
+    endif()
+    if(AEMU_MOLTENVK_LIPO_INFO MATCHES "Non-fat file:.*arm64")
+      configure_file("${AEMU_MOLTENVK_DYLIB}" "${AEMU_THIN_MOLTENVK_DYLIB}"
+                     COPYONLY)
+    elseif(AEMU_MOLTENVK_LIPO_INFO MATCHES
+           "Architectures in the fat file:.*arm64")
+      execute_process(
+        COMMAND "${AEMU_LIPO}" -thin arm64 "${AEMU_MOLTENVK_DYLIB}" -output
+                "${AEMU_THIN_MOLTENVK_DYLIB}"
+        ERROR_VARIABLE AEMU_MOLTENVK_THIN_ERROR
+        RESULT_VARIABLE AEMU_MOLTENVK_THIN_RESULT)
+      if(NOT AEMU_MOLTENVK_THIN_RESULT EQUAL 0)
+        message(
+          FATAL_ERROR
+            "Unable to thin MoltenVK to arm64: ${AEMU_MOLTENVK_THIN_ERROR}")
+      endif()
+    else()
+      message(
+        FATAL_ERROR
+          "MoltenVK does not contain an arm64 slice: ${AEMU_MOLTENVK_LIPO_INFO}"
+      )
+    endif()
+    execute_process(COMMAND "${CMAKE_COMMAND}" -E touch
+                            "${AEMU_THIN_MOLTENVK_DYLIB}")
+    set(AEMU_MOLTENVK_DYLIB "${AEMU_THIN_MOLTENVK_DYLIB}")
+  endif()
   set(VULKAN_DEPENDENCIES
       # Vulkan Loader
       "${PREBUILT_ROOT}/libvulkan.dylib>lib64/vulkan/libvulkan.dylib"
       # MoltenVK (Vulkan -> Metal, exposes the Apple GPU as a Vulkan device)
-      "${PREBUILT_ROOT}/icds/libMoltenVK.dylib>lib64/vulkan/libMoltenVK.dylib"
+      "${AEMU_MOLTENVK_DYLIB}>lib64/vulkan/libMoltenVK.dylib"
       "${PREBUILT_ROOT}/icds/MoltenVK_icd.json>lib64/vulkan/MoltenVK_icd.json"
       # Shaders
       ${VULKAN_COMMON_DEPENDENCIES})
