@@ -124,6 +124,13 @@ jobs:
             -k "$keychain_password" \
             "$keychain_path"
 
+          identity_report="$RUNNER_TEMP/codesigning-identities.txt"
+          security find-identity -v -p codesigning "$keychain_path" | tee "$identity_report"
+          if ! grep -Fq "$MACOS_CODESIGN_IDENTITY" "$identity_report"; then
+            echo "::error::MACOS_CODESIGN_IDENTITY was not found in the imported signing keychain. Check that the P12 includes the Developer ID Application private key and that the identity secret matches one of the listed identities."
+            exit 1
+          fi
+
           xcrun notarytool store-credentials aemu-notary \
             --apple-id "$APPLE_NOTARY_APPLE_ID" \
             --team-id "$APPLE_TEAM_ID" \
