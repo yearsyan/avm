@@ -11,7 +11,6 @@ MODE=""
 LOCAL_ROOT=""
 ARTIFACT=""
 ARTIFACT_SHA256="${AEMU_PREBUILTS_ARTIFACT_SHA256:-}"
-ARTIFACT_TREE_ROOT=""
 MAKE_ARTIFACT=""
 FORCE=0
 SKIP_DIGEST=0
@@ -21,7 +20,7 @@ usage() {
 Usage:
   scripts/bootstrap-prebuilts.sh --from-local <android-emu-root> [--force]
   scripts/bootstrap-prebuilts.sh --from-git [--cache-dir <dir>] [--force]
-  scripts/bootstrap-prebuilts.sh --from-artifact <file-or-url> [--artifact-sha256 <sha256>] [--force]
+  scripts/bootstrap-prebuilts.sh --from-artifact <file-or-url> --artifact-sha256 <sha256> [--force]
   scripts/bootstrap-prebuilts.sh --verify
   scripts/bootstrap-prebuilts.sh --make-artifact <path.tar.gz>
 
@@ -286,15 +285,21 @@ download_artifact() {
 verify_artifact_sha() {
   local file="$1"
 
-  [[ -z "${ARTIFACT_SHA256}" ]] && return
+  [[ -n "${ARTIFACT_SHA256}" ]] || die "--artifact-sha256 is required for --from-artifact"
   local actual
   actual="$(shasum -a 256 "${file}" | cut -d' ' -f1)"
   [[ "${actual}" == "${ARTIFACT_SHA256}" ]] ||
     die "artifact sha256 mismatch: expected ${ARTIFACT_SHA256}, got ${actual}"
 }
 
-copy_artifact_entry() {
-  copy_entry_from_tree "${ARTIFACT_TREE_ROOT}" "$@"
+artifact_member_entry() {
+  local name="$1" dest="$2" url="$3" rev="$4" digest="$5"
+  shift 5
+  local path
+
+  for path in "$@"; do
+    printf '%s/%s\n' "${dest}" "${path}"
+  done
 }
 
 make_artifact_entry() {
@@ -322,19 +327,17 @@ run_install_from_git() {
 }
 
 run_install_from_artifact() {
-  local tmp archive
+  local tmp archive list
   tmp="$(mktemp -d)"
   archive="${tmp}/prebuilts-archive"
+  list="${tmp}/prebuilts-list"
 
   download_artifact "${ARTIFACT}" "${archive}"
   verify_artifact_sha "${archive}"
-  mkdir -p "${tmp}/extract"
-  tar -xf "${archive}" -C "${tmp}/extract"
-  ARTIFACT_TREE_ROOT="${tmp}/extract"
 
   read_lock ensure_replaceable_entry
-  read_lock copy_artifact_entry
-  verify_all
+  read_lock artifact_member_entry | LC_ALL=C sort >"${list}"
+  tar -xf "${archive}" -C "${DEST_ROOT}" -T "${list}"
 }
 
 run_make_artifact() {

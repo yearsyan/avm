@@ -112,16 +112,17 @@ jobs:
           prebuilts_sha256="${INPUT_PREBUILTS_SHA256:-${SECRET_PREBUILTS_SHA256:-}}"
 
           if [[ -n "$prebuilts_url" ]]; then
-            args=(--from-artifact "$prebuilts_url" --force)
-            if [[ -n "$prebuilts_sha256" ]]; then
-              args+=(--artifact-sha256 "$prebuilts_sha256")
+            if [[ -z "$prebuilts_sha256" ]]; then
+              echo "::error::prebuilts_sha256 is required when prebuilts_url is set"
+              exit 1
             fi
-            ./scripts/bootstrap-prebuilts.sh "${args[@]}"
+            ./scripts/bootstrap-prebuilts.sh \
+              --from-artifact "$prebuilts_url" \
+              --artifact-sha256 "$prebuilts_sha256" \
+              --force
           else
             ./scripts/bootstrap-prebuilts.sh --from-git --cache-dir "$PREBUILTS_CACHE_DIR" --force
           fi
-
-          ./scripts/bootstrap-prebuilts.sh --verify
 
       - name: Build emulator
         run: ./scripts/build_headless_macos.sh

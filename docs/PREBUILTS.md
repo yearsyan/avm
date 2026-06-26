@@ -27,7 +27,9 @@ artifact store, then use that artifact in CI or clean developer machines:
   --force
 ```
 
-This avoids cloning the full Android prebuilt history on every machine.
+This verifies the compressed artifact itself and extracts only the locked paths,
+avoiding the full Android prebuilt history and a second copied tree on every
+machine.
 
 ## Local Android Emulator Checkout
 
