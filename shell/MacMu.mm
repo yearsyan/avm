@@ -455,6 +455,10 @@ void terminateQemu(pid_t pid) {
     terminateQemu(_qemuPid);
 }
 
+- (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication*)sender {
+    return YES;
+}
+
 @end
 
 @interface MacMuSurfaceRenderer : NSObject <MTKViewDelegate>

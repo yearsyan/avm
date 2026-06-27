@@ -68,7 +68,8 @@ qemu and the shell.
 The communication contract is:
 
 1. qemu/gfxstream creates or reuses a global IOSurface.
-2. qemu/gfxstream GPU-blits the final ColorBuffer into that IOSurface.
+2. qemu/gfxstream publishes a posted ColorBuffer's IOSurface when available;
+   otherwise it GPU-blits the final ColorBuffer into an export IOSurface.
 3. qemu/gfxstream writes a small JSON metadata file atomically.
 4. `macmu` polls the metadata file.
 5. `macmu` calls `IOSurfaceLookup(iosurface_id)`.
@@ -92,7 +93,24 @@ serialized through the file.
 
 ## Copy and Synchronization Model
 
-The current implementation is deliberately simple:
+The Vulkan implementation first attempts a zero-copy path:
+
+- displayable BGRA ColorBuffers are created as Metal IOSurface-exportable images;
+- `DisplayVk` exports the posted ColorBuffer's IOSurface directly;
+- qemu/gfxstream performs a Vulkan barrier/queue handoff before publishing
+  metadata.
+
+The default validated path is currently OpenGL composition. `ColorBufferGl`
+first attempts to make its main `GL_TEXTURE_2D` IOSurface-backed, but the macOS
+CGL/translator stack currently rejects that binding. It then creates a
+ColorBuffer-owned IOSurface mirror using `GL_TEXTURE_RECTANGLE`; `DisplayGl`
+publishes that ColorBuffer IOSurface directly instead of owning a separate
+display export surface. The mirror is synchronized from the ColorBuffer's main
+GL texture with a GPU blit.
+
+If the source ColorBuffer is not exportable or mirrorable, is not an RGBA/BGRA
+display format, has a different display-frame size, or the driver refuses the
+export, the implementation falls back to the original copy path:
 
 - qemu/gfxstream owns the source ColorBuffer.
 - qemu/gfxstream owns the exported IOSurface target.
@@ -100,10 +118,11 @@ The current implementation is deliberately simple:
 - Metadata is published only after the frame copy completes.
 - The shell samples the IOSurface through Metal.
 
-So the shell-side display does not copy pixels on the CPU, but the current
-gfxstream export path does perform a GPU copy from the final ColorBuffer into
-the IOSurface. A future optimization could make the final ColorBuffer itself
-IOSurface-backed and remove this extra GPU blit.
+So the shell-side display does not copy pixels on the CPU. On the Vulkan/BGRA
+zero-copy path, the final ColorBuffer is the exported IOSurface. On the current
+OpenGL path, the ColorBuffer owns the IOSurface mirror that is exported to the
+shell. Fallback paths still perform a GPU copy from the final ColorBuffer into
+an IOSurface-backed target image.
 
 ## Shell Rendering
 
@@ -153,6 +172,7 @@ The app bundle keeps qemu and its runtime libraries under
 - Only the first posted layer is exported.
 - Rotation and color transforms are ignored.
 - Frame delivery is metadata polling, not event-driven.
-- There is an extra GPU blit from ColorBuffer to IOSurface.
+- Non-RGBA/BGRA, non-exportable, or non-mirrorable ColorBuffers still use an
+  extra GPU blit from ColorBuffer to IOSurface.
 - The `AEMU_*` exporter variables are still emitted for compatibility with
   older local builds; they can be removed after all builds consume `MACMU_*`.
