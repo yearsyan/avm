@@ -60,11 +60,9 @@ typedef struct QAndroidAutomationAgent QAndroidAutomationAgent;
 #define ANDROID_CONSOLE_AGENTS_LIST(X)          \
     X(QAndroidAutomationAgent, automation)      \
     X(QAndroidBatteryAgent, battery)            \
-    X(QAndroidClipboardAgent, clipboard)        \
     X(QAndroidCellularAgent, cellular)          \
     X(QAndroidDisplayAgent, display)            \
     X(QAndroidEmulatorWindowAgent, emu)         \
-    X(QAndroidFingerAgent, finger)              \
     X(QAndroidHttpProxyAgent, proxy)            \
     X(AndroidProxyCB, proxy_cb)                 \
     X(QAndroidLibuiAgent, libui)                \
@@ -75,7 +73,6 @@ typedef struct QAndroidAutomationAgent QAndroidAutomationAgent;
     X(QAndroidSensorsAgent, sensors)            \
     X(QAndroidTelephonyAgent, telephony)        \
     X(QAndroidUserEventAgent, user_event)       \
-    X(QAndroidVirtualSceneAgent, virtual_scene) \
     X(QAndroidVmOperations, vm)                 \
     X(QCarDataAgent, car)                       \
     X(QGrpcAgent, grpc)                         \

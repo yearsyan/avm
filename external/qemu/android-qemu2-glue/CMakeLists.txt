@@ -40,20 +40,17 @@ set(android-qemu2-glue_src
     emulation/VirtioWifiForwarder.cpp
     emulation/WifiService.cpp
     looper-qemu.cpp
+    macmu-input-receiver.cpp
     net-android.cpp
     proxy/slirp_proxy.cpp
     qemu-automation-agent-impl.cpp
     qemu-battery-agent-impl.cpp
-    qemu-car-data-agent-impl.cpp
     qemu-cellular-agent-impl.c
     qemu-console-factory.cpp
-    qemu-clipboard-agent-impl.cpp
     qemu-display-agent-impl.cpp
-    qemu-finger-agent-impl.c
     qemu-globals-agent-impl.cpp
     qemu-http-proxy-agent-impl.c
     qemu-hw-control-agent-impl.cpp
-    qemu-hw-xr-led-agent-impl.cpp
     qemu-location-agent-impl.c
     qemu-multi-display-agent-impl.cpp
     qemu-net-agent-impl.c
@@ -63,7 +60,6 @@ set(android-qemu2-glue_src
     qemu-setup.cpp
     qemu-telephony-agent-impl.c
     qemu-user-event-agent-impl.c
-    qemu-virtual-scene-agent-impl.cpp
     snapshot_compression.cpp
     utils/register_crash_info.cpp
     utils/stream.cpp)
@@ -81,6 +77,7 @@ target_include_directories(
           ${ANDROID_AUTOGEN}
           ../slirp
           ${VIRGLRENDERER_INCLUDE_DIR}
+          ${CMAKE_CURRENT_SOURCE_DIR}/../../../shell
           ${ANDROID_QEMU2_TOP_DIR}/android/third_party/libdtb/include/
           ${CMAKE_CURRENT_BINARY_DIR})
 

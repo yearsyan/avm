@@ -18,50 +18,6 @@ function(aemu_core_only_install_prebuilt_files DEPENDENCIES_TARGET)
   endforeach()
 endfunction()
 
-if(NOT OPTION_AEMU_CORE_ONLY)
-  android_add_executable(
-    TARGET emulator INSTALL .
-    LICENSE Apache-2.0
-    SRC main-emulator.cpp
-    DEPS aemu-gl-init
-    android-emu-agents-headers
-    android-emu-avd
-    android-emu-base
-    android-emu-base-headers
-    android-emu-crash-initializer
-    android-emu-crashreport
-    android-emu-crashreport-consent-never
-    android-emu-files
-    android-emu-launch
-    android-emu-utils
-    android-hw-config
-    qemu-host-common-headers
-    ui::common
-    ui::window)
-
-
-  add_resource(TARGET emulator RESOURCE ../images/emulator_icon.rc)
-  target_include_directories(
-    emulator # This is not right!, an implicit dependency..
-    PRIVATE ${ANDROID_QEMU2_TOP_DIR}/android/android-emu)
-  target_compile_definitions(
-    emulator
-    PRIVATE "-DCRASHUPLOAD=${OPTION_CRASHUPLOAD}"
-    "-DANDROID_SDK_TOOLS_REVISION=${OPTION_SDK_TOOLS_REVISION}"
-    "-DANDROID_SDK_TOOLS_BUILD_NUMBER=${OPTION_SDK_TOOLS_BUILD_NUMBER}")
-  if(NOT WINDOWS)
-    target_link_libraries(emulator PRIVATE android-emu-feature)
-  endif()
-  # Make sure we have the qemu dependencies available.
-  # AEMU core-only / macOS-aarch64: only the aarch64 headless engine is built.
-  if(BUILDING_FOR_AARCH64)
-    add_dependencies(emulator qemu-system-aarch64-headless)
-  else()
-    add_dependencies(emulator qemu-system-x86_64-headless
-                            qemu-system-aarch64-headless)
-  endif()
-endif()
-
 set(PC_BIOS "${ANDROID_QEMU2_TOP_DIR}/pc-bios")
 set(EMULATOR_BIOS_DEPENDENCIES
   "${PC_BIOS}/bios.bin>lib/pc-bios/bios.bin"

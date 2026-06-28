@@ -87,15 +87,20 @@ not as proof that the headless core rendering path is broken.
 Recommended launch shape:
 
 ```sh
-ANDROID_SDK_ROOT=<android-sdk> \
-ANDROID_HOME=<android-sdk> \
 ANDROID_EMULATOR_LAUNCHER_DIR=build/cmake/distribution/emulator \
 DYLD_LIBRARY_PATH=build/cmake/distribution/emulator/lib64:build/cmake/distribution/emulator/lib64/gles_angle:build/cmake/distribution/emulator/lib64/vulkan \
 build/cmake/distribution/emulator/qemu/darwin-aarch64/qemu-system-aarch64-headless \
   -avd aemu_aosp35_arm64 \
+  -sysdir <path-to>/system-images/android-35/default/arm64-v8a \
   -no-window -no-audio -no-snapshot -no-boot-anim \
   -gpu host
 ```
+
+No `ANDROID_SDK_ROOT` / `ANDROID_HOME` is required: qemu resolves the AVD's
+image search path from `-sysdir` directly, and the AVD itself is located via
+`ANDROID_AVD_HOME` / `$HOME/.android/avd` (independent of the SDK root). The
+shell passes the same `-sysdir` through when launched with `--system-path
+<dir>` (or the `MACMU_SYSTEM_PATH` / `AEMU_SHELL_SYSTEM_PATH` env var).
 
 If a previous emulator session was killed while it was writing a snapshot, the
 next cold boot can segfault inside `drive_init` / `blk_bs` (the qcow2-on-qcow2

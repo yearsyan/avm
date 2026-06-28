@@ -352,10 +352,12 @@ static int _getSkinPathFromName(const char* skinName,
     }
 
     /* is the skin name a relative path from the SDK root ? */
-    p = bufprint(temp, end, "%s" PATH_SEP "%s", sdkRootPath, skinName);
-    if (!path_is_absolute(skinName) && p < end && _checkSkinPath(temp)) {
-        skinName = temp;
-        goto FOUND_IT;
+    if (sdkRootPath != NULL) {
+        p = bufprint(temp, end, "%s" PATH_SEP "%s", sdkRootPath, skinName);
+        if (!path_is_absolute(skinName) && p < end && _checkSkinPath(temp)) {
+            skinName = temp;
+            goto FOUND_IT;
+        }
     }
 
     /* nope */
@@ -967,7 +969,15 @@ AvdInfo* avdInfo_new(const char* name, AvdInfoParams* __unused_params, const cha
     i->target = NULL;
     i->sysdir = sysdir;
 
-    if (_avdInfo_getSdkRoot(i) < 0 || _avdInfo_getRootIni(i) < 0 ||
+    // The SDK root is only needed to resolve the AVD's image search paths from
+    // config.ini. When the caller passed -sysdir on the command line, the
+    // search path is supplied explicitly and _avdInfo_getSearchPaths() takes an
+    // early-return that never touches i->sdkRootPath, so resolving the SDK root
+    // can be skipped entirely. This lets MacMu launch qemu without
+    // ANDROID_SDK_ROOT/ANDROID_HOME as long as the system-images path is given
+    // via -sysdir.
+    if ((!i->sysdir && _avdInfo_getSdkRoot(i) < 0) ||
+        _avdInfo_getRootIni(i) < 0 ||
         _avdInfo_getContentPath(i) < 0 || _avdInfo_getConfigIni(i) < 0 ||
         _avdInfo_getEnvironmentIni(i) < 0 ||
         _avdInfo_getCoreHwIniPath(i, i->contentPath) < 0 ||

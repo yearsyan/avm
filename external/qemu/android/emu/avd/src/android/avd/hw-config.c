@@ -128,7 +128,13 @@ int androidHwConfig_read(AndroidHwConfig* config, CIniFile* ini) {
     }
 
     if (!config->android_sdk_root || strlen(config->android_sdk_root) == 0) {
-        config->android_sdk_root = path_getSdkRoot();
+        // path_getSdkRoot() may legitimately return NULL when the system-images
+        // path was supplied via -sysdir and no ANDROID_SDK_ROOT/ANDROID_HOME is
+        // set. Leave the field empty in that case rather than assigning NULL.
+        char* resolved = path_getSdkRoot();
+        if (resolved) {
+            config->android_sdk_root = resolved;
+        }
     }
     if (!config->android_avd_home || strlen(config->android_avd_home) == 0) {
         char temp[PATH_MAX], *p=temp, *end=p+sizeof(temp);

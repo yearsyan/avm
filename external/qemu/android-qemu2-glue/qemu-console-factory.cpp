@@ -18,21 +18,16 @@
 #include "android/emulation/control/AgentLogger.h"          // for AndroidLo...
 #include "android/emulation/control/AndroidAgentFactory.h"  // for injectCon...
 #include "android/emulation/control/battery_agent.h"        // for QAndroidB...
-#include "android/emulation/control/car_data_agent.h"       // for QCarDataA...
 #include "android/emulation/control/cellular_agent.h"       // for QAndroidC...
-#include "android/emulation/control/clipboard_agent.h"      // for QAndroidC...
-#include "android/emulation/control/finger_agent.h"         // for QAndroidF...
 #include "android/emulation/control/grpc_agent.h"           // for QGrpcAgent
 #include "android/emulation/control/http_proxy_agent.h"     // for QAndroidH...
 #include "android/emulation/control/hw_control_agent.h"
-#include "android/emulation/control/hw_xr_led_agent.h"
 #include "android/emulation/control/libui_agent.h"          // for QAndroidL...
 #include "android/emulation/control/location_agent.h"       // for QAndroidL...
 #include "android/emulation/control/net_agent.h"            // for QAndroidN...
 #include "android/emulation/control/sensors_agent.h"        // for QAndroidS...
 #include "android/emulation/control/telephony_agent.h"      // for QAndroidT...
 #include "android/emulation/control/user_event_agent.h"     // for QAndroidU...
-#include "android/emulation/control/virtual_scene_agent.h"  // for QAndroidV...
 #include "host-common/display_agent.h"        // for QAndroidD...
 #include "host-common/multi_display_agent.h"  // for QAndroidM...
 #include "host-common/record_screen_agent.h"  // for QAndroidR...
@@ -47,12 +42,6 @@ extern "C" const QAndroidBatteryAgent* const gQAndroidBatteryAgent;
 
 // Defined in android/qemu-cellular-agent.c
 extern "C" const QAndroidCellularAgent* const gQAndroidCellularAgent;
-
-// Defined in qemu-clipboard-agent-impl.cpp
-extern "C" const QAndroidClipboardAgent* const gQAndroidClipboardAgent;
-
-// Defined in android/qemu-finger-agent.c
-extern "C" const QAndroidFingerAgent* const gQAndroidFingerAgent;
 
 // Defined in android/qemu-location-agent-impl.c
 extern "C" const QAndroidLocationAgent* const gQAndroidLocationAgent;
@@ -73,17 +62,11 @@ extern "C" const QAndroidTelephonyAgent* const gQAndroidTelephonyAgent;
 // Defined in android-qemu2-glue/qemu-user-event-agent-impl.c
 extern "C" const QAndroidUserEventAgent* const gQAndroidUserEventAgent;
 
-// Defined in android/qemu-virtual-scene-agent.cpp
-extern "C" const QAndroidVirtualSceneAgent* const gQAndroidVirtualSceneAgent;
-
 // Defined in android-qemu2-glue/qemu-net-agent-impl.c
 extern "C" const QAndroidNetAgent* const gQAndroidNetAgent;
 
 // Defined in android-qemu2-glue/qemu-display-agent-impl.cpp
 extern "C" const QAndroidDisplayAgent* const gQAndroidDisplayAgent;
-
-// Defined in android-qemu2-glue/qemu-car-data-agent-impl.cpp
-extern "C" const QCarDataAgent* const gQCarDataAgent;
 
 #if defined(AEMU_CORE_ONLY)
 static int coreOnlyGrpcStart(int, const char*) {
@@ -115,9 +98,6 @@ extern "C" const QAndroidMultiDisplayAgent* const gQAndroidMultiDisplayAgent;
 // Defined in android-qemu2-glue/qemu-hw-control-agent-impl.cpp
 extern "C" const QAndroidHwControlAgent* const gQAndroidHwControlAgent;
 
-// Defined in android-qemu2-glue/qemu-hw-xr-led-agent-impl.cpp
-extern "C" const QAndroidHwXrLedAgent* const gQAndroidHwXrLedAgent;
-
 // Defined in android-qemu2-glue/qemu-globals-agent-impl.cpp
 extern "C" const QAndroidGlobalVarsAgent* const gQAndroidGlobalVarsAgent;
 
@@ -135,10 +115,8 @@ const QAndroidLibuiAgent* const getQAndroidLibuiAgent();
 #define ANDROID_AGENTS_LIST(X)   \
     X(QAndroidAutomationAgent)   \
     X(QAndroidBatteryAgent)      \
-    X(QAndroidClipboardAgent)    \
     X(QAndroidCellularAgent)     \
     X(QAndroidDisplayAgent)      \
-    X(QAndroidFingerAgent)       \
     X(QAndroidHttpProxyAgent)    \
     X(QAndroidLocationAgent)     \
     X(QAndroidMultiDisplayAgent) \
@@ -147,12 +125,9 @@ const QAndroidLibuiAgent* const getQAndroidLibuiAgent();
     X(QAndroidSensorsAgent)      \
     X(QAndroidTelephonyAgent)    \
     X(QAndroidUserEventAgent)    \
-    X(QAndroidVirtualSceneAgent) \
     X(QAndroidVmOperations)      \
-    X(QCarDataAgent)             \
     X(QGrpcAgent)                \
     X(QAndroidHwControlAgent)    \
-    X(QAndroidHwXrLedAgent) \
     X(QAndroidGlobalVarsAgent)   \
     X(QAndroidSurfaceAgent)
 

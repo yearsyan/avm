@@ -18,18 +18,14 @@ typedef struct UiEmuAgent {
     const struct QAndroidAutomationAgent* automation;
     const struct QAndroidBatteryAgent* battery;
     const struct QAndroidCellularAgent* cellular;
-    const struct QAndroidClipboardAgent* clipboard;
     const struct QAndroidDisplayAgent* display;
     const struct QAndroidEmulatorWindowAgent* window;
-    const struct QAndroidFingerAgent* finger;
     const struct QAndroidLocationAgent* location;
     const struct QAndroidHttpProxyAgent* proxy;
     const struct QAndroidRecordScreenAgent* record;
     const struct QAndroidSensorsAgent* sensors;
     const struct QAndroidTelephonyAgent* telephony;
     const struct QAndroidUserEventAgent* userEvents;
-    const struct QAndroidVirtualSceneAgent* virtualScene;
-    const struct QCarDataAgent* car;
     const struct QAndroidMultiDisplayAgent* multiDisplay;
     const struct SettingsAgent* settings;
 } UiEmuAgent;

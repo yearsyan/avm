@@ -122,6 +122,7 @@ extern "C" {
 #include "android-qemu2-glue/emulation/serial_line.h"
 #include "android-qemu2-glue/emulation/virtio-input-multi-touch.h"
 #include "android-qemu2-glue/emulation/virtio-input-rotary.h"
+#include "android-qemu2-glue/macmu-input-receiver.h"
 #include "android-qemu2-glue/proxy/slirp_proxy.h"
 #include "android/gps/PassiveGpsUpdater.h"
 #include "android/ui-emu-agent.h"
@@ -469,10 +470,23 @@ static void replaceDefaultPath(AvdInfo* avd,
                __LINE__, __func__, strlen(proposedPath), proposedPath);
     }
 
-    std::string strProposed =
-            path_is_absolute(proposedPath)
-                    ? std::string(proposedPath)
-                    : PathUtils::join(path_getSdkRoot(), proposedPath);
+    std::string strProposed;
+    if (path_is_absolute(proposedPath)) {
+        strProposed = proposedPath;
+    } else {
+        // path_getSdkRoot() may return NULL when the system-images path was
+        // supplied via -sysdir and no ANDROID_SDK_ROOT/ANDROID_HOME is set.
+        // Constructing std::string from NULL is UB, and a relative proposedPath
+        // cannot be resolved without a base, so treat it as unresolvable.
+        char* sdkRoot = path_getSdkRoot();
+        if (!sdkRoot) {
+            dprint("%s %d %s:relative proposed path %s cannot be resolved "
+                   "without an SDK root\n",
+                   __FILE__, __LINE__, __func__, proposedPath);
+            return;
+        }
+        strProposed = PathUtils::join(sdkRoot, proposedPath);
+    }
     if (!path_is_dir(strProposed.c_str())) {
         dprint("%s %d %s:proposed path %s is not dir\n", __FILE__, __LINE__,
                __func__, strProposed.c_str());
@@ -790,10 +804,14 @@ static void initialize_virtio_input_devs(android::ParameterList& args,
                 args.add("-device");
                 args.add("virtio-mouse-pci");
             }
-        } else if (fc::isEnabled(fc::VirtioTablet)) {
+        }
+
+        if (fc::isEnabled(fc::VirtioTablet)) {
             args.add("-device");
             args.add("virtio-tablet-pci");
-        } else if (androidHwConfig_isScreenMultiTouch(hw)) {
+        }
+
+        if (androidHwConfig_isScreenMultiTouch(hw)) {
             for (int id = 1; id <= VIRTIO_INPUT_MAX_NUM; id++) {
                 args.add("-device");
                 args.add(StringFormat("virtio_input_multi_touch_pci_%d", id)
@@ -819,6 +837,13 @@ static void initialize_virtio_input_devs(android::ParameterList& args,
             args.add("virtio_input_multi_touch_touchpad_pci_0");
         }
     }
+}
+
+static void initialize_macmu_input_features() {
+    fc::setIfNotOverriden(fc::VirtioInput, true);
+    fc::setIfNotOverriden(fc::VirtioMouse, false);
+    fc::setIfNotOverriden(fc::VirtioDualModeMouse, false);
+    fc::setIfNotOverriden(fc::VirtioTablet, false);
 }
 
 static void enableSignalTermination() {
@@ -1143,18 +1168,14 @@ static int startEmulatorWithMinConfig(int argc,
             getConsoleAgents()->automation,
             getConsoleAgents()->battery,
             getConsoleAgents()->cellular,
-            getConsoleAgents()->clipboard,
             getConsoleAgents()->display,
             getConsoleAgents()->emu,
-            getConsoleAgents()->finger,
             getConsoleAgents()->location,
             getConsoleAgents()->proxy,
             getConsoleAgents()->record,
             getConsoleAgents()->sensors,
             getConsoleAgents()->telephony,
             getConsoleAgents()->user_event,
-            getConsoleAgents()->virtual_scene,
-            getConsoleAgents()->car,
             getConsoleAgents()->multi_display,
             nullptr  // For now there's no uses of SettingsAgent, so we
                      //          // don't set it.
@@ -1302,10 +1323,12 @@ static int startEmulatorWithMinConfig(int argc,
         }
     }
 
+    macmu_input_receiver_start(getConsoleAgents()->user_event);
     skin_winsys_spawn_thread(opts->no_window, enter_qemu_main_loop, argc, argv);
     android::crashreport::CrashReporter::get()->hangDetector().pause(false);
     skin_winsys_enter_main_loop(opts->no_window);
     android::crashreport::CrashReporter::get()->hangDetector().pause(true);
+    macmu_input_receiver_stop();
 
 #ifndef AEMU_CORE_ONLY
     // Make sure VirtualSceneManager and scene service library resources are
@@ -1712,8 +1735,7 @@ extern "C" int main(int argc, char** argv) {
                 fc::setIfNotOverriden(fc::HVF, true);
                 fc::setIfNotOverriden(fc::Vulkan, true);
                 fc::setIfNotOverriden(fc::GLDirectMem, true);
-                fc::setIfNotOverriden(fc::VirtioInput, true);
-                fc::setIfNotOverriden(fc::VirtioMouse, false);
+                initialize_macmu_input_features();
                 fc::setEnabledOverride(fc::RefCountPipe, false);
                 fc::setIfNotOverriden(fc::VulkanNullOptionalStrings, true);
                 fc::setIfNotOverriden(fc::VulkanIgnoredHandles, true);
@@ -1779,6 +1801,7 @@ extern "C" int main(int argc, char** argv) {
 
     // just because we know that we're in the new emulator as we got here
     opts->ranchu = 1;
+    initialize_macmu_input_features();
 
     getConsoleAgents()->settings->inject_AvdInfo(avd);
     bool reportMetrics = !opts->fuchsia;
@@ -2297,8 +2320,15 @@ extern "C" int main(int argc, char** argv) {
             bugInfo.dumpFirstbootInfoForDownloadableSnapshot(
                     orgSrcFirstbootIniFileName);
 
-            std::string systemImagePath =
-                    path_getAvdSystemPath(avdName, path_getSdkRoot(), false);
+            // Prefer the explicit -sysdir (avd->sysdir) when available; fall
+            // back to the SDK root otherwise. Both may be NULL in a -sysdir-only
+            // launch without ANDROID_SDK_ROOT, in which case path_getAvdSystemPath
+            // cannot resolve relative search paths and returns an empty result.
+            const char* avdSysdir = avd->sysdir;
+            std::string systemImagePath = path_getAvdSystemPath(
+                    avdName,
+                    avdSysdir ? avdSysdir : path_getSdkRoot(),
+                    false);
             // try copy content from <sysimgdir>/snapshots/avd/default
             std::string srcDirLocal = PathUtils::join(
                     systemImagePath, "snapshots", "local", "avd");
@@ -3261,18 +3291,14 @@ extern "C" int main(int argc, char** argv) {
             getConsoleAgents()->automation,
             getConsoleAgents()->battery,
             getConsoleAgents()->cellular,
-            getConsoleAgents()->clipboard,
             getConsoleAgents()->display,
             getConsoleAgents()->emu,
-            getConsoleAgents()->finger,
             getConsoleAgents()->location,
             getConsoleAgents()->proxy,
             getConsoleAgents()->record,
             getConsoleAgents()->sensors,
             getConsoleAgents()->telephony,
             getConsoleAgents()->user_event,
-            getConsoleAgents()->virtual_scene,
-            getConsoleAgents()->car,
             getConsoleAgents()->multi_display,
             nullptr,  // For now there's no uses of SettingsAgent, so we
                       // don't set it.
@@ -3591,12 +3617,14 @@ extern "C" int main(int argc, char** argv) {
                 });
     }
 
+    macmu_input_receiver_start(getConsoleAgents()->user_event);
     skin_winsys_spawn_thread(opts->no_window, enter_qemu_main_loop, args.size(),
                              args.array());
 
     android::crashreport::CrashReporter::get()->hangDetector().pause(false);
     skin_winsys_enter_main_loop(opts->no_window);
     android::crashreport::CrashReporter::get()->hangDetector().pause(true);
+    macmu_input_receiver_stop();
 
 #ifndef AEMU_CORE_ONLY
     // Make sure VirtualSceneManager and scene service library resources are
