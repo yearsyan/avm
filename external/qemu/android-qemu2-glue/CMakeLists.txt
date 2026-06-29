@@ -78,6 +78,7 @@ target_include_directories(
           ../slirp
           ${VIRGLRENDERER_INCLUDE_DIR}
           ${CMAKE_CURRENT_SOURCE_DIR}/../../../shell
+          ${CMAKE_CURRENT_SOURCE_DIR}/../../../shell/protocol
           ${ANDROID_QEMU2_TOP_DIR}/android/third_party/libdtb/include/
           ${CMAKE_CURRENT_BINARY_DIR})
 
