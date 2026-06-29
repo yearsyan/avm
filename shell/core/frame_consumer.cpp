@@ -1,23 +1,22 @@
 // SPDX-License-Identifier: MIT
 //
-// Frame channel consumer: shm-backed seqlock payload + Mach doorbell. Moved
-// verbatim from the original single-file MacMu.mm. Pure C++.
+// Frame channel consumer: shm-backed seqlock payload + Unix socket doorbell.
 
 #include "frame_consumer.h"
 
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
-#include <mach/mach.h>
-#include <mach/mach_init.h>
-#include <mach/message.h>
-#include <servers/bootstrap.h>
+#include <poll.h>
 #include <string>
 #include <sys/mman.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <unistd.h>
 
 namespace {
@@ -40,11 +39,6 @@ struct ShmPayload {
     uint64_t timestampNs;
 };
 
-struct DoorbellMessage {
-    mach_msg_header_t header;
-    uint64_t frame;
-};
-
 std::string frame_channel_name(uint32_t wrapper_pid) {
     char buf[64];
     std::snprintf(buf, sizeof(buf), "macmu.frame.%u", static_cast<unsigned>(wrapper_pid));
@@ -53,6 +47,23 @@ std::string frame_channel_name(uint32_t wrapper_pid) {
 
 std::string shm_path(const std::string& name) {
     return name.find('/') == std::string::npos ? std::string("/") + name : name;
+}
+
+std::string doorbell_path(const std::string& name) {
+    return "/tmp/" + name + ".doorbell";
+}
+
+bool fill_unix_addr(const std::string& path, sockaddr_un* addr) {
+    if (path.size() >= sizeof(addr->sun_path)) {
+        return false;
+    }
+    std::memset(addr, 0, sizeof(*addr));
+#ifdef __APPLE__
+    addr->sun_len = sizeof(*addr);
+#endif
+    addr->sun_family = AF_UNIX;
+    std::strncpy(addr->sun_path, path.c_str(), sizeof(addr->sun_path) - 1);
+    return true;
 }
 
 }  // namespace
@@ -68,11 +79,13 @@ bool FrameConsumer::create(uint32_t wrapper_pid) {
     }
     totalSize_ = sizeof(ShmHeader) + sizeof(ShmPayload);
     if (ftruncate(shmFd_, static_cast<off_t>(totalSize_)) != 0) {
+        teardown();
         return false;
     }
     mapped_ = mmap(nullptr, totalSize_, PROT_READ | PROT_WRITE, MAP_SHARED, shmFd_, 0);
     if (mapped_ == MAP_FAILED) {
         mapped_ = nullptr;
+        teardown();
         return false;
     }
     ShmHeader* header = static_cast<ShmHeader*>(mapped_);
@@ -82,27 +95,22 @@ bool FrameConsumer::create(uint32_t wrapper_pid) {
     payload_ = static_cast<char*>(mapped_) + sizeof(ShmHeader);
     std::memset(payload_, 0, sizeof(ShmPayload));
 
-    kern_return_t kr =
-        mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &machPort_);
-    if (kr != KERN_SUCCESS) {
-        teardown();  // release the half-initialized shm so producer falls back
+    const std::string pathDoorbell = doorbell_path(name_);
+    sockaddr_un addr = {};
+    if (!fill_unix_addr(pathDoorbell, &addr)) {
+        teardown();
         return false;
     }
-    mach_port_limits_t limits = {0};
-    limits.mpl_qlimit = MACH_PORT_QLIMIT_MAX;
-    mach_port_set_attributes(mach_task_self(), machPort_, MACH_PORT_LIMITS_INFO,
-                             reinterpret_cast<mach_port_info_t>(&limits),
-                             MACH_PORT_LIMITS_INFO_COUNT);
-    // bootstrap_register expects a name_t (char[128]); copy into a buffer.
-    name_t serviceName;
-    std::memset(serviceName, 0, sizeof(serviceName));
-    std::strncpy(serviceName, name_.c_str(), sizeof(serviceName) - 1);
-    kr = bootstrap_register(bootstrap_port, serviceName, machPort_);
-    if (kr != KERN_SUCCESS) {
-        teardown();  // ditto: avoid a half-open channel the producer would bind to
+    doorbellFd_ = socket(AF_UNIX, SOCK_DGRAM, 0);
+    if (doorbellFd_ < 0) {
+        teardown();
         return false;
     }
-    ownsRight_ = true;
+    unlink(pathDoorbell.c_str());
+    if (bind(doorbellFd_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+        teardown();
+        return false;
+    }
     valid_ = true;
     return true;
 }
@@ -138,18 +146,19 @@ bool FrameConsumer::wait_for_frame(uint64_t last_frame, uint64_t timeout_ms, Sur
         drain_notifications();
         if (read(out) && out->frame > last_frame) return true;
 
-        DoorbellMessage msg;
-        std::memset(&msg, 0, sizeof(msg));
         const uint64_t now = steady_now_ms();
         if (now >= deadline_ms) break;
-        const mach_msg_timeout_t remaining =
-            static_cast<mach_msg_timeout_t>(deadline_ms - now);
-        kern_return_t kr =
-            mach_msg(&msg.header, MACH_RCV_MSG | MACH_RCV_TIMEOUT, 0, sizeof(msg),
-                     machPort_, remaining, MACH_PORT_NULL);
-        if (kr == KERN_SUCCESS || kr == MACH_RCV_TOO_LARGE) {
+        pollfd pfd = {};
+        pfd.fd = doorbellFd_;
+        pfd.events = POLLIN;
+        const int pollResult =
+            poll(&pfd, 1, static_cast<int>(deadline_ms - now));
+        if (pollResult > 0 && (pfd.revents & POLLIN)) {
+            drain_notifications();
             if (read(out) && out->frame > last_frame) return true;
-        } else if (kr == MACH_RCV_TIMED_OUT) {
+        } else if (pollResult == 0) {
+            continue;
+        } else if (pollResult < 0 && errno == EINTR) {
             continue;
         } else {
             break;
@@ -167,22 +176,22 @@ uint64_t FrameConsumer::steady_now_ms() {
 
 void FrameConsumer::drain_notifications() {
     while (true) {
-        DoorbellMessage msg;
-        std::memset(&msg, 0, sizeof(msg));
-        kern_return_t kr = mach_msg(&msg.header, MACH_RCV_MSG | MACH_RCV_TIMEOUT, 0,
-                                    sizeof(msg), machPort_, 0, MACH_PORT_NULL);
-        if (kr != KERN_SUCCESS && kr != MACH_RCV_TOO_LARGE) break;
+        uint64_t frame = 0;
+        const ssize_t bytes = recv(doorbellFd_, &frame, sizeof(frame), MSG_DONTWAIT);
+        if (bytes >= 0) {
+            continue;
+        }
+        if (errno == EINTR) {
+            continue;
+        }
+        break;
     }
 }
 
 void FrameConsumer::teardown() {
-    // Note: we intentionally do not unregister the bootstrap name here
-    // (bootstrap_register is deprecated and its name_t signature differs
-    // by SDK). Deallocating the receive right is sufficient; the producer
-    // will fail its bootstrap_look_up and fall back to shm polling.
-    if (machPort_ != 0) {
-        mach_port_deallocate(mach_task_self(), machPort_);
-        machPort_ = 0;
+    if (doorbellFd_ >= 0) {
+        close(doorbellFd_);
+        doorbellFd_ = -1;
     }
     if (mapped_) {
         munmap(mapped_, totalSize_);
@@ -194,6 +203,7 @@ void FrameConsumer::teardown() {
     }
     if (!name_.empty()) {
         shm_unlink(shm_path(name_).c_str());
+        unlink(doorbell_path(name_).c_str());
     }
     valid_ = false;
 }
