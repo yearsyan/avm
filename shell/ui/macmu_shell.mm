@@ -1,23 +1,23 @@
 // MacMu macOS shell for IOSurface display export.
 // SPDX-License-Identifier: MIT
 //
-// Build:
-//   cmake -S shell -B build/shell
-//   cmake --build build/shell --target macmu_shell
-//
-// By default this shell launches qemu-system-aarch64-headless with IOSurface
-// export enabled. This file is now just the app shell: NSApplication setup,
-// the menu, the window/MTKView, the doorbell thread and the AppDelegate. The
-// Metal renderer lives in macmu_surface_renderer.mm; option parsing, the frame
-// channel, the metadata fallback reader and the qemu launcher live in the .cpp
-// companions.
+// The app shell owns the AppKit lifecycle, the status window, the optional
+// IOSurface display window, the menu-bar status item, and the qemu supervisor.
 
 #import <AppKit/AppKit.h>
 #import <Metal/Metal.h>
 #import <MetalKit/MetalKit.h>
 
 #include <atomic>
+#include <cerrno>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <mutex>
+#include <string>
+#include <sys/wait.h>
 #include <thread>
+#include <unistd.h>
 
 #include "frame_consumer.h"
 #include "guest_input_sender.h"
@@ -28,163 +28,505 @@
 #include "shell_options.h"
 #include "surface_metadata.h"
 
-@interface MacMuAppDelegate : NSObject <NSApplicationDelegate>
-- (instancetype)initWithQemuPid:(pid_t)qemuPid;
+namespace {
+
+NSString* ns_string(const std::string& value) {
+    return [NSString stringWithUTF8String:value.c_str()];
+}
+
+std::string path_join(const std::string& lhs, const std::string& rhs) {
+    if (lhs.empty()) {
+        return rhs;
+    }
+    if (lhs.back() == '/') {
+        return lhs + rhs;
+    }
+    return lhs + "/" + rhs;
+}
+
+std::string default_avd_home() {
+    if (const char* avdHome = std::getenv("ANDROID_AVD_HOME")) {
+        if (avdHome[0] != '\0') {
+            return avdHome;
+        }
+    }
+    return path_join(std::string([NSHomeDirectory() UTF8String]), ".android/avd");
+}
+
+std::string avd_path_for_options(const ShellOptions& options) {
+    return path_join(default_avd_home(), options.avdName + ".avd");
+}
+
+NSTextField* make_label(NSString* text, NSRect frame) {
+    NSTextField* label = [[NSTextField alloc] initWithFrame:frame];
+    label.stringValue = text;
+    label.bezeled = NO;
+    label.drawsBackground = NO;
+    label.editable = NO;
+    label.selectable = NO;
+    label.textColor = [NSColor secondaryLabelColor];
+    label.font = [NSFont systemFontOfSize:12.0 weight:NSFontWeightSemibold];
+    return label;
+}
+
+NSTextField* make_value(NSString* text, NSRect frame) {
+    NSTextField* value = [[NSTextField alloc] initWithFrame:frame];
+    value.stringValue = text;
+    value.bezeled = NO;
+    value.drawsBackground = NO;
+    value.editable = NO;
+    value.selectable = YES;
+    value.lineBreakMode = NSLineBreakByTruncatingMiddle;
+    value.font = [NSFont monospacedSystemFontOfSize:12.0 weight:NSFontWeightRegular];
+    return value;
+}
+
+}  // namespace
+
+@interface MacMuAppDelegate : NSObject <NSApplicationDelegate, NSWindowDelegate>
+- (instancetype)initWithOptions:(const ShellOptions&)options;
 @end
 
 @implementation MacMuAppDelegate {
+    ShellOptions _options;
+
+    FrameConsumer* _frameConsumer;
+    InputSender* _inputSender;
+    GuestInputSender* _guestInputSender;
+    id<MTLDevice> _metalDevice;
+
+    NSWindow* _statusWindow;
+    NSTextField* _qemuStatusValue;
+    NSTextField* _avdPathValue;
+    NSTextField* _systemPathValue;
+    NSButton* _startButton;
+
+    NSWindow* _displayWindow;
+    MTKView* _displayView;
+    MacMuSurfaceRendererRef _displayRenderer;
+
+    NSStatusItem* _statusItem;
+
+    std::atomic<bool> _shuttingDown;
+    std::atomic<bool> _doorbellShutdown;
+    std::atomic<uint64_t> _qemuGeneration;
+    std::thread _qemuMonitorThread;
+    std::thread _doorbellThread;
+    std::mutex _qemuMutex;
+    std::mutex _guestInputMutex;
     pid_t _qemuPid;
+    bool _channelReady;
 }
 
-- (instancetype)initWithQemuPid:(pid_t)qemuPid {
+- (instancetype)initWithOptions:(const ShellOptions&)options {
     self = [super init];
     if (!self) {
         return nil;
     }
-    _qemuPid = qemuPid;
+    _options = options;
+    _frameConsumer = nullptr;
+    _inputSender = nullptr;
+    _guestInputSender = nullptr;
+    _metalDevice = nil;
+    _statusWindow = nil;
+    _qemuStatusValue = nil;
+    _avdPathValue = nil;
+    _systemPathValue = nil;
+    _startButton = nil;
+    _displayWindow = nil;
+    _displayView = nil;
+    _displayRenderer = nil;
+    _statusItem = nil;
+    _shuttingDown.store(false, std::memory_order_relaxed);
+    _doorbellShutdown.store(true, std::memory_order_relaxed);
+    _qemuGeneration.store(0, std::memory_order_relaxed);
+    _qemuPid = -1;
+    _channelReady = false;
     return self;
 }
 
+- (void)applicationDidFinishLaunching:(NSNotification*)notification {
+    [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
+    [self installMainMenu];
+    [self installStatusItem];
+    [self createRuntimeChannels];
+    [self createStatusWindow];
+    [self showStatusWindow:nil];
+    [self startQemuSupervisor];
+    if (_options.openDisplay) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self openDisplayWindow:nil];
+        });
+    }
+    [NSApp activateIgnoringOtherApps:YES];
+}
+
 - (void)applicationWillTerminate:(NSNotification*)notification {
-    terminate_qemu(_qemuPid);
+    [self shutdownRuntime];
 }
 
 - (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication*)sender {
+    return NO;
+}
+
+- (BOOL)applicationShouldHandleReopen:(NSApplication*)sender hasVisibleWindows:(BOOL)flag {
+    [self showStatusWindow:nil];
     return YES;
+}
+
+- (void)windowWillClose:(NSNotification*)notification {
+    if ([notification object] == _displayWindow) {
+        [self stopDoorbellThread];
+        _displayWindow = nil;
+        _displayView = nil;
+        _displayRenderer = nil;
+    }
+}
+
+- (void)installMainMenu {
+    NSMenu* menu = [[NSMenu alloc] initWithTitle:@"MacMu"];
+    NSMenuItem* appItem = [[NSMenuItem alloc] init];
+    [menu addItem:appItem];
+
+    NSMenu* appMenu = [[NSMenu alloc] initWithTitle:@"MacMu"];
+    NSMenuItem* showItem = [appMenu addItemWithTitle:@"Show MacMu"
+                                              action:@selector(showStatusWindow:)
+                                       keyEquivalent:@"0"];
+    showItem.target = self;
+    NSMenuItem* displayItem = [appMenu addItemWithTitle:@"Open Display"
+                                                 action:@selector(openDisplayWindow:)
+                                          keyEquivalent:@"1"];
+    displayItem.target = self;
+    [appMenu addItem:[NSMenuItem separatorItem]];
+    NSMenuItem* quitItem = [appMenu addItemWithTitle:@"Quit MacMu"
+                                              action:@selector(terminate:)
+                                       keyEquivalent:@"q"];
+    quitItem.target = NSApp;
+    [appItem setSubmenu:appMenu];
+
+    [NSApp setMainMenu:menu];
+}
+
+- (void)installStatusItem {
+    _statusItem = [[NSStatusBar systemStatusBar] statusItemWithLength:NSVariableStatusItemLength];
+    _statusItem.button.title = @"MacMu";
+    _statusItem.button.toolTip = @"MacMu";
+
+    NSMenu* menu = [[NSMenu alloc] initWithTitle:@"MacMu"];
+    NSMenuItem* showItem = [[NSMenuItem alloc] initWithTitle:@"Show MacMu"
+                                                      action:@selector(showStatusWindow:)
+                                               keyEquivalent:@""];
+    showItem.target = self;
+    [menu addItem:showItem];
+
+    NSMenuItem* displayItem = [[NSMenuItem alloc] initWithTitle:@"Open Display"
+                                                         action:@selector(openDisplayWindow:)
+                                                  keyEquivalent:@""];
+    displayItem.target = self;
+    [menu addItem:displayItem];
+    [menu addItem:[NSMenuItem separatorItem]];
+
+    NSMenuItem* quitItem = [[NSMenuItem alloc] initWithTitle:@"Quit MacMu"
+                                                      action:@selector(quitFromStatusItem:)
+                                               keyEquivalent:@""];
+    quitItem.target = self;
+    [menu addItem:quitItem];
+    _statusItem.menu = menu;
+}
+
+- (void)createRuntimeChannels {
+    _frameConsumer = new FrameConsumer();
+    _channelReady = _frameConsumer->create(static_cast<uint32_t>(getpid()));
+    if (_channelReady) {
+        NSLog(@"MacMu frame channel ready (pid=%u).", static_cast<unsigned>(getpid()));
+    } else {
+        NSLog(@"MacMu frame channel unavailable; no frames will be displayed.");
+    }
+
+    _inputSender = new InputSender();
+    if (_inputSender->open(_options.inputSocketPath)) {
+        NSLog(@"MacMu input channel ready at %s.", _options.inputSocketPath.c_str());
+    } else {
+        NSLog(@"MacMu input channel unavailable; pointer input will be disabled.");
+    }
+
+    _guestInputSender = new GuestInputSender();
+    if (_guestInputSender->start(_options.guestRpcSocketPath)) {
+        NSLog(@"MacMu RPC agent listener ready at %s.", _options.guestRpcSocketPath.c_str());
+    } else {
+        NSLog(@"MacMu RPC agent listener unavailable; guest RPC will be disabled.");
+    }
+    _metalDevice = MTLCreateSystemDefaultDevice();
+    if (!_metalDevice) {
+        NSLog(@"Metal is not available; display window will be disabled.");
+    }
+}
+
+- (void)createStatusWindow {
+    if (_statusWindow) {
+        return;
+    }
+
+    const NSRect frame = NSMakeRect(0, 0, 640, 300);
+    _statusWindow = [[NSWindow alloc]
+        initWithContentRect:frame
+                  styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
+                            NSWindowStyleMaskMiniaturizable
+                    backing:NSBackingStoreBuffered
+                      defer:NO];
+    _statusWindow.title = @"MacMu";
+    _statusWindow.releasedWhenClosed = NO;
+    _statusWindow.delegate = self;
+
+    NSView* content = [[NSView alloc] initWithFrame:frame];
+    _statusWindow.contentView = content;
+
+    NSTextField* title = make_label(@"MacMu", NSMakeRect(28, 246, 360, 26));
+    title.font = [NSFont systemFontOfSize:22.0 weight:NSFontWeightSemibold];
+    title.textColor = [NSColor labelColor];
+    [content addSubview:title];
+
+    NSTextField* subtitle =
+        make_label(@"Android emulator core status", NSMakeRect(30, 222, 360, 18));
+    subtitle.font = [NSFont systemFontOfSize:13.0 weight:NSFontWeightRegular];
+    [content addSubview:subtitle];
+
+    [content addSubview:make_label(@"QEMU", NSMakeRect(30, 176, 130, 20))];
+    _qemuStatusValue = make_value(@"Starting", NSMakeRect(170, 176, 430, 20));
+    [content addSubview:_qemuStatusValue];
+
+    [content addSubview:make_label(@"AVD Path", NSMakeRect(30, 136, 130, 20))];
+    _avdPathValue = make_value(ns_string(avd_path_for_options(_options)),
+                               NSMakeRect(170, 136, 430, 20));
+    [content addSubview:_avdPathValue];
+
+    [content addSubview:make_label(@"System Image", NSMakeRect(30, 96, 130, 20))];
+    const std::string systemPath =
+        _options.systemPath.empty() ? std::string("Not set (qemu default)") : _options.systemPath;
+    _systemPathValue = make_value(ns_string(systemPath), NSMakeRect(170, 96, 430, 20));
+    [content addSubview:_systemPathValue];
+
+    _startButton = [NSButton buttonWithTitle:@"Start"
+                                      target:self
+                                      action:@selector(openDisplayWindow:)];
+    _startButton.frame = NSMakeRect(500, 28, 100, 34);
+    _startButton.bezelStyle = NSBezelStyleRounded;
+    _startButton.enabled = _channelReady && _metalDevice != nil;
+    [content addSubview:_startButton];
+
+    NSButton* quitButton = [NSButton buttonWithTitle:@"Quit"
+                                              target:NSApp
+                                              action:@selector(terminate:)];
+    quitButton.frame = NSMakeRect(392, 28, 92, 34);
+    quitButton.bezelStyle = NSBezelStyleRounded;
+    [content addSubview:quitButton];
+
+    [_statusWindow center];
+}
+
+- (void)showStatusWindow:(id)sender {
+    [self createStatusWindow];
+    [_statusWindow makeKeyAndOrderFront:nil];
+    [NSApp activateIgnoringOtherApps:YES];
+}
+
+- (void)openDisplayWindow:(id)sender {
+    if (!_channelReady || !_frameConsumer || !_frameConsumer->valid() || !_metalDevice) {
+        NSBeep();
+        return;
+    }
+    if (_displayWindow) {
+        [_displayWindow makeKeyAndOrderFront:nil];
+        [NSApp activateIgnoringOtherApps:YES];
+        return;
+    }
+
+    NSRect frame = NSMakeRect(0, 0, 420, 720);
+    _displayWindow = [[NSWindow alloc]
+        initWithContentRect:frame
+                  styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
+                            NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskResizable
+                    backing:NSBackingStoreBuffered
+                      defer:NO];
+    _displayWindow.title = @"MacMu Display";
+    _displayWindow.releasedWhenClosed = NO;
+    _displayWindow.delegate = self;
+    [_displayWindow center];
+
+    _displayView = macmu_input_view_create(frame, _metalDevice, _inputSender, _guestInputSender);
+    _displayView.colorPixelFormat = MTLPixelFormatBGRA8Unorm;
+    _displayView.clearColor = MTLClearColorMake(0.03, 0.03, 0.035, 1.0);
+    _displayView.preferredFramesPerSecond = 60;
+    _displayView.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+
+    _displayRenderer = macmu_surface_renderer_create(_displayView, _frameConsumer);
+    macmu_input_view_set_renderer(_displayView, _displayRenderer);
+    _displayView.delegate = _displayRenderer;
+    _displayWindow.contentView = _displayView;
+    [_displayWindow makeFirstResponder:_displayView];
+    [_displayWindow makeKeyAndOrderFront:nil];
+
+    if (_frameConsumer->valid()) {
+        _displayView.paused = YES;
+        _displayView.enableSetNeedsDisplay = YES;
+        [self startDoorbellThreadForView:_displayView];
+        [_displayView setNeedsDisplay:YES];
+    } else {
+        _displayView.paused = NO;
+        _displayView.enableSetNeedsDisplay = NO;
+    }
+    [NSApp activateIgnoringOtherApps:YES];
+}
+
+- (void)quitFromStatusItem:(id)sender {
+    [NSApp terminate:nil];
+}
+
+- (void)setQemuStatusText:(NSString*)text {
+    _qemuStatusValue.stringValue = text;
+    if (_statusItem.button) {
+        _statusItem.button.title = [text hasPrefix:@"Running"] ? @"MacMu: Running" : @"MacMu";
+    }
+}
+
+- (void)publishQemuStatus:(NSString*)text {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [self setQemuStatusText:text];
+    });
+}
+
+- (void)startQemuSupervisor {
+    MacMuAppDelegate* delegate = self;
+    _qemuMonitorThread = std::thread([delegate] { [delegate qemuMonitorLoop]; });
+}
+
+- (void)qemuMonitorLoop {
+    while (!_shuttingDown.load(std::memory_order_acquire)) {
+        [self publishQemuStatus:@"Starting"];
+        const int doorbellFd =
+            (_channelReady && _frameConsumer) ? _frameConsumer->producer_doorbell_fd() : -1;
+        const pid_t pid = launch_qemu(_options, doorbellFd);
+        if (pid <= 0) {
+            [self publishQemuStatus:@"Launch failed; retrying"];
+            std::this_thread::sleep_for(std::chrono::seconds(2));
+            continue;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(_qemuMutex);
+            _qemuPid = pid;
+        }
+        _qemuGeneration.fetch_add(1, std::memory_order_acq_rel);
+        [self publishQemuStatus:[NSString stringWithFormat:@"Running (pid %d)", pid]];
+
+        int status = 0;
+        while (waitpid(pid, &status, 0) < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            break;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(_qemuMutex);
+            if (_qemuPid == pid) {
+                _qemuPid = -1;
+            }
+        }
+
+        if (_shuttingDown.load(std::memory_order_acquire)) {
+            break;
+        }
+        [self publishQemuStatus:@"Exited; restarting"];
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+    }
+}
+
+- (void)stopGuestInputSender {
+    std::lock_guard<std::mutex> lock(_guestInputMutex);
+    if (_guestInputSender) {
+        _guestInputSender->stop();
+    }
+}
+
+- (pid_t)currentQemuPid {
+    std::lock_guard<std::mutex> lock(_qemuMutex);
+    return _qemuPid;
+}
+
+- (void)startDoorbellThreadForView:(MTKView*)view {
+    [self stopDoorbellThread];
+    _doorbellShutdown.store(false, std::memory_order_release);
+    MacMuAppDelegate* delegate = self;
+    _doorbellThread = std::thread([delegate, view]() {
+        uint64_t lastFrame = 0;
+        uint64_t seenGeneration = delegate->_qemuGeneration.load(std::memory_order_acquire);
+        while (!delegate->_doorbellShutdown.load(std::memory_order_acquire)) {
+            const uint64_t currentGeneration =
+                delegate->_qemuGeneration.load(std::memory_order_acquire);
+            if (currentGeneration != seenGeneration) {
+                seenGeneration = currentGeneration;
+                lastFrame = 0;
+            }
+
+            SurfaceMetadata meta = {};
+            if (delegate->_frameConsumer &&
+                delegate->_frameConsumer->wait_for_frame(lastFrame, 1000, &meta)) {
+                lastFrame = meta.frame;
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    [view setNeedsDisplay:YES];
+                });
+            }
+        }
+    });
+}
+
+- (void)stopDoorbellThread {
+    _doorbellShutdown.store(true, std::memory_order_release);
+    if (_doorbellThread.joinable()) {
+        _doorbellThread.join();
+    }
+}
+
+- (void)shutdownRuntime {
+    if (_shuttingDown.exchange(true, std::memory_order_acq_rel)) {
+        return;
+    }
+
+    [self stopDoorbellThread];
+    [self stopGuestInputSender];
+
+    const pid_t pid = [self currentQemuPid];
+    if (pid > 0) {
+        terminate_qemu(pid);
+    }
+    if (_qemuMonitorThread.joinable()) {
+        _qemuMonitorThread.join();
+    }
+
+    if (_frameConsumer) {
+        delete _frameConsumer;
+        _frameConsumer = nullptr;
+    }
+    if (_inputSender) {
+        delete _inputSender;
+        _inputSender = nullptr;
+    }
+    if (_guestInputSender) {
+        delete _guestInputSender;
+        _guestInputSender = nullptr;
+    }
 }
 
 @end
 
-static MacMuAppDelegate* gAppDelegate;
-static FrameConsumer* gFrameConsumer;
-static InputSender* gInputSender;
-static GuestInputSender* gGuestInputSender;
-static std::atomic<bool> gShutdown{false};
-static std::thread gDoorbellThread;
-
 int main(int argc, char** argv) {
     @autoreleasepool {
         ShellOptions options = parse_options(argc, argv);
-
-        // The frame channel consumer must be created BEFORE qemu is launched,
-        // so the producer (gfxstream) can discover the shm object + Mach
-        // receive right on its first publish.
-        gFrameConsumer = new FrameConsumer();
-        const bool channelReady = gFrameConsumer->create(static_cast<uint32_t>(getpid()));
-        if (channelReady) {
-            NSLog(@"MacMu frame channel ready (pid=%u).", static_cast<unsigned>(getpid()));
-        } else {
-            NSLog(@"MacMu frame channel unavailable; no frames will be displayed.");
-        }
-
-        gInputSender = new InputSender();
-        if (gInputSender->open(options.inputSocketPath)) {
-            NSLog(@"MacMu input channel ready at %s.", options.inputSocketPath.c_str());
-        } else {
-            NSLog(@"MacMu input channel unavailable; pointer input will be disabled.");
-        }
-
-        const pid_t qemuPid = options.launchQemu ? launch_qemu(options) : -1;
-        if (options.launchQemu && qemuPid <= 0) {
-            return 1;
-        }
-        gGuestInputSender = new GuestInputSender();
-        gGuestInputSender->start(options);
-
         NSApplication* app = [NSApplication sharedApplication];
-        [app setActivationPolicy:NSApplicationActivationPolicyRegular];
-        gAppDelegate = [[MacMuAppDelegate alloc] initWithQemuPid:qemuPid];
-        [app setDelegate:gAppDelegate];
-
-        NSMenu* menu = [[NSMenu alloc] initWithTitle:@"MacMu"];
-        NSMenuItem* appItem = [[NSMenuItem alloc] init];
-        [menu addItem:appItem];
-        NSMenu* appMenu = [[NSMenu alloc] initWithTitle:@"MacMu"];
-        NSString* quitTitle = @"Quit MacMu";
-        [appMenu addItemWithTitle:quitTitle action:@selector(terminate:) keyEquivalent:@"q"];
-        [appItem setSubmenu:appMenu];
-        [app setMainMenu:menu];
-
-        id<MTLDevice> device = MTLCreateSystemDefaultDevice();
-        if (!device) {
-            NSLog(@"Metal is not available.");
-            return 1;
-        }
-
-        NSRect frame = NSMakeRect(0, 0, 420, 720);
-        NSWindow* window = [[NSWindow alloc]
-            initWithContentRect:frame
-                      styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
-                                NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskResizable
-                        backing:NSBackingStoreBuffered
-                          defer:NO];
-        [window center];
-
-        MTKView* view = macmu_input_view_create(frame, device, gInputSender, gGuestInputSender);
-        view.colorPixelFormat = MTLPixelFormatBGRA8Unorm;
-        view.clearColor = MTLClearColorMake(0.03, 0.03, 0.035, 1.0);
-        view.preferredFramesPerSecond = 60;
-        view.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
-
-        MacMuSurfaceRendererRef renderer = macmu_surface_renderer_create(view, gFrameConsumer);
-        macmu_input_view_set_renderer(view, renderer);
-        // MacMuSurfaceRendererRef resolves to MacMuSurfaceRenderer* under Obj-C;
-        // it conforms to MTKViewDelegate, so a plain assignment is all ARC needs.
-        view.delegate = renderer;
-        window.contentView = view;
-        [window makeFirstResponder:view];
-        [window makeKeyAndOrderFront:nil];
-
-        const bool useChannel = channelReady && gFrameConsumer->valid();
-        if (useChannel) {
-            // Event-driven rendering: the view only redraws when a new guest
-            // frame arrives, instead of spinning a 60 Hz timer. A background
-            // thread blocks on the Mach doorbell and kicks the main thread.
-            view.paused = YES;
-            view.enableSetNeedsDisplay = YES;
-            gDoorbellThread = std::thread([view]() {
-                uint64_t lastFrame = 0;
-                while (!gShutdown.load(std::memory_order_relaxed)) {
-                    SurfaceMetadata meta = {};
-                    if (gFrameConsumer->wait_for_frame(lastFrame, 1000, &meta)) {
-                        lastFrame = meta.frame;
-                        // Hop to the main thread to trigger a display cycle.
-                        dispatch_async(dispatch_get_main_queue(), ^{
-                            [view setNeedsDisplay:YES];
-                        });
-                    }
-                }
-            });
-        } else {
-            // Legacy fallback: drive the draw loop at a fixed cadence.
-            view.paused = NO;
-            view.enableSetNeedsDisplay = NO;
-        }
-
-        [app activateIgnoringOtherApps:YES];
+        MacMuAppDelegate* delegate = [[MacMuAppDelegate alloc] initWithOptions:options];
+        [app setDelegate:delegate];
         [app run];
-
-        // Signal the doorbell thread to exit, then join it BEFORE destroying
-        // gFrameConsumer. The thread's wait_for_frame() has a bounded 1s timeout
-        // so the join is guaranteed to return; joining first avoids a
-        // use-after-free where the detached thread would touch gFrameConsumer
-        // after we delete it below.
-        gShutdown.store(true, std::memory_order_relaxed);
-        if (gDoorbellThread.joinable()) {
-            gDoorbellThread.join();
-        }
-    }
-    if (gFrameConsumer) {
-        delete gFrameConsumer;
-        gFrameConsumer = nullptr;
-    }
-    if (gInputSender) {
-        delete gInputSender;
-        gInputSender = nullptr;
-    }
-    if (gGuestInputSender) {
-        delete gGuestInputSender;
-        gGuestInputSender = nullptr;
     }
     return 0;
 }

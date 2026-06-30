@@ -134,6 +134,25 @@ std::string default_dyld_library_path(const std::string& launcher_dir) {
     return lib64 + ":" + path_join(lib64, "gles_angle") + ":" + path_join(lib64, "vulkan");
 }
 
+std::string default_guest_ramdisk_overlay_path(const std::string& launcher_dir) {
+    (void)launcher_dir;
+    return {};
+}
+
+std::string default_guest_ramdisk_path(const std::string& launcher_dir) {
+    const std::string path = path_join(launcher_dir, "lib/macmu-ramdisk.img");
+    return file_exists(path) ? path : std::string();
+}
+
+std::string default_guest_agent_image_path(const std::string& launcher_dir) {
+    const std::string path = path_join(launcher_dir, "lib/macmu-agent.img");
+    return file_exists(path) ? path : std::string();
+}
+
+std::string default_guest_rpc_socket_path() {
+    return "/tmp/macmu.rpc." + std::to_string(static_cast<unsigned>(getpid())) + ".sock";
+}
+
 }  // namespace
 
 ShellOptions parse_options(int argc, char** argv) {
@@ -157,6 +176,18 @@ ShellOptions parse_options(int argc, char** argv) {
     // set MACMU_SYSTEM_PATH / AEMU_SHELL_SYSTEM_PATH.
     options.systemPath =
         env_or_default("MACMU_SYSTEM_PATH", "AEMU_SHELL_SYSTEM_PATH", options.systemPath);
+    options.guestRpcSocketPath =
+        env_or_default("MACMU_GUEST_RPC_SOCKET", "AEMU_SHELL_GUEST_RPC_SOCKET",
+                       default_guest_rpc_socket_path());
+    options.guestAgentImagePath =
+        env_or_default("MACMU_GUEST_AGENT_IMAGE", "AEMU_SHELL_GUEST_AGENT_IMAGE",
+                       default_guest_agent_image_path(options.launcherDir));
+    options.guestRamdiskOverlayPath =
+        env_or_default("MACMU_GUEST_RAMDISK_OVERLAY", "AEMU_SHELL_GUEST_RAMDISK_OVERLAY",
+                       default_guest_ramdisk_overlay_path(options.launcherDir));
+    options.guestRamdiskPath =
+        env_or_default("MACMU_GUEST_RAMDISK", "AEMU_SHELL_GUEST_RAMDISK",
+                       default_guest_ramdisk_path(options.launcherDir));
     options.avdName = env_or_default("MACMU_AVD_NAME", "AEMU_SHELL_AVD_NAME", options.avdName);
     bool qemu_path_overridden =
         std::getenv("MACMU_QEMU_PATH") != nullptr ||
@@ -164,6 +195,15 @@ ShellOptions parse_options(int argc, char** argv) {
     bool dyld_library_path_overridden =
         std::getenv("MACMU_DYLD_LIBRARY_PATH") != nullptr ||
         std::getenv("AEMU_SHELL_DYLD_LIBRARY_PATH") != nullptr;
+    bool guest_ramdisk_overlay_overridden =
+        std::getenv("MACMU_GUEST_RAMDISK_OVERLAY") != nullptr ||
+        std::getenv("AEMU_SHELL_GUEST_RAMDISK_OVERLAY") != nullptr;
+    bool guest_ramdisk_overridden =
+        std::getenv("MACMU_GUEST_RAMDISK") != nullptr ||
+        std::getenv("AEMU_SHELL_GUEST_RAMDISK") != nullptr;
+    bool guest_agent_image_overridden =
+        std::getenv("MACMU_GUEST_AGENT_IMAGE") != nullptr ||
+        std::getenv("AEMU_SHELL_GUEST_AGENT_IMAGE") != nullptr;
 
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
@@ -175,9 +215,7 @@ ShellOptions parse_options(int argc, char** argv) {
             return argv[++i];
         };
 
-        if (arg == "--attach") {
-            options.launchQemu = false;
-        } else if (arg == "--launcher-dir") {
+        if (arg == "--launcher-dir") {
             if (const char* value = require_value("--launcher-dir")) {
                 options.launcherDir = value;
                 if (!qemu_path_overridden) {
@@ -185,6 +223,17 @@ ShellOptions parse_options(int argc, char** argv) {
                 }
                 if (!dyld_library_path_overridden) {
                     options.dyldLibraryPath = default_dyld_library_path(options.launcherDir);
+                }
+                if (!guest_ramdisk_overlay_overridden) {
+                    options.guestRamdiskOverlayPath =
+                        default_guest_ramdisk_overlay_path(options.launcherDir);
+                }
+                if (!guest_ramdisk_overridden) {
+                    options.guestRamdiskPath = default_guest_ramdisk_path(options.launcherDir);
+                }
+                if (!guest_agent_image_overridden) {
+                    options.guestAgentImagePath =
+                        default_guest_agent_image_path(options.launcherDir);
                 }
             }
         } else if (arg == "--qemu") {
@@ -205,10 +254,33 @@ ShellOptions parse_options(int argc, char** argv) {
             if (const char* value = require_value("--system-path")) {
                 options.systemPath = value;
             }
+        } else if (arg == "--guest-rpc-socket") {
+            if (const char* value = require_value("--guest-rpc-socket")) {
+                options.guestRpcSocketPath = value;
+            }
+        } else if (arg == "--guest-agent-image") {
+            if (const char* value = require_value("--guest-agent-image")) {
+                options.guestAgentImagePath = value;
+                guest_agent_image_overridden = true;
+            }
+        } else if (arg == "--guest-ramdisk-overlay") {
+            if (const char* value = require_value("--guest-ramdisk-overlay")) {
+                options.guestRamdiskOverlayPath = value;
+                guest_ramdisk_overlay_overridden = true;
+            }
+        } else if (arg == "--guest-ramdisk") {
+            if (const char* value = require_value("--guest-ramdisk")) {
+                options.guestRamdiskPath = value;
+                guest_ramdisk_overridden = true;
+            }
         } else if (arg == "--avd") {
             if (const char* value = require_value("--avd")) {
                 options.avdName = value;
             }
+        } else if (arg == "--wipe-data") {
+            options.wipeData = true;
+        } else if (arg == "--open-display") {
+            options.openDisplay = true;
         }
     }
     return options;

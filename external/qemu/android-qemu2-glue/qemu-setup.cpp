@@ -168,6 +168,14 @@ inline static std::string to_string(const char* str) {
     return str ? std::string(str) : "";
 }
 
+static const char kMacMuGuestAgentDevicePath[] =
+        "/dev/block/platform/a003400.virtio_mmio/by-name/macmu";
+
+static const char* get_macmu_guest_agent_device_path() {
+    const char* value = std::getenv("MACMU_GUEST_AGENT_DEVICE");
+    return value && value[0] ? value : kMacMuGuestAgentDevicePath;
+}
+
 extern "C" void ranchu_device_tree_setup(void* fdt) {
     /* fstab */
     qemu_fdt_add_subnode(fdt, "/firmware/android/fstab");
@@ -209,6 +217,21 @@ extern "C" void ranchu_device_tree_setup(void* fdt) {
         qemu_fdt_setprop_string(fdt, "/firmware/android/fstab/vendor", "type",
                                 "ext4");
         free(vendor_path);
+    }
+
+    if (const char* image = std::getenv("MACMU_GUEST_AGENT_IMAGE");
+        image && image[0]) {
+        qemu_fdt_add_subnode(fdt, "/firmware/android/fstab/macmu");
+        qemu_fdt_setprop_string(fdt, "/firmware/android/fstab/macmu",
+                                "compatible", "android,macmu");
+        qemu_fdt_setprop_string(fdt, "/firmware/android/fstab/macmu", "dev",
+                                get_macmu_guest_agent_device_path());
+        qemu_fdt_setprop_string(fdt, "/firmware/android/fstab/macmu",
+                                "fsmgr_flags", "wait");
+        qemu_fdt_setprop_string(fdt, "/firmware/android/fstab/macmu",
+                                "mnt_flags", "ro");
+        qemu_fdt_setprop_string(fdt, "/firmware/android/fstab/macmu", "type",
+                                "ext4");
     }
 }
 

@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: MIT
+
+on property:sys.boot_completed=1
+    start macmu_rpc_agent
+
+service macmu_rpc_agent /system/bin/sh -c "exec /system/bin/app_process / dev.macmu.agent.MacMuAgent"
+    class late_start
+    user shell
+    group shell input inet readproc log
+    seclabel u:r:shell:s0
+    setenv CLASSPATH /mnt/macmu/macmu-agent.jar
+    disabled

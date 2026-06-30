@@ -1,0 +1,5 @@
+# SPDX-License-Identifier: MIT
+
+on late-fs
+    mount_all /vendor/etc/sensors/fstab.ranchu --late
+    umount /vendor/etc/sensors

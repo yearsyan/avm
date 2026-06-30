@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //
-// Frame channel consumer: shm-backed seqlock payload + Unix socket doorbell.
+// Frame channel consumer: shm-backed seqlock payload + inherited FD doorbell.
 
 #include "frame_consumer.h"
 
@@ -9,20 +9,19 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
-#include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
 #include <poll.h>
 #include <string>
 #include <sys/mman.h>
 #include <sys/socket.h>
-#include <sys/un.h>
 #include <unistd.h>
 
 namespace {
 
 constexpr uint64_t kShmMagic = 0x4d41434d5546524dull;  // 'MACMUFRM'
 constexpr uint32_t kShmVersion = 1;
+constexpr int kDoorbellSocketBufferBytes = 1 << 20;
 
 struct ShmHeader {
     uint64_t magic;
@@ -49,21 +48,21 @@ std::string shm_path(const std::string& name) {
     return name.find('/') == std::string::npos ? std::string("/") + name : name;
 }
 
-std::string doorbell_path(const std::string& name) {
-    return "/tmp/" + name + ".doorbell";
-}
-
-bool fill_unix_addr(const std::string& path, sockaddr_un* addr) {
-    if (path.size() >= sizeof(addr->sun_path)) {
+bool set_close_on_exec(int fd) {
+    const int flags = fcntl(fd, F_GETFD);
+    if (flags < 0) {
         return false;
     }
-    std::memset(addr, 0, sizeof(*addr));
-#ifdef __APPLE__
-    addr->sun_len = sizeof(*addr);
-#endif
-    addr->sun_family = AF_UNIX;
-    std::strncpy(addr->sun_path, path.c_str(), sizeof(addr->sun_path) - 1);
-    return true;
+    return fcntl(fd, F_SETFD, flags | FD_CLOEXEC) == 0;
+}
+
+void set_socket_buffer_size_best_effort(int fd, int option) {
+    int size = kDoorbellSocketBufferBytes;
+    setsockopt(fd, SOL_SOCKET, option, &size, sizeof(size));
+}
+
+bool is_new_frame(const SurfaceMetadata& metadata, uint64_t last_frame) {
+    return metadata.frame != 0 && metadata.frame != last_frame;
 }
 
 }  // namespace
@@ -95,24 +94,29 @@ bool FrameConsumer::create(uint32_t wrapper_pid) {
     payload_ = static_cast<char*>(mapped_) + sizeof(ShmHeader);
     std::memset(payload_, 0, sizeof(ShmPayload));
 
-    const std::string pathDoorbell = doorbell_path(name_);
-    sockaddr_un addr = {};
-    if (!fill_unix_addr(pathDoorbell, &addr)) {
+    int doorbellPair[2] = {-1, -1};
+    if (socketpair(AF_UNIX, SOCK_DGRAM, 0, doorbellPair) != 0) {
         teardown();
         return false;
     }
-    doorbellFd_ = socket(AF_UNIX, SOCK_DGRAM, 0);
-    if (doorbellFd_ < 0) {
+    doorbellFd_ = doorbellPair[0];
+    producerDoorbellFd_ = doorbellPair[1];
+    if (!set_close_on_exec(doorbellFd_) || !set_close_on_exec(producerDoorbellFd_)) {
         teardown();
         return false;
     }
-    unlink(pathDoorbell.c_str());
-    if (bind(doorbellFd_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
-        teardown();
-        return false;
-    }
+    set_socket_buffer_size_best_effort(doorbellFd_, SO_RCVBUF);
+    set_socket_buffer_size_best_effort(producerDoorbellFd_, SO_SNDBUF);
+
     valid_ = true;
     return true;
+}
+
+void FrameConsumer::close_producer_doorbell_fd() {
+    if (producerDoorbellFd_ >= 0) {
+        close(producerDoorbellFd_);
+        producerDoorbellFd_ = -1;
+    }
 }
 
 bool FrameConsumer::read(SurfaceMetadata* out) {
@@ -139,13 +143,9 @@ bool FrameConsumer::read(SurfaceMetadata* out) {
 
 bool FrameConsumer::wait_for_frame(uint64_t last_frame, uint64_t timeout_ms, SurfaceMetadata* out) {
     if (!valid_) return false;
-    if (read(out) && out->frame > last_frame) return true;
+    if (read(out) && is_new_frame(*out, last_frame)) return true;
     const uint64_t deadline_ms = steady_now_ms() + timeout_ms;
     do {
-        // Drain any queued notifications without blocking first.
-        drain_notifications();
-        if (read(out) && out->frame > last_frame) return true;
-
         const uint64_t now = steady_now_ms();
         if (now >= deadline_ms) break;
         pollfd pfd = {};
@@ -155,16 +155,16 @@ bool FrameConsumer::wait_for_frame(uint64_t last_frame, uint64_t timeout_ms, Sur
             poll(&pfd, 1, static_cast<int>(deadline_ms - now));
         if (pollResult > 0 && (pfd.revents & POLLIN)) {
             drain_notifications();
-            if (read(out) && out->frame > last_frame) return true;
+            if (read(out) && is_new_frame(*out, last_frame)) return true;
         } else if (pollResult == 0) {
-            continue;
+            break;
         } else if (pollResult < 0 && errno == EINTR) {
             continue;
         } else {
             break;
         }
     } while (steady_now_ms() < deadline_ms);
-    return read(out) && out->frame > last_frame;
+    return read(out) && is_new_frame(*out, last_frame);
 }
 
 uint64_t FrameConsumer::steady_now_ms() {
@@ -178,8 +178,11 @@ void FrameConsumer::drain_notifications() {
     while (true) {
         uint64_t frame = 0;
         const ssize_t bytes = recv(doorbellFd_, &frame, sizeof(frame), MSG_DONTWAIT);
-        if (bytes >= 0) {
+        if (bytes > 0) {
             continue;
+        }
+        if (bytes == 0) {
+            break;
         }
         if (errno == EINTR) {
             continue;
@@ -193,6 +196,7 @@ void FrameConsumer::teardown() {
         close(doorbellFd_);
         doorbellFd_ = -1;
     }
+    close_producer_doorbell_fd();
     if (mapped_) {
         munmap(mapped_, totalSize_);
         mapped_ = nullptr;
@@ -203,7 +207,6 @@ void FrameConsumer::teardown() {
     }
     if (!name_.empty()) {
         shm_unlink(shm_path(name_).c_str());
-        unlink(doorbell_path(name_).c_str());
     }
     valid_ = false;
 }

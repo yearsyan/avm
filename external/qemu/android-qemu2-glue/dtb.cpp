@@ -47,6 +47,7 @@ int createDtbFile(const Params& params, const std::string &dtbFilename) {
     struct property android_properties[1];
     struct property fstab_properties[1];
     struct property vendor_properties[5];
+    struct property macmu_properties[5];
 
     char lit_compatible[] = "compatible";
     char lit_dev[] = "dev";
@@ -55,6 +56,7 @@ int createDtbFile(const Params& params, const std::string &dtbFilename) {
     char lit_fsmgr_flags[] = "fsmgr_flags";
 
     char lit_vendor_compatible_value[] = "android,vendor";
+    char lit_macmu_compatible_value[] = "android,macmu";
     char lit_fstab_compatibe_value[] = "android,fstab";
     char lit_android_compatibe_value[] = "android,firmware";
 
@@ -65,6 +67,9 @@ int createDtbFile(const Params& params, const std::string &dtbFilename) {
     std::vector<char> vendor_device_location(
         params.vendor_device_location.begin(), params.vendor_device_location.end());
     vendor_device_location.push_back(0);
+    std::vector<char> macmu_device_location(
+        params.macmu_device_location.begin(), params.macmu_device_location.end());
+    macmu_device_location.push_back(0);
 
     initProperty(lit_compatible, lit_android_compatibe_value,
         &android_properties[0], nullptr);
@@ -87,23 +92,46 @@ int createDtbFile(const Params& params, const std::string &dtbFilename) {
     initProperty(lit_fsmgr_flags, lit_fsmgr_flags_value,
         &vendor_properties[4], NULL);
 
+    if (!params.macmu_device_location.empty()) {
+        initProperty(lit_compatible, lit_macmu_compatible_value,
+            &macmu_properties[0], &macmu_properties[1]);
+
+        initProperty(lit_dev, macmu_device_location.data(),
+            &macmu_properties[1], &macmu_properties[2]);
+
+        initProperty(lit_type, lit_type_value,
+            &macmu_properties[2], &macmu_properties[3]);
+
+        initProperty(lit_mnt_flags, lit_mnt_flags_value,
+            &macmu_properties[3], &macmu_properties[4]);
+
+        initProperty(lit_fsmgr_flags, lit_fsmgr_flags_value,
+            &macmu_properties[4], NULL);
+    }
+
     struct node root;
     struct node firmware;
     struct node android;
     struct node fstab;
     struct node vendor;
+    struct node macmu;
 
     char lit_root[] = "";
     char lit_firmware[] = "firmware";
     char lit_android[] = "android";
     char lit_fstab[] = "fstab";
     char lit_vendor[] = "vendor";
+    char lit_macmu[] = "macmu";
 
     initNode(lit_root, nullptr, &root, &firmware);
     initNode(lit_firmware, nullptr, &firmware, &android);
     initNode(lit_android, android_properties, &android, &fstab);
     initNode(lit_fstab, fstab_properties, &fstab, &vendor);
-    initNode(lit_vendor, vendor_properties, &vendor, nullptr);
+    initNode(lit_vendor, vendor_properties, &vendor,
+             params.macmu_device_location.empty() ? nullptr : &macmu);
+    if (!params.macmu_device_location.empty()) {
+        initNode(lit_macmu, macmu_properties, &macmu, nullptr);
+    }
 
     android::base::ScopedStdioFile file(::android_fopen(dtbFilename.c_str(), "wb"));
     if (file.get()) {

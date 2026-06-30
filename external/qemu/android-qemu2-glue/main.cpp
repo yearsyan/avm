@@ -1357,6 +1357,88 @@ static std::string getWriteableFilename(const char* disk_dataPartition_path,
     }
 }
 
+static const char* getNonEmptyEnv(const char* name) {
+    const char* value = getenv(name);
+    return value && value[0] ? value : nullptr;
+}
+
+static const char kMacMuGuestAgentDevicePath[] =
+        "/dev/block/platform/a003400.virtio_mmio/by-name/macmu";
+
+static const char* getMacMuGuestAgentDevicePath() {
+    if (const char* devicePath = getNonEmptyEnv("MACMU_GUEST_AGENT_DEVICE")) {
+        return devicePath;
+    }
+    return kMacMuGuestAgentDevicePath;
+}
+
+static void appendMacMuGuestBootProperties(
+        std::vector<std::pair<std::string, std::string>>* props) {
+    const char* socketPath = getNonEmptyEnv("MACMU_GUEST_RPC_SOCKET");
+    if (socketPath) {
+        props->push_back({"androidboot.macmu_rpc_socket", socketPath});
+    }
+    if (getNonEmptyEnv("MACMU_GUEST_AGENT_IMAGE")) {
+        const char* initRc = getNonEmptyEnv("MACMU_GUEST_INIT_RC");
+        props->push_back({"androidboot.init_rc",
+                          initRc ? initRc : "/vendor/etc/sensors/init.rc"});
+    }
+}
+
+static int appendFileToStream(FILE* out, const char* srcPath) {
+    FILE* in = fopen(srcPath, "rb");
+    if (!in) {
+        return errno ? errno : ENOENT;
+    }
+
+    char buffer[64 * 1024];
+    int result = 0;
+    while (true) {
+        const size_t readBytes = fread(buffer, 1, sizeof(buffer), in);
+        if (readBytes > 0 &&
+            fwrite(buffer, 1, readBytes, out) != readBytes) {
+            result = errno ? errno : EIO;
+            break;
+        }
+        if (readBytes < sizeof(buffer)) {
+            if (ferror(in)) {
+                result = errno ? errno : EIO;
+            }
+            break;
+        }
+    }
+
+    if (fclose(in) != 0 && result == 0) {
+        result = errno ? errno : EIO;
+    }
+    return result;
+}
+
+static int createMacMuGuestRamdisk(const char* basePath,
+                                   const char* overlayPath,
+                                   const char* outPath) {
+    if (!basePath || !overlayPath || !outPath || !outPath[0]) {
+        return EINVAL;
+    }
+    if (!path_exists(overlayPath)) {
+        return ENOENT;
+    }
+
+    FILE* out = fopen(outPath, "wb");
+    if (!out) {
+        return errno ? errno : EIO;
+    }
+
+    int result = appendFileToStream(out, basePath);
+    if (result == 0) {
+        result = appendFileToStream(out, overlayPath);
+    }
+    if (fclose(out) != 0 && result == 0) {
+        result = errno ? errno : EIO;
+    }
+    return result;
+}
+
 static bool isEmulatorCircular(const char* param, const char* val) {
     return strcmp(param, "ro.emulator.circular") == 0 &&
            (strncmp(val, "1", 1) == 0 || strncmp(val, "y", 1) == 0 ||
@@ -2869,9 +2951,40 @@ extern "C" int main(int argc, char** argv) {
     args.add("-nodefaults");
 
     std::string bootconfigInitrdPath;
+    std::string macmuGuestInitrdPath;
+    const char* ramdiskWithMacMuOverlayPath = hw->disk_ramdisk_path;
 
     if (hw->disk_ramdisk_path) {
         args.add2("-kernel", hw->kernel_path);
+
+        if (const char* macmuGuestRamdiskPath =
+                    getNonEmptyEnv("MACMU_GUEST_RAMDISK")) {
+            if (!path_exists(macmuGuestRamdiskPath)) {
+                android_panic("MacMu guest ramdisk is missing: %s",
+                              macmuGuestRamdiskPath);
+                return ENOENT;
+            }
+            ramdiskWithMacMuOverlayPath = macmuGuestRamdiskPath;
+            dinfo("MacMu guest ramdisk selected: %s", macmuGuestRamdiskPath);
+        } else if (const char* macmuGuestOverlayPath =
+                           getNonEmptyEnv("MACMU_GUEST_RAMDISK_OVERLAY")) {
+            macmuGuestInitrdPath = getWriteableFilename(
+                    hw->disk_dataPartition_path, "macmu-initrd");
+            const int result = createMacMuGuestRamdisk(
+                    hw->disk_ramdisk_path, macmuGuestOverlayPath,
+                    macmuGuestInitrdPath.c_str());
+            if (result) {
+                android_panic("Could not prepare MacMu guest initrd overlay, "
+                              "error=%d base=%s overlay=%s dst=%s",
+                              result, hw->disk_ramdisk_path,
+                              macmuGuestOverlayPath,
+                              macmuGuestInitrdPath.c_str());
+                return result;
+            }
+            ramdiskWithMacMuOverlayPath = macmuGuestInitrdPath.c_str();
+            dinfo("MacMu guest initrd overlay appended: %s",
+                  macmuGuestOverlayPath);
+        }
 
         if (fc::isEnabled(fc::AndroidbootProps) ||
             fc::isEnabled(fc::AndroidbootProps2)) {
@@ -2879,28 +2992,51 @@ extern "C" int main(int argc, char** argv) {
                     hw->disk_dataPartition_path, "initrd");
             args.add2("-initrd", bootconfigInitrdPath.c_str());
         } else {
-            args.add2("-initrd", hw->disk_ramdisk_path);
+            args.add2("-initrd", ramdiskWithMacMuOverlayPath);
         }
     } else {
         android_panic("disk_ramdisk_path is required but missing");
         return 1;
     }
 
+    // Add MacMu after the AVD partitions so the emulator's platform by-name
+    // paths and androidboot.boot_devices remain stable. The guest fstab uses
+    // platform by-name paths for MacMu and userdata to avoid ARM's reversed
+    // /dev/block/vd* numbering.
     // add partition parameters with the sequence pre-defined in
     // targetInfo.imagePartitionTypes
     args.add(PartitionParameters::create(hw, avd));
+
+    if (const char* macmuGuestAgentImage =
+                getNonEmptyEnv("MACMU_GUEST_AGENT_IMAGE")) {
+        args.add("-blockdev");
+        args.add(StringFormat(
+                "driver=file,node-name=macmu_file,filename=%s,read-only=on",
+                macmuGuestAgentImage));
+        args.add("-blockdev");
+        args.add("driver=raw,node-name=macmu,file=macmu_file,read-only=on");
+        args.add("-device");
+        args.add(StringFormat("%s,drive=macmu",
+                              kTarget.storageDeviceType));
+        dinfo("MacMu guest agent image selected: %s", macmuGuestAgentImage);
+    }
 
     if (fc::isEnabled(fc::KernelDeviceTreeBlobSupport)) {
         const std::string dtbFileName = getWriteableFilename(
                 hw->disk_dataPartition_path, "default.dtb");
 
-        if (android_op_wipe_data || !path_exists(dtbFileName.c_str())) {
+        if (android_op_wipe_data || !path_exists(dtbFileName.c_str()) ||
+            getNonEmptyEnv("MACMU_GUEST_AGENT_IMAGE")) {
             ::dtb::Params params;
 
             char* vendor_path = avdInfo_getVendorImageDevicePathInGuest(avd);
             if (vendor_path) {
                 params.vendor_device_location = vendor_path;
                 free(vendor_path);
+                if (getNonEmptyEnv("MACMU_GUEST_AGENT_IMAGE")) {
+                    params.macmu_device_location =
+                            getMacMuGuestAgentDevicePath();
+                }
 
                 exitStatus = createDtbFile(params, dtbFileName);
                 if (exitStatus) {
@@ -3511,6 +3647,7 @@ extern "C" int main(int argc, char** argv) {
                         getBootPropOpenglesVersion(&rendererConfig), apiLevel,
                         avdFlavor, real_console_tty_prefix,
                         &verified_boot_params, hw);
+        appendMacMuGuestBootProperties(&userspaceBootOpts);
 
         std::vector<std::string> kernelCmdLineUserspaceBootOpts;
         if (fc::isEnabled(fc::AndroidbootProps) ||
@@ -3524,12 +3661,12 @@ extern "C" int main(int argc, char** argv) {
             }
 
             const int r = createRamdiskWithBootconfig(
-                    hw->disk_ramdisk_path, bootconfigInitrdPath.c_str(),
+                    ramdiskWithMacMuOverlayPath, bootconfigInitrdPath.c_str(),
                     userspaceBootOpts);
             if (r) {
                 android_panic("%s:%d Could not prepare the ramdisk with bootconfig, "
                        "error=%d src=%s dst=%s",
-                       __func__, __LINE__, r, hw->disk_ramdisk_path,
+                       __func__, __LINE__, r, ramdiskWithMacMuOverlayPath,
                        bootconfigInitrdPath.c_str());
 
                 return r;

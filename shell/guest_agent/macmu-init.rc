@@ -1,0 +1,10 @@
+# SPDX-License-Identifier: MIT
+
+import /vendor/etc/sensors/init.ranchu.rc
+import /system/etc/init/hw/init.rc
+import /system/etc/init
+import /system_ext/etc/init
+import /vendor/etc/init
+import /odm/etc/init
+import /product/etc/init
+import /vendor/etc/sensors/macmu-agent.rc

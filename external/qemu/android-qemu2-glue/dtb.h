@@ -17,6 +17,7 @@ namespace dtb {
 
 struct Params {
     std::string vendor_device_location;  // location of the vendor partition.
+    std::string macmu_device_location;  // location of the MacMu agent partition.
 };
 
 /*

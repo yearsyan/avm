@@ -154,6 +154,12 @@ float scroll_axis_value(NSEvent* event, CGFloat delta) {
     }
 }
 
+- (void)mouseExited:(NSEvent*)event {
+    if (_guestInputSender) {
+        _guestInputSender->send_hover_exit();
+    }
+}
+
 - (void)mouseDown:(NSEvent*)event {
     [[self window] makeFirstResponder:self];
     int x = 0;
@@ -165,7 +171,11 @@ float scroll_axis_value(NSEvent* event, CGFloat delta) {
     _leftTouchActive = YES;
     _lastTouchX = x;
     _lastTouchY = y;
-    _inputSender->send_touch(macmu::InputEventKind::kTouchBegin, displayId, 0, x, y);
+    if (_guestInputSender && _guestInputSender->ready()) {
+        _guestInputSender->send_touch(macmu::InputEventKind::kTouchBegin, displayId, 0, x, y);
+    } else {
+        _inputSender->send_touch(macmu::InputEventKind::kTouchBegin, displayId, 0, x, y);
+    }
 }
 
 - (void)mouseDragged:(NSEvent*)event {
@@ -178,7 +188,11 @@ float scroll_axis_value(NSEvent* event, CGFloat delta) {
     if ([self mapEvent:event clamp:YES x:&x y:&y displayId:&displayId]) {
         _lastTouchX = x;
         _lastTouchY = y;
-        _inputSender->send_touch(macmu::InputEventKind::kTouchUpdate, displayId, 0, x, y);
+        if (_guestInputSender && _guestInputSender->ready()) {
+            _guestInputSender->send_touch(macmu::InputEventKind::kTouchUpdate, displayId, 0, x, y);
+        } else {
+            _inputSender->send_touch(macmu::InputEventKind::kTouchUpdate, displayId, 0, x, y);
+        }
     }
 }
 
@@ -191,7 +205,11 @@ float scroll_axis_value(NSEvent* event, CGFloat delta) {
     uint32_t displayId = 0;
     [self mapEvent:event clamp:YES x:&x y:&y displayId:&displayId];
     _leftTouchActive = NO;
-    _inputSender->send_touch(macmu::InputEventKind::kTouchEnd, displayId, 0, x, y);
+    if (_guestInputSender && _guestInputSender->ready()) {
+        _guestInputSender->send_touch(macmu::InputEventKind::kTouchEnd, displayId, 0, x, y);
+    } else {
+        _inputSender->send_touch(macmu::InputEventKind::kTouchEnd, displayId, 0, x, y);
+    }
 }
 
 - (void)scrollWheel:(NSEvent*)event {
@@ -238,7 +256,12 @@ float scroll_axis_value(NSEvent* event, CGFloat delta) {
     int y = 0;
     uint32_t displayId = 0;
     if ([self mapEvent:event clamp:clamp x:&x y:&y displayId:&displayId]) {
-        _inputSender->send_mouse_move(displayId, x, y, buttons_for_event(event));
+        const uint32_t buttons = buttons_for_event(event);
+        if (_guestInputSender && _guestInputSender->ready()) {
+            _guestInputSender->send_mouse_move(displayId, x, y, buttons);
+        } else {
+            _inputSender->send_mouse_move(displayId, x, y, buttons);
+        }
     }
 }
 
@@ -247,7 +270,12 @@ float scroll_axis_value(NSEvent* event, CGFloat delta) {
     int y = 0;
     uint32_t displayId = 0;
     if ([self mapEvent:event clamp:YES x:&x y:&y displayId:&displayId]) {
-        _inputSender->send_mouse_button(displayId, x, y, buttons_for_event(event));
+        const uint32_t buttons = buttons_for_event(event);
+        if (_guestInputSender && _guestInputSender->ready()) {
+            _guestInputSender->send_mouse_button(displayId, x, y, buttons);
+        } else {
+            _inputSender->send_mouse_button(displayId, x, y, buttons);
+        }
     }
 }
 

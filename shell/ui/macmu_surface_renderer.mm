@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 
@@ -41,6 +42,11 @@ NSSize fitted_window_content_size(uint32_t pixel_width, uint32_t pixel_height) {
     return NSMakeSize(std::max<CGFloat>(1.0, width), std::max<CGFloat>(1.0, height));
 }
 
+bool renderer_debug_logs_enabled() {
+    static const bool enabled = std::getenv("MACMU_RENDERER_LOG") != nullptr;
+    return enabled;
+}
+
 }  // namespace
 
 @interface MacMuSurfaceRenderer : NSObject <MTKViewDelegate>
@@ -53,11 +59,17 @@ NSSize fitted_window_content_size(uint32_t pixel_width, uint32_t pixel_height) {
     id<MTLCommandQueue> _queue;
     id<MTLRenderPipelineState> _pipeline;
     SurfaceMetadata _metadata;
-    IOSurfaceRef _surface;
     id<MTLTexture> _surfaceTexture;
+    NSMutableDictionary<NSNumber*, id>* _surfaceCache;
+    NSMutableDictionary<NSNumber*, id<MTLTexture>>* _textureCache;
     FrameConsumer* _frameConsumer;  // not owned; nil when unavailable
     bool _useChannel;               // true when FrameConsumer is valid
     uint64_t _lastDrawnFrame;       // last frame number actually rendered
+    uint64_t _lastLoggedSubmitFrame;
+    MacmuIOSurfaceID _lastFailedSurfaceId;
+    bool _loggedWaitingForFrame;
+    bool _loggedMissingTexture;
+    bool _loggedNoDrawable;
     Viewport _cachedViewport;       // recomputed only when drawable size changes
     bool _viewportValid;
 }
@@ -71,10 +83,16 @@ NSSize fitted_window_content_size(uint32_t pixel_width, uint32_t pixel_height) {
     _view = view;
     _device = view.device;
     _queue = [_device newCommandQueue];
-    _surface = nullptr;
+    _surfaceCache = [[NSMutableDictionary alloc] init];
+    _textureCache = [[NSMutableDictionary alloc] init];
     _frameConsumer = frameConsumer;
     _useChannel = frameConsumer != nullptr && frameConsumer->valid();
     _lastDrawnFrame = 0;
+    _lastLoggedSubmitFrame = 0;
+    _lastFailedSurfaceId = 0;
+    _loggedWaitingForFrame = false;
+    _loggedMissingTexture = false;
+    _loggedNoDrawable = false;
     _viewportValid = false;
     _cachedViewport = Viewport{};
 
@@ -98,13 +116,6 @@ NSSize fitted_window_content_size(uint32_t pixel_width, uint32_t pixel_height) {
     }
 
     return self;
-}
-
-- (void)dealloc {
-    if (_surface) {
-        CFRelease(_surface);
-        _surface = nullptr;
-    }
 }
 
 - (void)mtkView:(MTKView*)view drawableSizeWillChange:(CGSize)size {
@@ -184,65 +195,107 @@ NSSize fitted_window_content_size(uint32_t pixel_width, uint32_t pixel_height) {
         gotFrame = _frameConsumer->read(&next);
     }
     if (!gotFrame) {
+        if (renderer_debug_logs_enabled() && !_surfaceTexture && !_loggedWaitingForFrame) {
+            NSLog(@"MacMu renderer waiting for first IOSurface frame.");
+            _loggedWaitingForFrame = true;
+        }
         return NO;
     }
-    // Only a frame-number advance counts as a new frame worth rendering.
-    if (next.frame <= _lastDrawnFrame && _surfaceTexture != nil) {
+    _loggedWaitingForFrame = false;
+    // A qemu restart resets the producer's frame counter. Treat a lower frame
+    // number as a fresh stream; only an equal frame is a true duplicate.
+    const BOOL frameCounterReset = next.frame < _lastDrawnFrame;
+    if (next.frame == _lastDrawnFrame && _surfaceTexture != nil) {
         return NO;
     }
-    const BOOL surfaceChanged = next.iosurfaceId != _metadata.iosurfaceId ||
-                               next.width != _metadata.width ||
-                               next.height != _metadata.height;
+    const BOOL sizeChanged = frameCounterReset || next.width != _metadata.width ||
+                             next.height != _metadata.height;
+    const BOOL surfaceChanged =
+        sizeChanged || next.iosurfaceId != _metadata.iosurfaceId;
     if (surfaceChanged) {
-        IOSurfaceRef surface = IOSurfaceLookup(next.iosurfaceId);
-        if (!surface) {
-            return NO;
+        if (renderer_debug_logs_enabled()) {
+            NSLog(@"MacMu renderer mapping IOSurface %u (%ux%u), frame %llu%@.",
+                  next.iosurfaceId, next.width, next.height,
+                  static_cast<unsigned long long>(next.frame),
+                  frameCounterReset ? @" after producer restart" : @"");
         }
-        MTLTextureDescriptor* descriptor =
-            [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
-                                                              width:next.width
-                                                             height:next.height
-                                                          mipmapped:NO];
-        descriptor.usage = MTLTextureUsageShaderRead;
-        id<MTLTexture> texture = [_device newTextureWithDescriptor:descriptor
-                                                         iosurface:surface
-                                                             plane:0];
+        if (sizeChanged) {
+            [_surfaceCache removeAllObjects];
+            [_textureCache removeAllObjects];
+        }
+
+        NSNumber* cacheKey = @(next.iosurfaceId);
+        id<MTLTexture> texture = [_textureCache objectForKey:cacheKey];
         if (!texture) {
-            CFRelease(surface);
-            return NO;
+            IOSurfaceRef surface = IOSurfaceLookup(next.iosurfaceId);
+            if (!surface) {
+                if (_lastFailedSurfaceId != next.iosurfaceId) {
+                    NSLog(@"MacMu renderer IOSurfaceLookup failed for id %u.", next.iosurfaceId);
+                    _lastFailedSurfaceId = next.iosurfaceId;
+                }
+                return NO;
+            }
+            MTLTextureDescriptor* descriptor =
+                [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                                                  width:next.width
+                                                                 height:next.height
+                                                              mipmapped:NO];
+            descriptor.usage = MTLTextureUsageShaderRead;
+            texture = [_device newTextureWithDescriptor:descriptor
+                                              iosurface:surface
+                                                  plane:0];
+            if (!texture) {
+                NSLog(@"MacMu renderer Metal texture creation failed for IOSurface %u.",
+                      next.iosurfaceId);
+                CFRelease(surface);
+                return NO;
+            }
+            id surfaceObject = CFBridgingRelease(surface);
+            [_surfaceCache setObject:surfaceObject forKey:cacheKey];
+            [_textureCache setObject:texture forKey:cacheKey];
         }
-        if (_surface) {
-            CFRelease(_surface);
-        }
-        _surface = surface;
         _surfaceTexture = texture;
-        const NSSize contentSize = fitted_window_content_size(next.width, next.height);
-        [_view.window setContentAspectRatio:NSMakeSize(next.width, next.height)];
-        [_view.window setContentSize:contentSize];
-        [_view.window setTitle:[NSString stringWithFormat:@"MacMu IOSurface %u", next.iosurfaceId]];
-        _viewportValid = false;
+        if (sizeChanged) {
+            const NSSize contentSize = fitted_window_content_size(next.width, next.height);
+            [_view.window setContentAspectRatio:NSMakeSize(next.width, next.height)];
+            [_view.window setContentSize:contentSize];
+            _viewportValid = false;
+        }
+        if (renderer_debug_logs_enabled()) {
+            NSLog(@"MacMu renderer mapped IOSurface %u into Metal texture.", next.iosurfaceId);
+        }
+        _lastFailedSurfaceId = 0;
     }
     _metadata = next;
     return YES;
 }
 
 - (void)drawInMTKView:(MTKView*)view {
-    // Skip the Metal submit entirely when there is no new frame to show. This
-    // is the key power/throughput win: a static guest screen (lock screen,
-    // paused app) no longer drives a 60 Hz blit loop.
+    // The doorbell wakes us for new guest frames, but AppKit can also ask the
+    // view to redraw after expose/resize. In that case, reuse the last mapped
+    // IOSurface instead of leaving the drawable at the window background.
     const BOOL hasNewFrame = [self reloadSurfaceIfNeeded];
-    if (!hasNewFrame) {
-        return;
-    }
     if (!_surfaceTexture || !_pipeline) {
+        if (renderer_debug_logs_enabled() && (hasNewFrame || !_loggedMissingTexture)) {
+            NSLog(@"MacMu renderer cannot draw yet (texture=%@ pipeline=%@).",
+                  _surfaceTexture ? @"yes" : @"no", _pipeline ? @"yes" : @"no");
+            _loggedMissingTexture = true;
+        }
         return;
     }
+    _loggedMissingTexture = false;
 
     id<CAMetalDrawable> drawable = view.currentDrawable;
     MTLRenderPassDescriptor* pass = view.currentRenderPassDescriptor;
     if (!drawable || !pass) {
+        if (!_loggedNoDrawable) {
+            NSLog(@"MacMu renderer has no drawable/pass yet (drawable=%@ pass=%@).",
+                  drawable ? @"yes" : @"no", pass ? @"yes" : @"no");
+            _loggedNoDrawable = true;
+        }
         return;
     }
+    _loggedNoDrawable = false;
     pass.colorAttachments[0].loadAction = MTLLoadActionClear;
     pass.colorAttachments[0].clearColor = view.clearColor;
 
@@ -263,7 +316,15 @@ NSSize fitted_window_content_size(uint32_t pixel_width, uint32_t pixel_height) {
     [commandBuffer presentDrawable:drawable];
     [commandBuffer commit];
 
-    _lastDrawnFrame = _metadata.frame;
+    if (hasNewFrame) {
+        _lastDrawnFrame = _metadata.frame;
+    }
+    if (renderer_debug_logs_enabled() && _metadata.frame != 0 &&
+        _metadata.frame != _lastLoggedSubmitFrame) {
+        NSLog(@"MacMu renderer submitted frame %llu from IOSurface %u.",
+              static_cast<unsigned long long>(_metadata.frame), _metadata.iosurfaceId);
+        _lastLoggedSubmitFrame = _metadata.frame;
+    }
 }
 
 @end

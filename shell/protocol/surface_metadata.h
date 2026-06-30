@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: MIT
 //
-// Shared surface metadata exchanged between the frame channel, the JSON
-// metadata fallback reader, and the AppKit/Metal renderer. Kept as a plain
-// C++ header (no Cocoa/Metal dependency) so the .cpp backend units can include
-// it without pulling in IOSurface.
+// Shared surface metadata exchanged between the frame channel and the
+// AppKit/Metal renderer. Kept as a plain C++ header (no Cocoa/Metal dependency)
+// so the .cpp backend units can include it without pulling in IOSurface.
 
 #ifndef MACMU_SHELL_SURFACE_METADATA_H
 #define MACMU_SHELL_SURFACE_METADATA_H

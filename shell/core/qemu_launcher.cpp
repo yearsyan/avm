@@ -5,9 +5,11 @@
 
 #include "qemu_launcher.h"
 
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fcntl.h>
 #include <signal.h>
 #include <spawn.h>
 #include <string>
@@ -21,6 +23,12 @@
 extern char** environ;
 
 namespace {
+
+// Stable child fd used only for the frame doorbell. Keep it away from stdio and
+// the low-numbered fds qemu may inherit from its launcher.
+constexpr int kChildFrameDoorbellFd = 198;
+constexpr const char* kFrameDoorbellFdEnv = "MACMU_FRAME_DOORBELL_FD";
+constexpr const char* kLegacyFrameDoorbellFdEnv = "AEMU_FRAME_DOORBELL_FD";
 
 bool has_key(const std::vector<std::pair<std::string, std::string>>& overrides,
              const std::string& key) {
@@ -59,9 +67,18 @@ std::vector<char*> make_cstring_vector(std::vector<std::string>& values) {
     return pointers;
 }
 
+bool set_close_on_exec(int fd, bool enabled) {
+    const int flags = fcntl(fd, F_GETFD);
+    if (flags < 0) {
+        return false;
+    }
+    const int nextFlags = enabled ? (flags | FD_CLOEXEC) : (flags & ~FD_CLOEXEC);
+    return fcntl(fd, F_SETFD, nextFlags) == 0;
+}
+
 }  // namespace
 
-pid_t launch_qemu(const ShellOptions& options) {
+pid_t launch_qemu(const ShellOptions& options, int frameDoorbellFd) {
     std::vector<std::string> args = {
         options.qemuPath,
         "-avd",
@@ -80,20 +97,69 @@ pid_t launch_qemu(const ShellOptions& options) {
         args.push_back("-sysdir");
         args.push_back(options.systemPath);
     }
+    if (options.wipeData) {
+        args.push_back("-wipe-data");
+    }
+    if (!options.guestRpcSocketPath.empty()) {
+        args.push_back("-unix-pipe");
+        args.push_back(options.guestRpcSocketPath);
+    }
     std::vector<char*> argv = make_cstring_vector(args);
 
-    std::vector<std::string> environment = make_environment({
+    std::vector<std::pair<std::string, std::string>> overrides = {
         {"MACMU_IOSURFACE_EXPORT", "1"},
         {"AEMU_IOSURFACE_EXPORT", "1"},
         {"ANDROID_EMULATOR_LAUNCHER_DIR", options.launcherDir},
         {"ANDROID_EMULATOR_WRAPPER_PID", std::to_string(getpid())},
         {macmu::kInputSocketEnv, options.inputSocketPath},
+        {"MACMU_GUEST_RPC_SOCKET", options.guestRpcSocketPath},
+        {"MACMU_GUEST_AGENT_IMAGE", options.guestAgentImagePath},
+        {"MACMU_GUEST_RAMDISK", options.guestRamdiskPath},
+        {"MACMU_GUEST_RAMDISK_OVERLAY", options.guestRamdiskOverlayPath},
         {"DYLD_LIBRARY_PATH", options.dyldLibraryPath},
+        {kFrameDoorbellFdEnv,
+         frameDoorbellFd >= 0 ? std::to_string(kChildFrameDoorbellFd) : ""},
+        {kLegacyFrameDoorbellFdEnv,
+         frameDoorbellFd >= 0 ? std::to_string(kChildFrameDoorbellFd) : ""},
         {"LC_ALL", "C"},
         {"MESA_RGB_VISUAL", "TrueColor 24"},
         {"SWIFT_BACKTRACE", "enable=no"},
-    });
+    };
+    std::vector<std::string> environment = make_environment(overrides);
     std::vector<char*> envp = make_cstring_vector(environment);
+
+    posix_spawn_file_actions_t fileActions;
+    posix_spawn_file_actions_t* fileActionsPtr = nullptr;
+    bool restoreFrameDoorbellCloexec = false;
+    if (frameDoorbellFd >= 0) {
+        if (frameDoorbellFd == kChildFrameDoorbellFd) {
+            if (!set_close_on_exec(frameDoorbellFd, false)) {
+                std::fprintf(stderr, "Failed to prepare frame doorbell fd %d: %s\n",
+                             frameDoorbellFd, std::strerror(errno));
+                return -1;
+            }
+            restoreFrameDoorbellCloexec = true;
+        } else {
+            int actionResult = posix_spawn_file_actions_init(&fileActions);
+            if (actionResult != 0) {
+                std::fprintf(stderr, "Failed to initialize qemu spawn file actions: %s\n",
+                             std::strerror(actionResult));
+                return -1;
+            }
+            fileActionsPtr = &fileActions;
+            actionResult = posix_spawn_file_actions_adddup2(
+                &fileActions, frameDoorbellFd, kChildFrameDoorbellFd);
+            if (actionResult == 0) {
+                actionResult = posix_spawn_file_actions_addclose(&fileActions, frameDoorbellFd);
+            }
+            if (actionResult != 0) {
+                posix_spawn_file_actions_destroy(&fileActions);
+                std::fprintf(stderr, "Failed to prepare frame doorbell inheritance: %s\n",
+                             std::strerror(actionResult));
+                return -1;
+            }
+        }
+    }
 
     posix_spawnattr_t attributes;
     posix_spawnattr_init(&attributes);
@@ -101,9 +167,15 @@ pid_t launch_qemu(const ShellOptions& options) {
     posix_spawnattr_setpgroup(&attributes, 0);
 
     pid_t pid = -1;
-    const int result = posix_spawn(&pid, options.qemuPath.c_str(), nullptr, &attributes,
+    const int result = posix_spawn(&pid, options.qemuPath.c_str(), fileActionsPtr, &attributes,
                                    argv.data(), envp.data());
     posix_spawnattr_destroy(&attributes);
+    if (fileActionsPtr) {
+        posix_spawn_file_actions_destroy(&fileActions);
+    }
+    if (restoreFrameDoorbellCloexec) {
+        set_close_on_exec(frameDoorbellFd, true);
+    }
     if (result != 0) {
         std::fprintf(stderr, "Failed to launch qemu-system-aarch64-headless: %s\n",
                      std::strerror(result));
