@@ -244,8 +244,9 @@ NSTextField* make_value(NSString* text, NSRect frame) {
     }
 
     _inputSender = new InputSender();
-    if (_inputSender->open(_options.inputSocketPath)) {
-        NSLog(@"MacMu input channel ready at %s.", _options.inputSocketPath.c_str());
+    if (_inputSender->create()) {
+        NSLog(@"MacMu input channel ready (socketpair fd, remote=%d).",
+              _inputSender->remote_fd());
     } else {
         NSLog(@"MacMu input channel unavailable; pointer input will be disabled.");
     }
@@ -405,7 +406,8 @@ NSTextField* make_value(NSString* text, NSRect frame) {
         [self publishQemuStatus:@"Starting"];
         const int doorbellFd =
             (_channelReady && _frameConsumer) ? _frameConsumer->producer_doorbell_fd() : -1;
-        const pid_t pid = launch_qemu(_options, doorbellFd);
+        const int inputFd = (_inputSender && _inputSender->valid()) ? _inputSender->remote_fd() : -1;
+        const pid_t pid = launch_qemu(_options, doorbellFd, inputFd);
         if (pid <= 0) {
             [self publishQemuStatus:@"Launch failed; retrying"];
             std::this_thread::sleep_for(std::chrono::seconds(2));

@@ -12,9 +12,12 @@
 
 // Spawns qemu-system-aarch64-headless in a new process group with the shell's
 // IOSurface-export environment. If |frameDoorbellFd| is non-negative, it is
-// inherited into the child and advertised through MACMU_FRAME_DOORBELL_FD.
-// Returns the child pid, or -1 on failure (a message is printed to stderr).
-pid_t launch_qemu(const ShellOptions& options, int frameDoorbellFd = -1);
+// inherited into the child and advertised through MACMU_FRAME_DOORBELL_FD. If
+// |inputFd| is non-negative, it is inherited into the child (at the fixed fd
+// macmu::kInputChildFd) and advertised through MACMU_INPUT_FD, so host pointer
+// input reaches the guest without a filesystem socket. Returns the child pid,
+// or -1 on failure (a message is printed to stderr).
+pid_t launch_qemu(const ShellOptions& options, int frameDoorbellFd = -1, int inputFd = -1);
 
 // SIGTERM (then SIGKILL after ~5s) the process group rooted at |pid|. No-op for
 // non-positive pids; safe to call on an already-reaped child.

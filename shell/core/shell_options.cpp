@@ -165,10 +165,12 @@ ShellOptions parse_options(int argc, char** argv) {
     options.dyldLibraryPath =
         env_or_default("MACMU_DYLD_LIBRARY_PATH", "AEMU_SHELL_DYLD_LIBRARY_PATH",
                        default_dyld_library_path(options.launcherDir));
+    // Host pointer input now reaches qemu over an inherited AF_UNIX socketpair
+    // fd (see InputSender::create + qemu_launcher fd inheritance), so no
+    // filesystem socket path is synthesized by default. --input-socket /
+    // MACMU_INPUT_SOCKET_PATH still override it for the legacy UDS transport.
     options.inputSocketPath =
-        env_or_default(macmu::kInputSocketEnv,
-                       "/tmp/macmu.input." + std::to_string(static_cast<unsigned>(getpid())) +
-                           ".sock");
+        env_or_default(macmu::kInputSocketEnv, options.inputSocketPath);
     // The system-images path replaces the ANDROID_SDK_ROOT/ANDROID_HOME
     // dependency: it is forwarded to qemu as -sysdir, which lets qemu resolve
     // the AVD's image search path without an SDK root. No default is synthesized

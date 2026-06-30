@@ -7,20 +7,16 @@
 #include <cstring>
 #include <fcntl.h>
 #include <sys/socket.h>
-#include <sys/un.h>
 #include <unistd.h>
 
 namespace {
 
-bool fill_sockaddr(const std::string& path, sockaddr_un* addr, socklen_t* len) {
-    if (path.empty() || path.size() >= sizeof(addr->sun_path)) {
+bool set_close_on_exec(int fd) {
+    const int flags = fcntl(fd, F_GETFD);
+    if (flags < 0) {
         return false;
     }
-    std::memset(addr, 0, sizeof(*addr));
-    addr->sun_family = AF_UNIX;
-    std::strncpy(addr->sun_path, path.c_str(), sizeof(addr->sun_path) - 1);
-    *len = static_cast<socklen_t>(offsetof(sockaddr_un, sun_path) + path.size() + 1);
-    return true;
+    return fcntl(fd, F_SETFD, flags | FD_CLOEXEC) == 0;
 }
 
 macmu::InputEventPacket make_packet(macmu::InputEventKind kind,
@@ -46,29 +42,34 @@ macmu::InputEventPacket make_packet(macmu::InputEventKind kind,
 }  // namespace
 
 InputSender::~InputSender() {
+    if (m_remoteFd >= 0) {
+        close(m_remoteFd);
+        m_remoteFd = -1;
+    }
     if (m_fd >= 0) {
         close(m_fd);
         m_fd = -1;
     }
 }
 
-bool InputSender::open(const std::string& socket_path) {
-    sockaddr_un addr = {};
-    socklen_t len = 0;
-    if (!fill_sockaddr(socket_path, &addr, &len)) {
-        std::fprintf(stderr, "MacMu input socket path is too long: %s\n", socket_path.c_str());
+bool InputSender::create() {
+    int pair[2] = {-1, -1};
+    if (socketpair(AF_UNIX, SOCK_DGRAM, 0, pair) != 0) {
+        std::fprintf(stderr, "Failed to create MacMu input socketpair: %s\n",
+                     std::strerror(errno));
         return false;
     }
-
-    const int fd = socket(AF_UNIX, SOCK_DGRAM, 0);
-    if (fd < 0) {
-        std::fprintf(stderr, "Failed to create MacMu input socket: %s\n", std::strerror(errno));
+    if (!set_close_on_exec(pair[0]) || !set_close_on_exec(pair[1])) {
+        close(pair[0]);
+        close(pair[1]);
         return false;
     }
-    fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
+    // Non-blocking on the send end so a saturated queue (qemu slower than the
+    // host input rate) drops packets instead of blocking the UI thread.
+    fcntl(pair[0], F_SETFL, fcntl(pair[0], F_GETFL, 0) | O_NONBLOCK);
 
-    m_fd = fd;
-    m_socketPath = socket_path;
+    m_fd = pair[0];
+    m_remoteFd = pair[1];
     return true;
 }
 
@@ -92,13 +93,7 @@ void InputSender::send_packet(const macmu::InputEventPacket& packet) {
     if (m_fd < 0) {
         return;
     }
-    sockaddr_un addr = {};
-    socklen_t len = 0;
-    if (!fill_sockaddr(m_socketPath, &addr, &len)) {
-        return;
-    }
-    const ssize_t sent = sendto(m_fd, &packet, sizeof(packet), 0,
-                                reinterpret_cast<const sockaddr*>(&addr), len);
+    const ssize_t sent = send(m_fd, &packet, sizeof(packet), 0);
     if (sent < 0 && errno != ENOENT && errno != ECONNREFUSED && errno != EAGAIN &&
         errno != EWOULDBLOCK) {
         std::fprintf(stderr, "Failed to send MacMu input packet: %s\n", std::strerror(errno));

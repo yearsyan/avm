@@ -28,9 +28,7 @@ namespace {
 // the low-numbered fds qemu may inherit from its launcher.
 constexpr int kChildFrameDoorbellFd = 198;
 constexpr const char* kFrameDoorbellFdEnv = "MACMU_FRAME_DOORBELL_FD";
-constexpr const char* kLegacyFrameDoorbellFdEnv = "AEMU_FRAME_DOORBELL_FD";
-
-bool has_key(const std::vector<std::pair<std::string, std::string>>& overrides,
+constexpr const char* kLegacyFrameDoorbellFdEnv = "AEMU_FRAME_DOORBELL_FD";bool has_key(const std::vector<std::pair<std::string, std::string>>& overrides,
              const std::string& key) {
     for (const auto& override : overrides) {
         if (override.first == key) {
@@ -78,7 +76,7 @@ bool set_close_on_exec(int fd, bool enabled) {
 
 }  // namespace
 
-pid_t launch_qemu(const ShellOptions& options, int frameDoorbellFd) {
+pid_t launch_qemu(const ShellOptions& options, int frameDoorbellFd, int inputFd) {
     std::vector<std::string> args = {
         options.qemuPath,
         "-avd",
@@ -111,7 +109,6 @@ pid_t launch_qemu(const ShellOptions& options, int frameDoorbellFd) {
         {"AEMU_IOSURFACE_EXPORT", "1"},
         {"ANDROID_EMULATOR_LAUNCHER_DIR", options.launcherDir},
         {"ANDROID_EMULATOR_WRAPPER_PID", std::to_string(getpid())},
-        {macmu::kInputSocketEnv, options.inputSocketPath},
         {"MACMU_GUEST_RPC_SOCKET", options.guestRpcSocketPath},
         {"MACMU_GUEST_AGENT_IMAGE", options.guestAgentImagePath},
         {"MACMU_GUEST_RAMDISK", options.guestRamdiskPath},
@@ -121,6 +118,8 @@ pid_t launch_qemu(const ShellOptions& options, int frameDoorbellFd) {
          frameDoorbellFd >= 0 ? std::to_string(kChildFrameDoorbellFd) : ""},
         {kLegacyFrameDoorbellFdEnv,
          frameDoorbellFd >= 0 ? std::to_string(kChildFrameDoorbellFd) : ""},
+        {macmu::kInputFdEnv, inputFd >= 0 ? std::to_string(macmu::kInputChildFd) : ""},
+        {macmu::kInputSocketEnv, options.inputSocketPath},
         {"LC_ALL", "C"},
         {"MESA_RGB_VISUAL", "TrueColor 24"},
         {"SWIFT_BACKTRACE", "enable=no"},
@@ -131,6 +130,32 @@ pid_t launch_qemu(const ShellOptions& options, int frameDoorbellFd) {
     posix_spawn_file_actions_t fileActions;
     posix_spawn_file_actions_t* fileActionsPtr = nullptr;
     bool restoreFrameDoorbellCloexec = false;
+    bool restoreInputCloexec = false;
+
+    auto ensure_file_actions = [&]() -> bool {
+        if (fileActionsPtr) {
+            return true;
+        }
+        if (posix_spawn_file_actions_init(&fileActions) != 0) {
+            return false;
+        }
+        fileActionsPtr = &fileActions;
+        return true;
+    };
+    auto add_dup2 = [&](int parentFd, int childFd) -> bool {
+        int actionResult =
+            posix_spawn_file_actions_adddup2(&fileActions, parentFd, childFd);
+        if (actionResult == 0 && parentFd != childFd) {
+            actionResult = posix_spawn_file_actions_addclose(&fileActions, parentFd);
+        }
+        if (actionResult != 0) {
+            std::fprintf(stderr, "Failed to prepare fd %d inheritance: %s\n", parentFd,
+                         std::strerror(actionResult));
+            return false;
+        }
+        return true;
+    };
+
     if (frameDoorbellFd >= 0) {
         if (frameDoorbellFd == kChildFrameDoorbellFd) {
             if (!set_close_on_exec(frameDoorbellFd, false)) {
@@ -140,22 +165,41 @@ pid_t launch_qemu(const ShellOptions& options, int frameDoorbellFd) {
             }
             restoreFrameDoorbellCloexec = true;
         } else {
-            int actionResult = posix_spawn_file_actions_init(&fileActions);
-            if (actionResult != 0) {
-                std::fprintf(stderr, "Failed to initialize qemu spawn file actions: %s\n",
-                             std::strerror(actionResult));
+            if (!ensure_file_actions()) {
+                std::fprintf(stderr, "Failed to initialize qemu spawn file actions\n");
                 return -1;
             }
-            fileActionsPtr = &fileActions;
-            actionResult = posix_spawn_file_actions_adddup2(
-                &fileActions, frameDoorbellFd, kChildFrameDoorbellFd);
-            if (actionResult == 0) {
-                actionResult = posix_spawn_file_actions_addclose(&fileActions, frameDoorbellFd);
-            }
-            if (actionResult != 0) {
+            if (!add_dup2(frameDoorbellFd, kChildFrameDoorbellFd)) {
                 posix_spawn_file_actions_destroy(&fileActions);
-                std::fprintf(stderr, "Failed to prepare frame doorbell inheritance: %s\n",
-                             std::strerror(actionResult));
+                return -1;
+            }
+        }
+    }
+
+    if (inputFd >= 0) {
+        if (inputFd == macmu::kInputChildFd) {
+            if (!set_close_on_exec(inputFd, false)) {
+                std::fprintf(stderr, "Failed to prepare input fd %d: %s\n", inputFd,
+                             std::strerror(errno));
+                if (restoreFrameDoorbellCloexec) {
+                    set_close_on_exec(frameDoorbellFd, true);
+                }
+                if (fileActionsPtr) {
+                    posix_spawn_file_actions_destroy(&fileActions);
+                }
+                return -1;
+            }
+            restoreInputCloexec = true;
+        } else {
+            if (!ensure_file_actions()) {
+                std::fprintf(stderr, "Failed to initialize qemu spawn file actions\n");
+                if (restoreFrameDoorbellCloexec) {
+                    set_close_on_exec(frameDoorbellFd, true);
+                }
+                return -1;
+            }
+            if (!add_dup2(inputFd, macmu::kInputChildFd)) {
+                posix_spawn_file_actions_destroy(&fileActions);
                 return -1;
             }
         }
@@ -175,6 +219,9 @@ pid_t launch_qemu(const ShellOptions& options, int frameDoorbellFd) {
     }
     if (restoreFrameDoorbellCloexec) {
         set_close_on_exec(frameDoorbellFd, true);
+    }
+    if (restoreInputCloexec) {
+        set_close_on_exec(inputFd, true);
     }
     if (result != 0) {
         std::fprintf(stderr, "Failed to launch qemu-system-aarch64-headless: %s\n",

@@ -13,6 +13,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fcntl.h>
+#include <limits>
 #include <mutex>
 #ifdef __APPLE__
 #include <pthread.h>
@@ -34,8 +36,46 @@ public:
         if (mRunning.load(std::memory_order_relaxed)) {
             return;
         }
+        if (!agent) {
+            return;
+        }
+
+        // Preferred transport: an AF_UNIX SOCK_DGRAM socketpair end inherited
+        // from the shell, advertised through kInputFdEnv. No filesystem socket
+        // is created, bound, or unlinked, so there is no TOCTOU, residue, or
+        // cross-user exposure.
+        int fd = -1;
+        const char* fdEnv = std::getenv(macmu::kInputFdEnv);
+        if (fdEnv && fdEnv[0]) {
+            char* end = nullptr;
+            const long parsed = std::strtol(fdEnv, &end, 10);
+            if (end != fdEnv && parsed >= 0 && parsed < std::numeric_limits<int>::max()) {
+                fd = static_cast<int>(parsed);
+            }
+        }
+        if (fd >= 0) {
+            // The shell dup2()'d its socketpair end into this fd and removed
+            // FD_CLOEXEC on it; take ownership and keep the fd as-is.
+            const int flags = fcntl(fd, F_GETFD);
+            if (flags < 0) {
+                dwarning("MacMu input fd %d not usable: %s", fd, std::strerror(errno));
+                return;
+            }
+            mAgent = agent;
+            mFd = fd;
+            mPath.clear();
+            mUsingInheritedFd = true;
+            mRunning.store(true, std::memory_order_relaxed);
+            mThread = std::thread([this] { thread_loop(); });
+            dinfo("MacMu input receiver listening on inherited fd %d", mFd);
+            return;
+        }
+
+        // Legacy transport: a filesystem AF_UNIX SOCK_DGRAM socket bound at
+        // kInputSocketEnv. Kept so older launchers keep working; new launchers
+        // should pass kInputFdEnv instead.
         const char* path = std::getenv(macmu::kInputSocketEnv);
-        if (!path || !path[0] || !agent) {
+        if (!path || !path[0]) {
             return;
         }
         sockaddr_un addr = {};
@@ -44,7 +84,7 @@ public:
             return;
         }
 
-        const int fd = socket(AF_UNIX, SOCK_DGRAM, 0);
+        fd = socket(AF_UNIX, SOCK_DGRAM, 0);
         if (fd < 0) {
             dwarning("Failed to create MacMu input socket: %s", std::strerror(errno));
             return;
@@ -59,6 +99,7 @@ public:
         mAgent = agent;
         mPath = path;
         mFd = fd;
+        mUsingInheritedFd = false;
         mRunning.store(true, std::memory_order_relaxed);
         mThread = std::thread([this] { thread_loop(); });
         dinfo("MacMu input receiver listening on %s", mPath.c_str());
@@ -68,6 +109,7 @@ public:
         std::thread thread;
         std::string path;
         int fd = -1;
+        bool unlinkPath = false;
         {
             std::lock_guard<std::mutex> lock(mMutex);
             if (!mRunning.load(std::memory_order_relaxed)) {
@@ -77,6 +119,7 @@ public:
             fd = mFd;
             mFd = -1;
             path = mPath;
+            unlinkPath = !mUsingInheritedFd;
             thread = std::move(mThread);
         }
         if (fd >= 0) {
@@ -85,7 +128,7 @@ public:
         if (thread.joinable()) {
             thread.join();
         }
-        if (!path.empty()) {
+        if (unlinkPath && !path.empty()) {
             unlink(path.c_str());
         }
     }
@@ -214,6 +257,7 @@ private:
     const QAndroidUserEventAgent* mAgent = nullptr;
     int mFd = -1;
     std::string mPath;
+    bool mUsingInheritedFd = false;
     std::thread mThread;
     std::unordered_map<uint32_t, MouseState> mMouseStates;
 };

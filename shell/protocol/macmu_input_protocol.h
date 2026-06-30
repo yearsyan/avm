@@ -12,6 +12,17 @@ namespace macmu {
 
 inline constexpr uint32_t kInputProtocolMagic = 0x4d4d494e;  // "MMIN"
 inline constexpr uint16_t kInputProtocolVersion = 1;
+
+// Preferred transport: the shell builds an AF_UNIX SOCK_DGRAM socketpair, keeps
+// the local end, and dup2()'s the remote end into a fixed child fd advertised
+// through kInputFdEnv. No filesystem socket path is involved, so there is no
+// bind/unlink TOCTOU, no residue, and no cross-user exposure.
+inline constexpr const char* kInputFdEnv = "MACMU_INPUT_FD";
+inline constexpr int kInputChildFd = 199;
+
+// Legacy filesystem UDS transport. Still read by the qemu receiver when
+// kInputFdEnv is unset, so older launchers keep working. New code should use
+// the fd transport instead.
 inline constexpr const char* kInputSocketEnv = "MACMU_INPUT_SOCKET_PATH";
 inline constexpr int kInputTouchPressure = 0x400;
 inline constexpr int kInputTouchMajor = 0x400;
