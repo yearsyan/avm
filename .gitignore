@@ -3,6 +3,7 @@
 *.swp
 *.swo
 .cache/
+.codex-local/
 
 # CMake/Ninja generated files
 CMakeCache.txt
