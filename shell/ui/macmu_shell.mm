@@ -108,6 +108,7 @@ NSTextField* make_value(NSString* text, NSRect frame) {
     NSStatusItem* _statusItem;
 
     std::atomic<bool> _shuttingDown;
+    std::atomic<bool> _runtimeShutdownComplete;
     std::atomic<bool> _doorbellShutdown;
     std::atomic<uint64_t> _qemuGeneration;
     std::thread _qemuMonitorThread;
@@ -138,6 +139,7 @@ NSTextField* make_value(NSString* text, NSRect frame) {
     _displayRenderer = nil;
     _statusItem = nil;
     _shuttingDown.store(false, std::memory_order_relaxed);
+    _runtimeShutdownComplete.store(false, std::memory_order_relaxed);
     _doorbellShutdown.store(true, std::memory_order_relaxed);
     _qemuGeneration.store(0, std::memory_order_relaxed);
     _qemuPid = -1;
@@ -162,7 +164,17 @@ NSTextField* make_value(NSString* text, NSRect frame) {
 }
 
 - (void)applicationWillTerminate:(NSNotification*)notification {
-    [self shutdownRuntime];
+    if (!_runtimeShutdownComplete.load(std::memory_order_acquire)) {
+        [self shutdownRuntime];
+    }
+}
+
+- (NSApplicationTerminateReply)applicationShouldTerminate:(NSApplication*)sender {
+    if (_runtimeShutdownComplete.load(std::memory_order_acquire)) {
+        return NSTerminateNow;
+    }
+    [self beginAsyncTermination];
+    return NSTerminateCancel;
 }
 
 - (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication*)sender {
@@ -419,7 +431,11 @@ NSTextField* make_value(NSString* text, NSRect frame) {
             _qemuPid = pid;
         }
         _qemuGeneration.fetch_add(1, std::memory_order_acq_rel);
-        [self publishQemuStatus:[NSString stringWithFormat:@"Running (pid %d)", pid]];
+        if (_shuttingDown.load(std::memory_order_acquire)) {
+            terminate_qemu(pid);
+        } else {
+            [self publishQemuStatus:[NSString stringWithFormat:@"Running (pid %d)", pid]];
+        }
 
         int status = 0;
         while (waitpid(pid, &status, 0) < 0) {
@@ -473,7 +489,7 @@ NSTextField* make_value(NSString* text, NSRect frame) {
 
             SurfaceMetadata meta = {};
             if (delegate->_frameConsumer &&
-                delegate->_frameConsumer->wait_for_frame(lastFrame, 1000, &meta)) {
+                delegate->_frameConsumer->wait_for_frame(lastFrame, 100, &meta)) {
                 lastFrame = meta.frame;
                 dispatch_async(dispatch_get_main_queue(), ^{
                     [view setNeedsDisplay:YES];
@@ -490,11 +506,42 @@ NSTextField* make_value(NSString* text, NSRect frame) {
     }
 }
 
+- (void)hideWindowsForTermination {
+    if (_displayView) {
+        _displayView.paused = YES;
+        _displayView.delegate = nil;
+        macmu_input_view_set_renderer(_displayView, nil);
+    }
+    [_displayWindow orderOut:nil];
+    [_statusWindow orderOut:nil];
+}
+
+- (void)beginAsyncTermination {
+    if (_shuttingDown.exchange(true, std::memory_order_acq_rel)) {
+        [self hideWindowsForTermination];
+        return;
+    }
+
+    [self hideWindowsForTermination];
+    [self publishQemuStatus:@"Stopping"];
+
+    MacMuAppDelegate* delegate = self;
+    std::thread([delegate] {
+        [delegate performRuntimeShutdown];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [NSApp terminate:nil];
+        });
+    }).detach();
+}
+
 - (void)shutdownRuntime {
     if (_shuttingDown.exchange(true, std::memory_order_acq_rel)) {
         return;
     }
+    [self performRuntimeShutdown];
+}
 
+- (void)performRuntimeShutdown {
     [self stopDoorbellThread];
     [self stopGuestInputSender];
 
@@ -518,6 +565,7 @@ NSTextField* make_value(NSString* text, NSRect frame) {
         delete _guestInputSender;
         _guestInputSender = nullptr;
     }
+    _runtimeShutdownComplete.store(true, std::memory_order_release);
 }
 
 @end
