@@ -88,7 +88,7 @@ pid_t launch_qemu(const ShellOptions& options, int frameDoorbellFd, int inputFd)
         "-gpu",
         "host",
     };
-    // When the caller supplies an explicit system-images path, forward it to
+    // When the caller supplies an explicit Android image path, forward it to
     // qemu as -sysdir. This lets qemu resolve the AVD's image search path
     // directly and removes any need for ANDROID_SDK_ROOT / ANDROID_HOME.
     if (!options.systemPath.empty()) {

@@ -118,7 +118,7 @@ std::string config_ini_for(const ShellOptions& options) {
         << "hw.sensors.proximity=yes\n"
         << "hw.trackBall=no\n"
         << "hw.useext4=yes\n"
-        << "image.sysdir.1=system-images/android-35/default/arm64-v8a/\n"
+        << "image.sysdir.1=images/android-35-arm64/\n"
         << "kernel.newDeviceNaming=autodetect\n"
         << "kernel.supportsYaffs2=autodetect\n"
         << "runtime.network.latency=none\n"
@@ -151,7 +151,7 @@ std::string macmu_machine_ini_path(const ShellOptions& options) {
 bool macmu_ensure_runtime_directories(const ShellOptions& options, std::string* error) {
     return ensure_directory(options.appDataDir, error) &&
            ensure_directory(options.avdHome, error) &&
-           ensure_directory(path_join(options.appDataDir, "system-images"), error);
+           ensure_directory(path_join(options.appDataDir, "images"), error);
 }
 
 bool macmu_system_image_exists(const ShellOptions& options) {

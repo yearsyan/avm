@@ -87,7 +87,7 @@ std::string default_avd_home(const std::string& app_data_dir) {
 }
 
 std::string default_system_path(const std::string& app_data_dir) {
-    return path_join(app_data_dir, "system-images/android-35/default/arm64-v8a");
+    return path_join(app_data_dir, "images/android-35-arm64");
 }
 
 std::string executable_directory() {
@@ -192,7 +192,7 @@ ShellOptions parse_options(int argc, char** argv) {
     // MACMU_INPUT_SOCKET_PATH still override it for the legacy UDS transport.
     options.inputSocketPath =
         env_or_default(macmu::kInputSocketEnv, options.inputSocketPath);
-    // The system-images path replaces the ANDROID_SDK_ROOT/ANDROID_HOME
+    // The system image path replaces the ANDROID_SDK_ROOT/ANDROID_HOME
     // dependency: it is forwarded to qemu as -sysdir, which lets qemu resolve
     // the AVD's image search path without an SDK root. Product builds default
     // this to MacMu's app data root; development runs can still override it

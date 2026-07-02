@@ -12,7 +12,7 @@
 struct ShellOptions {
     // MacMu-owned writable data root. Defaults to
     // ~/Library/Application Support/MacMu and is used for managed machines and
-    // product-owned system images.
+    // product-owned Android images.
     std::string appDataDir;
     // Directory containing <name>.ini and <name>.avd entries. This is exported
     // to qemu as ANDROID_AVD_HOME so -avd resolves under MacMu's data root by
@@ -22,7 +22,7 @@ struct ShellOptions {
     std::string qemuPath;
     std::string dyldLibraryPath;
     std::string inputSocketPath;
-    // Explicit path to the system-images directory, forwarded to qemu as
+    // Explicit path to the Android image directory, forwarded to qemu as
     // -sysdir. When set, the shell no longer needs ANDROID_SDK_ROOT /
     // ANDROID_HOME: qemu resolves the AVD's image search path from this
     // directory directly. Empty means "not provided".
