@@ -19,6 +19,7 @@ add_executable(macmu_shell
     core/frame_consumer.cpp
     core/guest_input_sender.cpp
     core/input_sender.cpp
+    core/machine_manager.cpp
     core/qemu_launcher.cpp
     core/shell_options.cpp
     ui/macmu_input_view.mm

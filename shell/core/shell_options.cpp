@@ -74,6 +74,22 @@ std::string current_working_directory() {
     return path;
 }
 
+std::string default_app_data_dir() {
+    const char* home = std::getenv("HOME");
+    if (home && home[0] != '\0') {
+        return path_join(path_join(path_join(home, "Library"), "Application Support"), "MacMu");
+    }
+    return "MacMuData";
+}
+
+std::string default_avd_home(const std::string& app_data_dir) {
+    return path_join(app_data_dir, "avd");
+}
+
+std::string default_system_path(const std::string& app_data_dir) {
+    return path_join(app_data_dir, "system-images/android-35/default/arm64-v8a");
+}
+
 std::string executable_directory() {
     uint32_t size = 0;
     _NSGetExecutablePath(nullptr, &size);
@@ -157,6 +173,11 @@ std::string default_guest_rpc_socket_path() {
 
 ShellOptions parse_options(int argc, char** argv) {
     ShellOptions options;
+    options.appDataDir =
+        env_or_default("MACMU_APP_DATA_DIR", "AEMU_SHELL_APP_DATA_DIR", default_app_data_dir());
+    options.avdHome =
+        env_or_default("MACMU_AVD_HOME", "AEMU_SHELL_AVD_HOME",
+                       env_or_default("ANDROID_AVD_HOME", default_avd_home(options.appDataDir)));
     options.launcherDir =
         env_or_default("MACMU_LAUNCHER_DIR", "AEMU_SHELL_LAUNCHER_DIR", default_launcher_dir());
     options.qemuPath =
@@ -173,11 +194,12 @@ ShellOptions parse_options(int argc, char** argv) {
         env_or_default(macmu::kInputSocketEnv, options.inputSocketPath);
     // The system-images path replaces the ANDROID_SDK_ROOT/ANDROID_HOME
     // dependency: it is forwarded to qemu as -sysdir, which lets qemu resolve
-    // the AVD's image search path without an SDK root. No default is synthesized
-    // (empty == not provided); the caller is expected to pass --system-path or
-    // set MACMU_SYSTEM_PATH / AEMU_SHELL_SYSTEM_PATH.
+    // the AVD's image search path without an SDK root. Product builds default
+    // this to MacMu's app data root; development runs can still override it
+    // with --system-path or MACMU_SYSTEM_PATH.
     options.systemPath =
-        env_or_default("MACMU_SYSTEM_PATH", "AEMU_SHELL_SYSTEM_PATH", options.systemPath);
+        env_or_default("MACMU_SYSTEM_PATH", "AEMU_SHELL_SYSTEM_PATH",
+                       default_system_path(options.appDataDir));
     options.guestRpcSocketPath =
         env_or_default("MACMU_GUEST_RPC_SOCKET", "AEMU_SHELL_GUEST_RPC_SOCKET",
                        default_guest_rpc_socket_path());
@@ -194,6 +216,13 @@ ShellOptions parse_options(int argc, char** argv) {
     bool qemu_path_overridden =
         std::getenv("MACMU_QEMU_PATH") != nullptr ||
         std::getenv("AEMU_SHELL_QEMU_PATH") != nullptr;
+    bool avd_home_overridden =
+        std::getenv("MACMU_AVD_HOME") != nullptr ||
+        std::getenv("AEMU_SHELL_AVD_HOME") != nullptr ||
+        std::getenv("ANDROID_AVD_HOME") != nullptr;
+    bool system_path_overridden =
+        std::getenv("MACMU_SYSTEM_PATH") != nullptr ||
+        std::getenv("AEMU_SHELL_SYSTEM_PATH") != nullptr;
     bool dyld_library_path_overridden =
         std::getenv("MACMU_DYLD_LIBRARY_PATH") != nullptr ||
         std::getenv("AEMU_SHELL_DYLD_LIBRARY_PATH") != nullptr;
@@ -238,6 +267,21 @@ ShellOptions parse_options(int argc, char** argv) {
                         default_guest_agent_image_path(options.launcherDir);
                 }
             }
+        } else if (arg == "--app-data-dir") {
+            if (const char* value = require_value("--app-data-dir")) {
+                options.appDataDir = value;
+                if (!avd_home_overridden) {
+                    options.avdHome = default_avd_home(options.appDataDir);
+                }
+                if (!system_path_overridden) {
+                    options.systemPath = default_system_path(options.appDataDir);
+                }
+            }
+        } else if (arg == "--avd-home") {
+            if (const char* value = require_value("--avd-home")) {
+                options.avdHome = value;
+                avd_home_overridden = true;
+            }
         } else if (arg == "--qemu") {
             if (const char* value = require_value("--qemu")) {
                 options.qemuPath = value;
@@ -255,6 +299,7 @@ ShellOptions parse_options(int argc, char** argv) {
         } else if (arg == "--system-path") {
             if (const char* value = require_value("--system-path")) {
                 options.systemPath = value;
+                system_path_overridden = true;
             }
         } else if (arg == "--guest-rpc-socket") {
             if (const char* value = require_value("--guest-rpc-socket")) {

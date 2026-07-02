@@ -22,6 +22,7 @@
 #include "frame_consumer.h"
 #include "guest_input_sender.h"
 #include "input_sender.h"
+#include "machine_manager.h"
 #include "macmu_input_view.h"
 #include "macmu_surface_renderer.h"
 #include "qemu_launcher.h"
@@ -42,19 +43,6 @@ std::string path_join(const std::string& lhs, const std::string& rhs) {
         return lhs + rhs;
     }
     return lhs + "/" + rhs;
-}
-
-std::string default_avd_home() {
-    if (const char* avdHome = std::getenv("ANDROID_AVD_HOME")) {
-        if (avdHome[0] != '\0') {
-            return avdHome;
-        }
-    }
-    return path_join(std::string([NSHomeDirectory() UTF8String]), ".android/avd");
-}
-
-std::string avd_path_for_options(const ShellOptions& options) {
-    return path_join(default_avd_home(), options.avdName + ".avd");
 }
 
 NSTextField* make_label(NSString* text, NSRect frame) {
@@ -97,8 +85,10 @@ NSTextField* make_value(NSString* text, NSRect frame) {
 
     NSWindow* _statusWindow;
     NSTextField* _qemuStatusValue;
+    NSTextField* _appDataPathValue;
     NSTextField* _avdPathValue;
     NSTextField* _systemPathValue;
+    NSButton* _createMachineButton;
     NSButton* _startButton;
 
     NSWindow* _displayWindow;
@@ -131,8 +121,10 @@ NSTextField* make_value(NSString* text, NSRect frame) {
     _metalDevice = nil;
     _statusWindow = nil;
     _qemuStatusValue = nil;
+    _appDataPathValue = nil;
     _avdPathValue = nil;
     _systemPathValue = nil;
+    _createMachineButton = nil;
     _startButton = nil;
     _displayWindow = nil;
     _displayView = nil;
@@ -151,8 +143,13 @@ NSTextField* make_value(NSString* text, NSRect frame) {
     [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
     [self installMainMenu];
     [self installStatusItem];
+    std::string directoryError;
+    if (!macmu_ensure_runtime_directories(_options, &directoryError)) {
+        NSLog(@"MacMu data directory setup failed: %s", directoryError.c_str());
+    }
     [self createRuntimeChannels];
     [self createStatusWindow];
+    [self updateMachineControls];
     [self showStatusWindow:nil];
     [self startQemuSupervisor];
     if (_options.openDisplay) {
@@ -280,7 +277,7 @@ NSTextField* make_value(NSString* text, NSRect frame) {
         return;
     }
 
-    const NSRect frame = NSMakeRect(0, 0, 640, 300);
+    const NSRect frame = NSMakeRect(0, 0, 680, 360);
     _statusWindow = [[NSWindow alloc]
         initWithContentRect:frame
                   styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
@@ -294,35 +291,44 @@ NSTextField* make_value(NSString* text, NSRect frame) {
     NSView* content = [[NSView alloc] initWithFrame:frame];
     _statusWindow.contentView = content;
 
-    NSTextField* title = make_label(@"MacMu", NSMakeRect(28, 246, 360, 26));
+    NSTextField* title = make_label(@"MacMu", NSMakeRect(28, 306, 360, 26));
     title.font = [NSFont systemFontOfSize:22.0 weight:NSFontWeightSemibold];
     title.textColor = [NSColor labelColor];
     [content addSubview:title];
 
     NSTextField* subtitle =
-        make_label(@"Android emulator core status", NSMakeRect(30, 222, 360, 18));
+        make_label(@"Android emulator core status", NSMakeRect(30, 282, 360, 18));
     subtitle.font = [NSFont systemFontOfSize:13.0 weight:NSFontWeightRegular];
     [content addSubview:subtitle];
 
-    [content addSubview:make_label(@"QEMU", NSMakeRect(30, 176, 130, 20))];
-    _qemuStatusValue = make_value(@"Starting", NSMakeRect(170, 176, 430, 20));
+    [content addSubview:make_label(@"QEMU", NSMakeRect(30, 236, 130, 20))];
+    _qemuStatusValue = make_value(@"Starting", NSMakeRect(170, 236, 470, 20));
     [content addSubview:_qemuStatusValue];
 
-    [content addSubview:make_label(@"AVD Path", NSMakeRect(30, 136, 130, 20))];
-    _avdPathValue = make_value(ns_string(avd_path_for_options(_options)),
-                               NSMakeRect(170, 136, 430, 20));
+    [content addSubview:make_label(@"Data Root", NSMakeRect(30, 196, 130, 20))];
+    _appDataPathValue = make_value(ns_string(_options.appDataDir), NSMakeRect(170, 196, 470, 20));
+    [content addSubview:_appDataPathValue];
+
+    [content addSubview:make_label(@"Machine", NSMakeRect(30, 156, 130, 20))];
+    _avdPathValue = make_value(ns_string(macmu_machine_path(_options)),
+                               NSMakeRect(170, 156, 470, 20));
     [content addSubview:_avdPathValue];
 
-    [content addSubview:make_label(@"System Image", NSMakeRect(30, 96, 130, 20))];
-    const std::string systemPath =
-        _options.systemPath.empty() ? std::string("Not set (qemu default)") : _options.systemPath;
-    _systemPathValue = make_value(ns_string(systemPath), NSMakeRect(170, 96, 430, 20));
+    [content addSubview:make_label(@"System Image", NSMakeRect(30, 116, 130, 20))];
+    _systemPathValue = make_value(ns_string(_options.systemPath), NSMakeRect(170, 116, 470, 20));
     [content addSubview:_systemPathValue];
 
-    _startButton = [NSButton buttonWithTitle:@"Start"
+    _createMachineButton = [NSButton buttonWithTitle:@"Create Machine"
+                                              target:self
+                                              action:@selector(createMachine:)];
+    _createMachineButton.frame = NSMakeRect(364, 28, 136, 34);
+    _createMachineButton.bezelStyle = NSBezelStyleRounded;
+    [content addSubview:_createMachineButton];
+
+    _startButton = [NSButton buttonWithTitle:@"Display"
                                       target:self
                                       action:@selector(openDisplayWindow:)];
-    _startButton.frame = NSMakeRect(500, 28, 100, 34);
+    _startButton.frame = NSMakeRect(516, 28, 112, 34);
     _startButton.bezelStyle = NSBezelStyleRounded;
     _startButton.enabled = _channelReady && _metalDevice != nil;
     [content addSubview:_startButton];
@@ -330,7 +336,7 @@ NSTextField* make_value(NSString* text, NSRect frame) {
     NSButton* quitButton = [NSButton buttonWithTitle:@"Quit"
                                               target:NSApp
                                               action:@selector(terminate:)];
-    quitButton.frame = NSMakeRect(392, 28, 92, 34);
+    quitButton.frame = NSMakeRect(256, 28, 92, 34);
     quitButton.bezelStyle = NSBezelStyleRounded;
     [content addSubview:quitButton];
 
@@ -395,6 +401,36 @@ NSTextField* make_value(NSString* text, NSRect frame) {
     [NSApp terminate:nil];
 }
 
+- (void)updateMachineControls {
+    const bool hasSystemImage = macmu_system_image_exists(_options);
+    const bool hasMachine = macmu_machine_exists(_options);
+    if (_createMachineButton) {
+        _createMachineButton.enabled = hasSystemImage && !hasMachine;
+        _createMachineButton.title = hasMachine ? @"Machine Ready" : @"Create Machine";
+    }
+    if (_appDataPathValue) {
+        _appDataPathValue.stringValue = ns_string(_options.appDataDir);
+    }
+    if (_avdPathValue) {
+        _avdPathValue.stringValue = ns_string(macmu_machine_path(_options));
+    }
+    if (_systemPathValue) {
+        _systemPathValue.stringValue = ns_string(_options.systemPath);
+    }
+}
+
+- (void)createMachine:(id)sender {
+    std::string error;
+    if (macmu_create_default_machine(_options, &error)) {
+        [self updateMachineControls];
+        [self publishQemuStatus:@"Machine ready"];
+        return;
+    }
+    [self publishQemuStatus:ns_string(error)];
+    NSLog(@"MacMu machine creation failed: %s", error.c_str());
+    [self updateMachineControls];
+}
+
 - (void)setQemuStatusText:(NSString*)text {
     _qemuStatusValue.stringValue = text;
     if (_statusItem.button) {
@@ -415,6 +451,16 @@ NSTextField* make_value(NSString* text, NSRect frame) {
 
 - (void)qemuMonitorLoop {
     while (!_shuttingDown.load(std::memory_order_acquire)) {
+        if (!macmu_system_image_exists(_options)) {
+            [self publishQemuStatus:@"System image missing"];
+            std::this_thread::sleep_for(std::chrono::seconds(2));
+            continue;
+        }
+        if (!macmu_machine_exists(_options)) {
+            [self publishQemuStatus:@"Machine missing"];
+            std::this_thread::sleep_for(std::chrono::seconds(2));
+            continue;
+        }
         [self publishQemuStatus:@"Starting"];
         const int doorbellFd =
             (_channelReady && _frameConsumer) ? _frameConsumer->producer_doorbell_fd() : -1;

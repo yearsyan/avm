@@ -10,6 +10,14 @@
 #include "shell_constants.h"
 
 struct ShellOptions {
+    // MacMu-owned writable data root. Defaults to
+    // ~/Library/Application Support/MacMu and is used for managed machines and
+    // product-owned system images.
+    std::string appDataDir;
+    // Directory containing <name>.ini and <name>.avd entries. This is exported
+    // to qemu as ANDROID_AVD_HOME so -avd resolves under MacMu's data root by
+    // default instead of ~/.android/avd.
+    std::string avdHome;
     std::string launcherDir;
     std::string qemuPath;
     std::string dyldLibraryPath;
