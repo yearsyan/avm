@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 #include "host-common/MultiDisplay.h"
-#include "host-common/opengles.h"
+#include "android/macmu-opengles-hooks.h"
 
 #include <stddef.h>
 #include <algorithm>

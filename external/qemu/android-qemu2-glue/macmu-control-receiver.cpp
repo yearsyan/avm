@@ -4,7 +4,7 @@
 
 #include "aemu/base/async/ThreadLooper.h"
 #include "android/console.h"
-#include "host-common/opengles.h"
+#include "android/macmu-opengles-hooks.h"
 #include "android/utils/debug.h"
 #include "android/utils/looper.h"
 #include "macmu_control_protocol.h"

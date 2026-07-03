@@ -11,6 +11,7 @@
 */
 
 #include "host-common/opengles.h"
+#include "android/macmu-opengles-hooks.h"
 #include "android/opengles-overrides.h"
 
 #include "aemu/base/CpuUsage.h"
