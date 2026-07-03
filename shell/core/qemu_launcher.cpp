@@ -18,6 +18,7 @@
 #include <utility>
 #include <vector>
 
+#include "macmu_control_protocol.h"
 #include "macmu_input_protocol.h"
 
 extern char** environ;
@@ -28,7 +29,9 @@ namespace {
 // the low-numbered fds qemu may inherit from its launcher.
 constexpr int kChildFrameDoorbellFd = 198;
 constexpr const char* kFrameDoorbellFdEnv = "MACMU_FRAME_DOORBELL_FD";
-constexpr const char* kLegacyFrameDoorbellFdEnv = "AEMU_FRAME_DOORBELL_FD";bool has_key(const std::vector<std::pair<std::string, std::string>>& overrides,
+constexpr const char* kLegacyFrameDoorbellFdEnv = "AEMU_FRAME_DOORBELL_FD";
+
+bool has_key(const std::vector<std::pair<std::string, std::string>>& overrides,
              const std::string& key) {
     for (const auto& override : overrides) {
         if (override.first == key) {
@@ -76,7 +79,8 @@ bool set_close_on_exec(int fd, bool enabled) {
 
 }  // namespace
 
-pid_t launch_qemu(const ShellOptions& options, int frameDoorbellFd, int inputFd) {
+pid_t launch_qemu(const ShellOptions& options, int frameDoorbellFd, int inputFd,
+                  int controlFd) {
     std::vector<std::string> args = {
         options.qemuPath,
         "-avd",
@@ -102,6 +106,10 @@ pid_t launch_qemu(const ShellOptions& options, int frameDoorbellFd, int inputFd)
         args.push_back("-unix-pipe");
         args.push_back(options.guestRpcSocketPath);
     }
+    if (!options.guestCtrlSocketPath.empty()) {
+        args.push_back("-unix-pipe");
+        args.push_back(options.guestCtrlSocketPath);
+    }
     std::vector<char*> argv = make_cstring_vector(args);
 
     std::vector<std::pair<std::string, std::string>> overrides = {
@@ -113,6 +121,7 @@ pid_t launch_qemu(const ShellOptions& options, int frameDoorbellFd, int inputFd)
         {"MACMU_APP_DATA_DIR", options.appDataDir},
         {"MACMU_AVD_HOME", options.avdHome},
         {"MACMU_GUEST_RPC_SOCKET", options.guestRpcSocketPath},
+        {"MACMU_GUEST_CTRL_SOCKET", options.guestCtrlSocketPath},
         {"MACMU_GUEST_AGENT_IMAGE", options.guestAgentImagePath},
         {"MACMU_GUEST_RAMDISK", options.guestRamdiskPath},
         {"MACMU_GUEST_RAMDISK_OVERLAY", options.guestRamdiskOverlayPath},
@@ -122,6 +131,7 @@ pid_t launch_qemu(const ShellOptions& options, int frameDoorbellFd, int inputFd)
         {kLegacyFrameDoorbellFdEnv,
          frameDoorbellFd >= 0 ? std::to_string(kChildFrameDoorbellFd) : ""},
         {macmu::kInputFdEnv, inputFd >= 0 ? std::to_string(macmu::kInputChildFd) : ""},
+        {macmu::kControlFdEnv, controlFd >= 0 ? std::to_string(macmu::kControlChildFd) : ""},
         {macmu::kInputSocketEnv, options.inputSocketPath},
         {"LC_ALL", "C"},
         {"MESA_RGB_VISUAL", "TrueColor 24"},
@@ -208,6 +218,42 @@ pid_t launch_qemu(const ShellOptions& options, int frameDoorbellFd, int inputFd)
         }
     }
 
+    bool restoreControlCloexec = false;
+    if (controlFd >= 0) {
+        if (controlFd == macmu::kControlChildFd) {
+            if (!set_close_on_exec(controlFd, false)) {
+                std::fprintf(stderr, "Failed to prepare control fd %d: %s\n", controlFd,
+                             std::strerror(errno));
+                if (restoreFrameDoorbellCloexec) {
+                    set_close_on_exec(frameDoorbellFd, true);
+                }
+                if (restoreInputCloexec) {
+                    set_close_on_exec(inputFd, true);
+                }
+                if (fileActionsPtr) {
+                    posix_spawn_file_actions_destroy(&fileActions);
+                }
+                return -1;
+            }
+            restoreControlCloexec = true;
+        } else {
+            if (!ensure_file_actions()) {
+                std::fprintf(stderr, "Failed to initialize qemu spawn file actions\n");
+                if (restoreFrameDoorbellCloexec) {
+                    set_close_on_exec(frameDoorbellFd, true);
+                }
+                if (restoreInputCloexec) {
+                    set_close_on_exec(inputFd, true);
+                }
+                return -1;
+            }
+            if (!add_dup2(controlFd, macmu::kControlChildFd)) {
+                posix_spawn_file_actions_destroy(&fileActions);
+                return -1;
+            }
+        }
+    }
+
     posix_spawnattr_t attributes;
     posix_spawnattr_init(&attributes);
     posix_spawnattr_setflags(&attributes, POSIX_SPAWN_SETPGROUP);
@@ -225,6 +271,9 @@ pid_t launch_qemu(const ShellOptions& options, int frameDoorbellFd, int inputFd)
     }
     if (restoreInputCloexec) {
         set_close_on_exec(inputFd, true);
+    }
+    if (restoreControlCloexec) {
+        set_close_on_exec(controlFd, true);
     }
     if (result != 0) {
         std::fprintf(stderr, "Failed to launch qemu-system-aarch64-headless: %s\n",

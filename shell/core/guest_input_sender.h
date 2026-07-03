@@ -19,7 +19,7 @@ public:
     GuestInputSender(const GuestInputSender&) = delete;
     GuestInputSender& operator=(const GuestInputSender&) = delete;
 
-    bool start(const std::string& socket_path);
+    bool start(const std::string& socket_path, const std::string& app_data_dir);
     void stop();
     std::string socket_path() const { return m_socketPath; }
     bool ready() const { return m_writeFd.load(std::memory_order_acquire) >= 0; }
@@ -42,6 +42,7 @@ private:
 
     std::mutex m_socketMutex;
     std::string m_socketPath;
+    std::string m_logPath;
     std::atomic<int> m_listenFd{-1};
     std::atomic<int> m_writeFd{-1};
     std::atomic<bool> m_stopRequested{false};

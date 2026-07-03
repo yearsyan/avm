@@ -15,9 +15,13 @@
 // inherited into the child and advertised through MACMU_FRAME_DOORBELL_FD. If
 // |inputFd| is non-negative, it is inherited into the child (at the fixed fd
 // macmu::kInputChildFd) and advertised through MACMU_INPUT_FD, so host pointer
-// input reaches the guest without a filesystem socket. Returns the child pid,
-// or -1 on failure (a message is printed to stderr).
-pid_t launch_qemu(const ShellOptions& options, int frameDoorbellFd = -1, int inputFd = -1);
+// input reaches the guest without a filesystem socket. If |controlFd| is
+// non-negative, it is inherited at macmu::kControlChildFd and advertised
+// through MACMU_CONTROL_FD (the MMCP control plane; the caller must close its
+// copy of the remote end after the spawn). Returns the child pid, or -1 on
+// failure (a message is printed to stderr).
+pid_t launch_qemu(const ShellOptions& options, int frameDoorbellFd = -1, int inputFd = -1,
+                  int controlFd = -1);
 
 // SIGTERM (then SIGKILL after ~5s) the process group rooted at |pid|. No-op for
 // non-positive pids; safe to call on an already-reaped child.

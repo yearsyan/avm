@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //
-// FrameConsumer: the shell-side half of the cross-process frame channel.
+// FrameConsumer: the shell-side half of the cross-process frame channel (v2).
 //
 // This mirrors the layout and naming convention used by the gfxstream producer
 // (host/common/iosurface_export.cpp) but is deliberately self-contained so the
@@ -9,6 +9,11 @@
 // which it exports to qemu via ANDROID_EMULATOR_WRAPPER_PID), and an inherited
 // FD doorbell carries a notification for each frame. The shell keeps the
 // consumer end and passes the producer end to qemu by fd inheritance.
+//
+// Protocol v2: the shm object holds a fixed table of per-display slots
+// (slot index == Android display id), each an independent odd/even seqlock.
+// One doorbell serves all displays; its payload is advisory and readers
+// re-scan the slot table on wake. See docs/FRAME_CHANNEL_V2_CONTROL_PLANE.md.
 //
 // When the channel cannot be established, valid() returns false and callers
 // should avoid launching a frame-driven display path.
@@ -20,6 +25,8 @@
 #include <string>
 
 #include "surface_metadata.h"
+
+inline constexpr uint32_t kMacmuFrameSlotCount = 16;
 
 class FrameConsumer {
    public:
@@ -39,27 +46,34 @@ class FrameConsumer {
     int producer_doorbell_fd() const { return producerDoorbellFd_; }
     void close_producer_doorbell_fd();
 
-    // Seqlock-style read: sample the frame counter, read the payload, then
-    // re-read the counter. Only accept the snapshot if the two counter reads
-    // match, which guarantees we did not observe a producer update mid-snapshot
-    // (e.g. a new surface id paired with the previous frame number, which would
-    // make the consumer think it has already consumed the new surface).
-    bool read(SurfaceMetadata* out);
+    // Zero the whole slot table. Call between qemu generations so a restarted
+    // producer starts from a clean table (its frame counters reset too).
+    void reset_slots();
 
-    // Block until a frame different from |last_frame| is available or
-    // |timeout_ms| elapses. Drains coalesced doorbell notifications first.
-    bool wait_for_frame(uint64_t last_frame, uint64_t timeout_ms, SurfaceMetadata* out);
+    // Seqlock read of one display slot: sample the sequence (reject odd =
+    // writer active), read the payload, re-read the sequence, accept only if
+    // unchanged. Returns false if the slot has never been published.
+    bool read(uint32_t display_id, SurfaceMetadata* out);
+
+    // Block until ANY display has a frame newer than its entry in
+    // |last_frames| (array of kMacmuFrameSlotCount cursors) or |timeout_ms|
+    // elapses. On success returns true and stores the ready display id in
+    // |out_display_id|; the caller re-reads the slot and updates its cursor.
+    // Drains coalesced doorbell notifications before scanning.
+    bool wait_for_any_frame(const uint64_t* last_frames, uint64_t timeout_ms,
+                            uint32_t* out_display_id);
 
    private:
     static uint64_t steady_now_ms();
     void drain_notifications();
+    bool scan_slots(const uint64_t* last_frames, uint32_t* out_display_id);
     void teardown();
 
     std::string name_;
     int shmFd_ = -1;
     void* mapped_ = nullptr;
     size_t totalSize_ = 0;
-    void* payload_ = nullptr;  // ShmPayload* (defined locally in the .cpp)
+    void* slots_ = nullptr;  // ShmDisplaySlot* (defined locally in the .cpp)
     int doorbellFd_ = -1;
     int producerDoorbellFd_ = -1;
     bool valid_ = false;

@@ -40,6 +40,7 @@ set(android-qemu2-glue_src
     emulation/VirtioWifiForwarder.cpp
     emulation/WifiService.cpp
     looper-qemu.cpp
+    macmu-control-receiver.cpp
     macmu-input-receiver.cpp
     net-android.cpp
     proxy/slirp_proxy.cpp

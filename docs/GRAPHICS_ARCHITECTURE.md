@@ -55,13 +55,18 @@ Android guest
   -> macmu Metal view
 ```
 
-MacMu adds an IOSurface sink at the final display post stage:
+MacMu adds IOSurface sinks at two stages:
 
-- Vulkan path: `DisplayVk::postToIosurface()`.
-- OpenGL path: `DisplayGl::post()` with `IosurfaceGlDisplaySink`.
+- Display 0 (final present): `DisplayVk::postToIosurface()` on the Vulkan
+  path, `DisplayGl::post()` with `IosurfaceGlDisplaySink` on the OpenGL path.
+- Secondary displays (GL composition only): `PostWorkerGl::composeImpl`
+  exports each display's composition target ColorBuffer right after its
+  guest compose completes (`exportComposedDisplay`, sharing the blit/publish
+  machinery in `host/gl/iosurface_gl_export.{h,cpp}`).
 
-The sink currently exports the first posted display layer. Rotation and color
-transforms are intentionally ignored in this first implementation.
+Each display publishes into its own frame-channel slot (slot index ==
+Android display id). Rotation and color transforms are intentionally ignored
+in this first implementation.
 
 ## qemu to Shell Communication
 
@@ -92,24 +97,38 @@ The communication contract is:
    `IOSurfaceLookup(iosurface_id)`.
 8. `macmu` imports the IOSurface as a Metal texture and draws it.
 
-The shm wire layout is:
+The shm wire layout (protocol v2) is a header plus a fixed table of 16
+per-display slots; slot index == Android display id:
 
 ```c
 struct ShmHeader {
     uint64_t magic;          // 'MACMUFRM'
-    uint32_t version;        // 1
-    uint32_t payloadOffset;  // sizeof(ShmHeader)
+    uint32_t version;        // 2
+    uint32_t payloadOffset;  // offset of slot[0]
+    uint32_t slotCount;      // 16
+    uint32_t slotStride;     // 64
+    uint64_t reserved[2];
 };
 
-struct ShmPayload {
+struct ShmDisplaySlot {      // one cache line per display
+    uint64_t seq;            // odd/even seqlock; odd while producer writes
+    uint64_t frame;          // monotonic per slot; 0 = never published
     uint32_t iosurfaceId;
     uint32_t width;
     uint32_t height;
-    uint32_t reserved;
-    uint64_t frame;
+    uint32_t dpi;            // 0 = unknown (control plane is authoritative)
+    uint32_t pixelFormat;    // fourcc, 'BGRA'
+    uint32_t flags;          // bit0: primary display
     uint64_t timestampNs;
+    uint8_t  pad[16];
 };
 ```
+
+One doorbell serves all displays; its datagram payload
+(`{displayId, reserved, frame}`) is advisory and the consumer re-scans the
+slot table on any wake. Display add/remove/list rides the separate MMCP
+control channel on inherited fd 197 (see
+docs/FRAME_CHANNEL_V2_CONTROL_PLANE.md).
 
 The struct is duplicated in `hardware/google/gfxstream/host/common/iosurface_export.cpp`
 and `shell/core/frame_consumer.cpp` so the MIT shell remains self-contained.
@@ -192,9 +211,8 @@ The app bundle keeps qemu and its runtime libraries under
 
 ## Current Limitations
 
-- Single display export path.
-- Single shm payload and doorbell; the protocol is not yet display-indexed for
-  multi-display export.
+- Secondary displays are exported only on the GL composition path; Vulkan
+  composition still exports display 0 only.
 - Only the first posted layer is exported.
 - Rotation and color transforms are ignored.
 - Non-RGBA/BGRA, non-exportable, or non-mirrorable ColorBuffers still use an

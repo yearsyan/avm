@@ -28,8 +28,12 @@ struct ShellOptions {
     // directory directly. Empty means "not provided".
     std::string systemPath;
     // Host Unix domain socket used by the guest MacMu RPC agent through
-    // virtio-vsock's pipe:unix transport.
+    // virtio-vsock's pipe:unix transport (input events, fire-and-forget).
     std::string guestRpcSocketPath;
+    // Second host Unix domain socket used by the guest agent's control RPC
+    // connection (request/response: app list, app launch). Kept separate from
+    // the input socket so bulky responses never head-of-line block input.
+    std::string guestCtrlSocketPath;
     // Build-time ext4/GPT image carrying the guest MacMu RPC agent and init rc.
     // Empty means no guest agent injection.
     std::string guestAgentImagePath;

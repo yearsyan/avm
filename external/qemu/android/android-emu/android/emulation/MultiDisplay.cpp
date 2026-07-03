@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 #include "host-common/MultiDisplay.h"
+#include "host-common/opengles.h"
 
 #include <stddef.h>
 #include <algorithm>
@@ -924,6 +925,11 @@ int MultiDisplay::setDisplayColorBuffer(uint32_t displayId,
         }
         fireEvent(DisplayChangeEvent{DisplayChange::DisplayChanged, displayId});
     }
+    // MacMu IOSurface export: each (re)bind is the per-frame signal for
+    // VirtualDisplay-backed secondary displays (the guest rotates buffers and
+    // re-binds every frame); the duplicate-handle early-out above keeps this
+    // from firing when nothing changed.
+    android_notifyDisplayColorBufferChanged(displayId, colorBuffer);
     LOG(VERBOSE) << "setDisplayColorBuffer " << displayId << " cb "
                  << colorBuffer;
     return 0;

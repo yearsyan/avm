@@ -24,18 +24,19 @@ using MacMuSurfaceRendererRef = void*;
 
 class FrameConsumer;
 
-// Create the renderer delegate for |view|. Returns nil-equivalent (nullptr) on
-// Metal pipeline failure. The caller owns the returned object and is expected
-// to release it via -release (it is a plain NSObject under ARC).
+// Create the renderer delegate for |view|, sampling frame-channel slot
+// |display_id|. Returns nil-equivalent (nullptr) on Metal pipeline failure.
+// The caller owns the returned object and is expected to release it via
+// -release (it is a plain NSObject under ARC).
 MacMuSurfaceRendererRef macmu_surface_renderer_create(MTKView* view,
-                                                      FrameConsumer* frame_consumer);
+                                                      FrameConsumer* frame_consumer,
+                                                      uint32_t display_id);
 
 #ifdef __OBJC__
 // Convert an AppKit point in |view| coordinates into guest framebuffer pixels.
 // Returns false when no guest frame is known yet or the point is outside the
-// rendered viewport and |clamp| is false. The current IOSurface export only
-// carries display 0, but the out parameter keeps the caller protocol-ready for
-// multi-display metadata.
+// rendered viewport and |clamp| is false. |out_display_id| receives the
+// renderer's display id so input events route to the right guest display.
 bool macmu_surface_renderer_map_view_point(MacMuSurfaceRendererRef renderer,
                                            MTKView* view,
                                            double point_x,

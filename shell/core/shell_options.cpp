@@ -151,13 +151,13 @@ std::string default_dyld_library_path(const std::string& launcher_dir) {
 }
 
 std::string default_guest_ramdisk_overlay_path(const std::string& launcher_dir) {
-    (void)launcher_dir;
-    return {};
+    const std::string path = path_join(launcher_dir, "lib/macmu-guest-overlay.img");
+    return file_exists(path) ? path : std::string();
 }
 
 std::string default_guest_ramdisk_path(const std::string& launcher_dir) {
-    const std::string path = path_join(launcher_dir, "lib/macmu-ramdisk.img");
-    return file_exists(path) ? path : std::string();
+    (void)launcher_dir;
+    return {};
 }
 
 std::string default_guest_agent_image_path(const std::string& launcher_dir) {
@@ -167,6 +167,10 @@ std::string default_guest_agent_image_path(const std::string& launcher_dir) {
 
 std::string default_guest_rpc_socket_path() {
     return "/tmp/macmu.rpc." + std::to_string(static_cast<unsigned>(getpid())) + ".sock";
+}
+
+std::string default_guest_ctrl_socket_path() {
+    return "/tmp/macmu.ctrl." + std::to_string(static_cast<unsigned>(getpid())) + ".sock";
 }
 
 }  // namespace
@@ -203,6 +207,9 @@ ShellOptions parse_options(int argc, char** argv) {
     options.guestRpcSocketPath =
         env_or_default("MACMU_GUEST_RPC_SOCKET", "AEMU_SHELL_GUEST_RPC_SOCKET",
                        default_guest_rpc_socket_path());
+    options.guestCtrlSocketPath =
+        env_or_default("MACMU_GUEST_CTRL_SOCKET", "AEMU_SHELL_GUEST_CTRL_SOCKET",
+                       default_guest_ctrl_socket_path());
     options.guestAgentImagePath =
         env_or_default("MACMU_GUEST_AGENT_IMAGE", "AEMU_SHELL_GUEST_AGENT_IMAGE",
                        default_guest_agent_image_path(options.launcherDir));
@@ -304,6 +311,10 @@ ShellOptions parse_options(int argc, char** argv) {
         } else if (arg == "--guest-rpc-socket") {
             if (const char* value = require_value("--guest-rpc-socket")) {
                 options.guestRpcSocketPath = value;
+            }
+        } else if (arg == "--guest-ctrl-socket") {
+            if (const char* value = require_value("--guest-ctrl-socket")) {
+                options.guestCtrlSocketPath = value;
             }
         } else if (arg == "--guest-agent-image") {
             if (const char* value = require_value("--guest-agent-image")) {

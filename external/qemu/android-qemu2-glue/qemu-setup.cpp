@@ -169,7 +169,9 @@ inline static std::string to_string(const char* str) {
 }
 
 static const char kMacMuGuestAgentDevicePath[] =
-        "/dev/block/platform/a003400.virtio_mmio/by-name/macmu";
+        "/dev/block/platform/a003e00.virtio_mmio/by-name/macmu";
+static const char kMacMuGuestShiftedVendorDevicePath[] =
+        "/dev/block/platform/a003c00.virtio_mmio/by-name/vendor";
 
 static const char* get_macmu_guest_agent_device_path() {
     const char* value = std::getenv("MACMU_GUEST_AGENT_DEVICE");
@@ -205,11 +207,16 @@ extern "C" void ranchu_device_tree_setup(void* fdt) {
     char* vendor_path = avdInfo_getVendorImageDevicePathInGuest(
             getConsoleAgents()->settings->avdInfo());
     if (vendor_path) {
+        const char* vendor_device_path = vendor_path;
+        if (const char* image = std::getenv("MACMU_GUEST_AGENT_IMAGE");
+            image && image[0]) {
+            vendor_device_path = kMacMuGuestShiftedVendorDevicePath;
+        }
         qemu_fdt_add_subnode(fdt, "/firmware/android/fstab/vendor");
         qemu_fdt_setprop_string(fdt, "/firmware/android/fstab/vendor",
                                 "compatible", "android,vendor");
         qemu_fdt_setprop_string(fdt, "/firmware/android/fstab/vendor", "dev",
-                                vendor_path);
+                                vendor_device_path);
         qemu_fdt_setprop_string(fdt, "/firmware/android/fstab/vendor",
                                 "fsmgr_flags", "wait");
         qemu_fdt_setprop_string(fdt, "/firmware/android/fstab/vendor",

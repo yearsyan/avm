@@ -9,16 +9,46 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <fcntl.h>
 #include <poll.h>
+#include <string>
+#include <system_error>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <unistd.h>
 
 namespace {
 
-void log_message(const char* format, ...) {
-    FILE* file = std::fopen("/tmp/macmu-rpc-agent-host.log", "a");
+namespace fs = std::filesystem;
+
+std::string path_join(const std::string& lhs, const std::string& rhs) {
+    if (lhs.empty()) {
+        return rhs;
+    }
+    if (lhs.back() == '/') {
+        return lhs + rhs;
+    }
+    return lhs + "/" + rhs;
+}
+
+void ensure_directory_best_effort(const std::string& path) {
+    std::error_code ec;
+    fs::create_directories(path, ec);
+}
+
+std::string log_path_for(const std::string& app_data_dir) {
+    const std::string logDir = path_join(app_data_dir, "logs");
+    ensure_directory_best_effort(logDir);
+    return path_join(logDir, "macmu-rpc-agent-host." +
+                                std::to_string(static_cast<unsigned>(getpid())) + ".log");
+}
+
+void log_message(const std::string& path, const char* format, ...) {
+    if (path.empty()) {
+        return;
+    }
+    FILE* file = std::fopen(path.c_str(), "a");
     if (!file) {
         return;
     }
@@ -59,16 +89,16 @@ void wake_listener(const std::string& path) {
     close(fd);
 }
 
-int create_listener(const std::string& path) {
+int create_listener(const std::string& path, const std::string& log_path) {
     sockaddr_un addr = {};
     if (path.empty() || path.size() >= sizeof(addr.sun_path)) {
-        log_message("invalid Unix socket path: %s", path.c_str());
+        log_message(log_path, "invalid Unix socket path: %s", path.c_str());
         return -1;
     }
 
     const int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) {
-        log_message("socket(listener) failed: %s", std::strerror(errno));
+        log_message(log_path, "socket(listener) failed: %s", std::strerror(errno));
         return -1;
     }
 
@@ -77,12 +107,12 @@ int create_listener(const std::string& path) {
     addr.sun_family = AF_UNIX;
     std::snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", path.c_str());
     if (bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
-        log_message("bind(listener:%s) failed: %s", path.c_str(), std::strerror(errno));
+        log_message(log_path, "bind(listener:%s) failed: %s", path.c_str(), std::strerror(errno));
         close(fd);
         return -1;
     }
     if (listen(fd, 1) != 0) {
-        log_message("listen failed: %s", std::strerror(errno));
+        log_message(log_path, "listen failed: %s", std::strerror(errno));
         close(fd);
         return -1;
     }
@@ -127,10 +157,11 @@ GuestInputSender::~GuestInputSender() {
     stop();
 }
 
-bool GuestInputSender::start(const std::string& socket_path) {
+bool GuestInputSender::start(const std::string& socket_path, const std::string& app_data_dir) {
     stop();
 
-    const int fd = create_listener(socket_path);
+    m_logPath = log_path_for(app_data_dir);
+    const int fd = create_listener(socket_path, m_logPath);
     if (fd < 0) {
         return false;
     }
@@ -138,7 +169,7 @@ bool GuestInputSender::start(const std::string& socket_path) {
     m_stopRequested.store(false, std::memory_order_release);
     m_socketPath = socket_path;
     m_listenFd.store(fd, std::memory_order_release);
-    log_message("MacMu RPC host listener ready on %s", m_socketPath.c_str());
+    log_message(m_logPath, "MacMu RPC host listener ready on %s", m_socketPath.c_str());
     m_acceptThread = std::thread([this] { accept_thread(); });
     return true;
 }
@@ -266,14 +297,14 @@ void GuestInputSender::accept_thread() {
                 continue;
             }
             if (!m_stopRequested.load(std::memory_order_acquire)) {
-                log_message("accept failed: %s", std::strerror(errno));
+                log_message(m_logPath, "accept failed: %s", std::strerror(errno));
                 std::this_thread::sleep_for(std::chrono::milliseconds(100));
             }
             continue;
         }
 
         if (!perform_handshake(fd)) {
-            log_message("guest RPC handshake failed");
+            log_message(m_logPath, "guest RPC handshake failed");
             close(fd);
             continue;
         }
@@ -285,7 +316,7 @@ void GuestInputSender::accept_thread() {
             m_writeFd.store(fd, std::memory_order_release);
         }
 
-        log_message("MacMu RPC guest agent connected");
+        log_message(m_logPath, "MacMu RPC guest agent connected");
         std::fprintf(stderr, "MacMu RPC guest agent connected.\n");
     }
 }
@@ -311,9 +342,9 @@ bool GuestInputSender::send_line(const char* line, int len) {
     }
 
     if (written < 0) {
-        log_message("MacMu RPC write failed: %s", std::strerror(errno));
+        log_message(m_logPath, "MacMu RPC write failed: %s", std::strerror(errno));
     } else {
-        log_message("MacMu RPC short write: %zd/%d", written, len);
+        log_message(m_logPath, "MacMu RPC short write: %zd/%d", written, len);
     }
     close_client_locked();
     return false;

@@ -122,6 +122,7 @@ extern "C" {
 #include "android-qemu2-glue/emulation/serial_line.h"
 #include "android-qemu2-glue/emulation/virtio-input-multi-touch.h"
 #include "android-qemu2-glue/emulation/virtio-input-rotary.h"
+#include "android-qemu2-glue/macmu-control-receiver.h"
 #include "android-qemu2-glue/macmu-input-receiver.h"
 #include "android-qemu2-glue/proxy/slirp_proxy.h"
 #include "android/gps/PassiveGpsUpdater.h"
@@ -705,6 +706,11 @@ private:
                                            kTarget.storageDeviceType);
                 break;
             case IMAGE_TYPE_CACHE:
+                if (!m_hw->disk_cachePartition ||
+                    !m_hw->disk_cachePartition_path ||
+                    !strcmp(m_hw->disk_cachePartition_path, "")) {
+                    return {};
+                }
                 filePath = m_hw->disk_cachePartition_path;
                 bufferString = StringFormat("%s.qcow2", filePath.data());
                 driveParam +=
@@ -1328,10 +1334,12 @@ static int startEmulatorWithMinConfig(int argc,
     }
 
     macmu_input_receiver_start(getConsoleAgents()->user_event);
+    macmu_control_receiver_start();
     skin_winsys_spawn_thread(opts->no_window, enter_qemu_main_loop, argc, argv);
     android::crashreport::CrashReporter::get()->hangDetector().pause(false);
     skin_winsys_enter_main_loop(opts->no_window);
     android::crashreport::CrashReporter::get()->hangDetector().pause(true);
+    macmu_control_receiver_stop();
     macmu_input_receiver_stop();
 
 #ifndef AEMU_CORE_ONLY
@@ -1367,7 +1375,11 @@ static const char* getNonEmptyEnv(const char* name) {
 }
 
 static const char kMacMuGuestAgentDevicePath[] =
-        "/dev/block/platform/a003400.virtio_mmio/by-name/macmu";
+        "/dev/block/platform/a003e00.virtio_mmio/by-name/macmu";
+static const char kMacMuGuestShiftedVendorDevicePath[] =
+        "/dev/block/platform/a003c00.virtio_mmio/by-name/vendor";
+static const char kMacMuGuestShiftedDynamicPartitionBootDevice[] =
+        "a003400.virtio_mmio";
 
 static const char* getMacMuGuestAgentDevicePath() {
     if (const char* devicePath = getNonEmptyEnv("MACMU_GUEST_AGENT_DEVICE")) {
@@ -1382,10 +1394,13 @@ static void appendMacMuGuestBootProperties(
     if (socketPath) {
         props->push_back({"androidboot.macmu_rpc_socket", socketPath});
     }
-    if (getNonEmptyEnv("MACMU_GUEST_AGENT_IMAGE")) {
-        const char* initRc = getNonEmptyEnv("MACMU_GUEST_INIT_RC");
-        props->push_back({"androidboot.init_rc",
-                          initRc ? initRc : "/vendor/etc/sensors/init.rc"});
+    if (const char* ctrlSocketPath = getNonEmptyEnv("MACMU_GUEST_CTRL_SOCKET")) {
+        props->push_back({"androidboot.macmu_ctrl_socket", ctrlSocketPath});
+    }
+    if (const char* initRc = getNonEmptyEnv("MACMU_GUEST_INIT_RC")) {
+        props->push_back({"androidboot.init_rc", initRc});
+    } else if (getNonEmptyEnv("MACMU_GUEST_AGENT_IMAGE")) {
+        props->push_back({"androidboot.init_rc", "/vendor/etc/sensors/init.rc"});
     }
 }
 
@@ -2864,28 +2879,30 @@ extern "C" int main(int argc, char** argv) {
 
     bool createEmptyCacheFile = false;
 
-    // Make sure there's a temp cache partition if there wasn't a permanent one
-    if ((!hw->disk_cachePartition_path ||
-         strcmp(hw->disk_cachePartition_path, "") == 0)) {
-        str_reset(&hw->disk_cachePartition_path,
-                  tempfile_path(tempfile_create()));
-        createEmptyCacheFile = true;
-    }
+    if (hw->disk_cachePartition) {
+        // Make sure there's a temp cache partition if there wasn't a permanent one
+        if ((!hw->disk_cachePartition_path ||
+             strcmp(hw->disk_cachePartition_path, "") == 0)) {
+            str_reset(&hw->disk_cachePartition_path,
+                      tempfile_path(tempfile_create()));
+            createEmptyCacheFile = true;
+        }
 
-    if (!path_exists(hw->disk_cachePartition_path)) {
-        createEmptyCacheFile = true;
-    }
+        if (!path_exists(hw->disk_cachePartition_path)) {
+            createEmptyCacheFile = true;
+        }
 
-    if (createEmptyCacheFile) {
-        D("Creating empty ext4 cache partition: %s",
-          hw->disk_cachePartition_path);
-        int ret = android_createEmptyExt4Image(hw->disk_cachePartition_path,
-                                               hw->disk_cachePartition_size,
-                                               "cache");
-        if (ret < 0) {
-            android_panic("Could not create %s: %s", hw->disk_cachePartition_path,
-                   strerror(-ret));
-            return 1;
+        if (createEmptyCacheFile) {
+            D("Creating empty ext4 cache partition: %s",
+              hw->disk_cachePartition_path);
+            int ret = android_createEmptyExt4Image(hw->disk_cachePartition_path,
+                                                   hw->disk_cachePartition_size,
+                                                   "cache");
+            if (ret < 0) {
+                android_panic("Could not create %s: %s", hw->disk_cachePartition_path,
+                       strerror(-ret));
+                return 1;
+            }
         }
     }
 
@@ -3103,10 +3120,12 @@ extern "C" int main(int argc, char** argv) {
     args.add("-nodefaults");
 
     std::string bootconfigInitrdPath;
-    std::string macmuGuestInitrdPath;
     std::string vendorBootRamdiskPath;
     std::string vendorBootInitrdPath;
+    std::string macmuGuestOverlayInitrdPath;
     const char* selectedRamdiskPath = hw->disk_ramdisk_path;
+    const char* macmuGuestOverlayPath =
+            getNonEmptyEnv("MACMU_GUEST_RAMDISK_OVERLAY");
 
     if (hw->disk_ramdisk_path) {
         args.add2("-kernel", hw->kernel_path);
@@ -3120,24 +3139,6 @@ extern "C" int main(int argc, char** argv) {
             }
             selectedRamdiskPath = macmuGuestRamdiskPath;
             dinfo("MacMu guest ramdisk selected: %s", macmuGuestRamdiskPath);
-        } else if (const char* macmuGuestOverlayPath =
-                           getNonEmptyEnv("MACMU_GUEST_RAMDISK_OVERLAY")) {
-            macmuGuestInitrdPath = getWriteableFilename(
-                    hw->disk_dataPartition_path, "macmu-initrd");
-            const int result = createMacMuGuestRamdisk(
-                    hw->disk_ramdisk_path, macmuGuestOverlayPath,
-                    macmuGuestInitrdPath.c_str());
-            if (result) {
-                android_panic("Could not prepare MacMu guest initrd overlay, "
-                              "error=%d base=%s overlay=%s dst=%s",
-                              result, hw->disk_ramdisk_path,
-                              macmuGuestOverlayPath,
-                              macmuGuestInitrdPath.c_str());
-                return result;
-            }
-            selectedRamdiskPath = macmuGuestInitrdPath.c_str();
-            dinfo("MacMu guest initrd overlay appended: %s",
-                  macmuGuestOverlayPath);
         }
 
         std::unique_ptr<char, void (*)(void*)> vendorBootPath(
@@ -3173,6 +3174,25 @@ extern "C" int main(int argc, char** argv) {
             dinfo("vendor_boot ramdisk appended: %s", vendorBootPath.get());
         }
 
+        if (macmuGuestOverlayPath) {
+            macmuGuestOverlayInitrdPath = getWriteableFilename(
+                    hw->disk_dataPartition_path, "macmu-initrd");
+            const int result = createMacMuGuestRamdisk(
+                    selectedRamdiskPath, macmuGuestOverlayPath,
+                    macmuGuestOverlayInitrdPath.c_str());
+            if (result) {
+                android_panic("Could not prepare MacMu guest initrd overlay, "
+                              "error=%d base=%s overlay=%s dst=%s",
+                              result, selectedRamdiskPath,
+                              macmuGuestOverlayPath,
+                              macmuGuestOverlayInitrdPath.c_str());
+                return result;
+            }
+            selectedRamdiskPath = macmuGuestOverlayInitrdPath.c_str();
+            dinfo("MacMu guest initrd overlay appended: %s",
+                  macmuGuestOverlayPath);
+        }
+
         if (fc::isEnabled(fc::AndroidbootProps) ||
             fc::isEnabled(fc::AndroidbootProps2)) {
             bootconfigInitrdPath = getWriteableFilename(
@@ -3186,14 +3206,10 @@ extern "C" int main(int argc, char** argv) {
         return 1;
     }
 
-    // Add MacMu after the AVD partitions so the emulator's platform by-name
-    // paths and androidboot.boot_devices remain stable. The guest fstab uses
-    // platform by-name paths for MacMu and userdata to avoid ARM's reversed
-    // /dev/block/vd* numbering.
-    // add partition parameters with the sequence pre-defined in
-    // targetInfo.imagePartitionTypes
-    args.add(PartitionParameters::create(hw, avd));
-
+    // Add the MacMu agent disk before the normal ARM virtio-mmio partitions.
+    // Ranchu names MMIO block devices in reverse creation order, so this keeps
+    // system/cache/userdata/metadata/vendor at their stock vda-vde positions and
+    // places the MacMu GPT partition after them.
     if (const char* macmuGuestAgentImage =
                 getNonEmptyEnv("MACMU_GUEST_AGENT_IMAGE")) {
         args.add("-blockdev");
@@ -3203,10 +3219,13 @@ extern "C" int main(int argc, char** argv) {
         args.add("-blockdev");
         args.add("driver=raw,node-name=macmu,file=macmu_file,read-only=on");
         args.add("-device");
-        args.add(StringFormat("%s,drive=macmu",
-                              kTarget.storageDeviceType));
+        args.add(StringFormat("%s,drive=macmu", kTarget.storageDeviceType));
         dinfo("MacMu guest agent image selected: %s", macmuGuestAgentImage);
     }
+
+    // add partition parameters with the sequence pre-defined in
+    // targetInfo.imagePartitionTypes
+    args.add(PartitionParameters::create(hw, avd));
 
     if (fc::isEnabled(fc::KernelDeviceTreeBlobSupport)) {
         const std::string dtbFileName = getWriteableFilename(
@@ -3218,12 +3237,13 @@ extern "C" int main(int argc, char** argv) {
 
             char* vendor_path = avdInfo_getVendorImageDevicePathInGuest(avd);
             if (vendor_path) {
-                params.vendor_device_location = vendor_path;
-                free(vendor_path);
                 if (getNonEmptyEnv("MACMU_GUEST_AGENT_IMAGE")) {
-                    params.macmu_device_location =
-                            getMacMuGuestAgentDevicePath();
+                    params.vendor_device_location =
+                            kMacMuGuestShiftedVendorDevicePath;
+                } else {
+                    params.vendor_device_location = vendor_path;
                 }
+                free(vendor_path);
 
                 exitStatus = createDtbFile(params, dtbFileName);
                 if (exitStatus) {
@@ -3800,11 +3820,16 @@ extern "C" int main(int argc, char** argv) {
                     &verified_boot_params);
             if (feature_is_enabled(kFeature_DynamicPartition)) {
                 std::string boot_dev("androidboot.boot_devices=");
-                std::unique_ptr<char, void (*)(void*)>
-                        dynamicPartitionBootDevice(
-                                avdInfo_getDynamicPartitionBootDevice(avd),
-                                free);
-                boot_dev.append(dynamicPartitionBootDevice.get());
+                if (getNonEmptyEnv("MACMU_GUEST_AGENT_IMAGE")) {
+                    boot_dev.append(
+                            kMacMuGuestShiftedDynamicPartitionBootDevice);
+                } else {
+                    std::unique_ptr<char, void (*)(void*)>
+                            dynamicPartitionBootDevice(
+                                    avdInfo_getDynamicPartitionBootDevice(avd),
+                                    free);
+                    boot_dev.append(dynamicPartitionBootDevice.get());
+                }
                 verified_boot_params.push_back(boot_dev);
             }
             if (android_op_writable_system) {
@@ -3942,12 +3967,14 @@ extern "C" int main(int argc, char** argv) {
     }
 
     macmu_input_receiver_start(getConsoleAgents()->user_event);
+    macmu_control_receiver_start();
     skin_winsys_spawn_thread(opts->no_window, enter_qemu_main_loop, args.size(),
                              args.array());
 
     android::crashreport::CrashReporter::get()->hangDetector().pause(false);
     skin_winsys_enter_main_loop(opts->no_window);
     android::crashreport::CrashReporter::get()->hangDetector().pause(true);
+    macmu_control_receiver_stop();
     macmu_input_receiver_stop();
 
 #ifndef AEMU_CORE_ONLY

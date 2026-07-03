@@ -50,7 +50,9 @@ bool renderer_debug_logs_enabled() {
 }  // namespace
 
 @interface MacMuSurfaceRenderer : NSObject <MTKViewDelegate>
-- (instancetype)initWithView:(MTKView*)view frameConsumer:(FrameConsumer*)frameConsumer;
+- (instancetype)initWithView:(MTKView*)view
+               frameConsumer:(FrameConsumer*)frameConsumer
+                   displayId:(uint32_t)displayId;
 @end
 
 @implementation MacMuSurfaceRenderer {
@@ -63,6 +65,7 @@ bool renderer_debug_logs_enabled() {
     NSMutableDictionary<NSNumber*, id>* _surfaceCache;
     NSMutableDictionary<NSNumber*, id<MTLTexture>>* _textureCache;
     FrameConsumer* _frameConsumer;  // not owned; nil when unavailable
+    uint32_t _displayId;            // frame-channel slot this renderer samples
     bool _useChannel;               // true when FrameConsumer is valid
     uint64_t _lastDrawnFrame;       // last frame number actually rendered
     uint64_t _lastLoggedSubmitFrame;
@@ -74,7 +77,9 @@ bool renderer_debug_logs_enabled() {
     bool _viewportValid;
 }
 
-- (instancetype)initWithView:(MTKView*)view frameConsumer:(FrameConsumer*)frameConsumer {
+- (instancetype)initWithView:(MTKView*)view
+               frameConsumer:(FrameConsumer*)frameConsumer
+                   displayId:(uint32_t)displayId {
     self = [super init];
     if (!self) {
         return nil;
@@ -86,6 +91,7 @@ bool renderer_debug_logs_enabled() {
     _surfaceCache = [[NSMutableDictionary alloc] init];
     _textureCache = [[NSMutableDictionary alloc] init];
     _frameConsumer = frameConsumer;
+    _displayId = displayId;
     _useChannel = frameConsumer != nullptr && frameConsumer->valid();
     _lastDrawnFrame = 0;
     _lastLoggedSubmitFrame = 0;
@@ -180,7 +186,7 @@ bool renderer_debug_logs_enabled() {
                            static_cast<int>(_metadata.height) - 1);
     }
     if (outDisplayId) {
-        *outDisplayId = 0;
+        *outDisplayId = _displayId;
     }
     return YES;
 }
@@ -192,7 +198,7 @@ bool renderer_debug_logs_enabled() {
     SurfaceMetadata next = {};
     bool gotFrame = false;
     if (_useChannel) {
-        gotFrame = _frameConsumer->read(&next);
+        gotFrame = _frameConsumer->read(_displayId, &next);
     }
     if (!gotFrame) {
         if (renderer_debug_logs_enabled() && !_surfaceTexture && !_loggedWaitingForFrame) {
@@ -330,8 +336,11 @@ bool renderer_debug_logs_enabled() {
 @end
 
 MacMuSurfaceRendererRef macmu_surface_renderer_create(MTKView* view,
-                                                      FrameConsumer* frame_consumer) {
-    return [[MacMuSurfaceRenderer alloc] initWithView:view frameConsumer:frame_consumer];
+                                                      FrameConsumer* frame_consumer,
+                                                      uint32_t display_id) {
+    return [[MacMuSurfaceRenderer alloc] initWithView:view
+                                        frameConsumer:frame_consumer
+                                            displayId:display_id];
 }
 
 bool macmu_surface_renderer_map_view_point(MacMuSurfaceRendererRef renderer,

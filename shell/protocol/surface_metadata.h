@@ -15,6 +15,7 @@
 using MacmuIOSurfaceID = uint32_t;
 
 struct SurfaceMetadata {
+    uint32_t displayId = 0;
     MacmuIOSurfaceID iosurfaceId = 0;
     uint32_t width = 0;
     uint32_t height = 0;

@@ -16,7 +16,9 @@ find_library(QUARTZCORE_FRAMEWORK QuartzCore REQUIRED)
 
 add_executable(macmu_shell
     protocol/viewport.cpp
+    core/control_channel.cpp
     core/frame_consumer.cpp
+    core/guest_control_client.cpp
     core/guest_input_sender.cpp
     core/input_sender.cpp
     core/machine_manager.cpp
@@ -84,7 +86,8 @@ set(MACMU_GUEST_AGENT_IMAGE_ROOT "${CMAKE_CURRENT_BINARY_DIR}/macmu-agent-image-
 set(MACMU_GUEST_AGENT_EXT4 "${CMAKE_CURRENT_BINARY_DIR}/macmu-agent.ext4")
 set(MACMU_GUEST_AGENT_IMAGE "${CMAKE_CURRENT_BINARY_DIR}/macmu-agent.img")
 set(MACMU_GUEST_OVERLAY_DIR "${CMAKE_CURRENT_BINARY_DIR}/macmu-guest-overlay")
-set(MACMU_GUEST_RAMDISK_OVERLAY "${CMAKE_CURRENT_BINARY_DIR}/macmu-guest-overlay.cpio")
+set(MACMU_GUEST_RAMDISK_OVERLAY_CPIO "${CMAKE_CURRENT_BINARY_DIR}/macmu-guest-overlay.cpio")
+set(MACMU_GUEST_RAMDISK_OVERLAY "${CMAKE_CURRENT_BINARY_DIR}/macmu-guest-overlay.img")
 set(MACMU_GUEST_RAMDISK_BASE_CPIO "${CMAKE_CURRENT_BINARY_DIR}/macmu-base-ramdisk.cpio")
 set(MACMU_GUEST_RAMDISK_COMBINED_CPIO "${CMAKE_CURRENT_BINARY_DIR}/macmu-ramdisk.cpio")
 set(MACMU_GUEST_RAMDISK "${CMAKE_CURRENT_BINARY_DIR}/macmu-ramdisk.img")
@@ -165,18 +168,28 @@ if(MACMU_JAVAC AND MACMU_JAR AND MACMU_D8 AND EXISTS "${MACMU_ANDROID_JAR}")
             "MacMu guest agent image will not be built; emulator_make_ext4fs and python3 are required.")
     endif()
 
-    if(MACMU_CPIO)
+    if(MACMU_CPIO AND MACMU_LZ4)
         add_custom_command(
-            OUTPUT "${MACMU_GUEST_RAMDISK_OVERLAY}"
+            OUTPUT
+                    "${MACMU_GUEST_RAMDISK_OVERLAY_CPIO}"
+                    "${MACMU_GUEST_RAMDISK_OVERLAY}"
             COMMAND "${CMAKE_COMMAND}" -E rm -rf "${MACMU_GUEST_OVERLAY_DIR}"
             COMMAND "${CMAKE_COMMAND}" -E make_directory
+                    "${MACMU_GUEST_OVERLAY_DIR}/first_stage_ramdisk"
+            COMMAND "${CMAKE_COMMAND}" -E make_directory
                     "${MACMU_GUEST_OVERLAY_DIR}/system/etc"
+            COMMAND "${CMAKE_COMMAND}" -E copy
+                    "${CMAKE_CURRENT_SOURCE_DIR}/guest_agent/fstab.ranchu"
+                    "${MACMU_GUEST_OVERLAY_DIR}/first_stage_ramdisk/fstab.ranchu"
             COMMAND "${CMAKE_COMMAND}" -E copy
                     "${CMAKE_CURRENT_SOURCE_DIR}/guest_agent/fstab.ranchu"
                     "${MACMU_GUEST_OVERLAY_DIR}/system/etc/fstab.ranchu"
             COMMAND /bin/chmod -R u=rwX,go=rX "${MACMU_GUEST_OVERLAY_DIR}"
             COMMAND /bin/sh -c
-                    "cd '${MACMU_GUEST_OVERLAY_DIR}' && find . | sort | '${MACMU_CPIO}' -o -H newc > '${MACMU_GUEST_RAMDISK_OVERLAY}'"
+                    "cd '${MACMU_GUEST_OVERLAY_DIR}' && find . | sort | '${MACMU_CPIO}' -o -H newc > '${MACMU_GUEST_RAMDISK_OVERLAY_CPIO}'"
+            COMMAND "${MACMU_LZ4}" -l -f
+                    "${MACMU_GUEST_RAMDISK_OVERLAY_CPIO}"
+                    "${MACMU_GUEST_RAMDISK_OVERLAY}"
             DEPENDS
                     "${CMAKE_CURRENT_SOURCE_DIR}/guest_agent/fstab.ranchu"
             VERBATIM
@@ -194,14 +207,14 @@ if(MACMU_JAVAC AND MACMU_JAR AND MACMU_D8 AND EXISTS "${MACMU_ANDROID_JAR}")
                 COMMAND "${MACMU_PYTHON3}"
                         "${CMAKE_CURRENT_SOURCE_DIR}/tools/merge_newc.py"
                         "${MACMU_GUEST_RAMDISK_BASE_CPIO}"
-                        "${MACMU_GUEST_RAMDISK_OVERLAY}"
+                        "${MACMU_GUEST_RAMDISK_OVERLAY_CPIO}"
                         "${MACMU_GUEST_RAMDISK_COMBINED_CPIO}"
                 COMMAND "${MACMU_LZ4}" -l -f
                         "${MACMU_GUEST_RAMDISK_COMBINED_CPIO}"
                         "${MACMU_GUEST_RAMDISK}"
                 DEPENDS
                         "${MACMU_BASE_RAMDISK}"
-                        "${MACMU_GUEST_RAMDISK_OVERLAY}"
+                        "${MACMU_GUEST_RAMDISK_OVERLAY_CPIO}"
                         "${CMAKE_CURRENT_SOURCE_DIR}/tools/merge_newc.py"
                 VERBATIM
             )
@@ -214,7 +227,7 @@ if(MACMU_JAVAC AND MACMU_JAR AND MACMU_D8 AND EXISTS "${MACMU_ANDROID_JAR}")
                 "MacMu full guest ramdisk will not be built; set MACMU_BASE_RAMDISK and install lz4/python3.")
         endif()
     else()
-        message(WARNING "MacMu guest ramdisk overlay will not be built; cpio is required.")
+        message(WARNING "MacMu guest ramdisk overlay will not be built; cpio and lz4 are required.")
     endif()
 else()
     message(WARNING "MacMu guest RPC agent will not be built; set ANDROID_SDK_ROOT and install javac/d8.")

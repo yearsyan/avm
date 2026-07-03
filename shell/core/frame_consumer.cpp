@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //
-// Frame channel consumer: shm-backed seqlock payload + inherited FD doorbell.
+// Frame channel consumer (v2): shm slot table + inherited FD doorbell.
 
 #include "frame_consumer.h"
 
@@ -21,39 +21,44 @@
 namespace {
 
 constexpr uint64_t kShmMagic = 0x4d41434d5546524dull;  // 'MACMUFRM'
-constexpr uint32_t kShmVersion = 1;
+constexpr uint32_t kShmVersion = 2;
 constexpr int kDoorbellSocketBufferBytes = 1 << 20;
 
 // Shell-side copy of the cross-process wire layout. Keep this byte-for-byte in
 // sync with the producer copy in
 // hardware/google/gfxstream/host/common/iosurface_export.cpp. Update both files
-// together and bump kShmVersion for incompatible layout changes.
+// together and bump kShmVersion for incompatible layout changes. See
+// docs/FRAME_CHANNEL_V2_CONTROL_PLANE.md.
 struct ShmHeader {
     uint64_t magic;
     uint32_t version;
     uint32_t payloadOffset;
+    uint32_t slotCount;
+    uint32_t slotStride;
+    uint64_t reserved[2];
 };
 
-struct ShmPayload {
+struct ShmDisplaySlot {
+    uint64_t seq;          // seqlock: odd while the producer is writing
+    uint64_t frame;        // monotonic per slot; 0 = never published
     uint32_t iosurfaceId;
     uint32_t width;
     uint32_t height;
+    uint32_t dpi;
+    uint32_t pixelFormat;  // fourcc, currently always 'BGRA'
+    uint32_t flags;
+    uint64_t timestampNs;
+    uint8_t pad[16];
+};
+static_assert(sizeof(ShmDisplaySlot) == 64, "slot must stay one cache line");
+
+// Advisory doorbell payload; contents must not be trusted (datagrams can be
+// coalesced or dropped), readers re-scan the slot table on any wake.
+struct FrameDoorbellMsg {
+    uint32_t displayId;
     uint32_t reserved;
     uint64_t frame;
-    uint64_t timestampNs;
 };
-
-static_assert(sizeof(ShmHeader) == 16, "Frame shm header layout changed");
-static_assert(offsetof(ShmHeader, magic) == 0, "Frame shm header layout changed");
-static_assert(offsetof(ShmHeader, version) == 8, "Frame shm header layout changed");
-static_assert(offsetof(ShmHeader, payloadOffset) == 12, "Frame shm header layout changed");
-static_assert(sizeof(ShmPayload) == 32, "Frame shm payload layout changed");
-static_assert(offsetof(ShmPayload, iosurfaceId) == 0, "Frame shm payload layout changed");
-static_assert(offsetof(ShmPayload, width) == 4, "Frame shm payload layout changed");
-static_assert(offsetof(ShmPayload, height) == 8, "Frame shm payload layout changed");
-static_assert(offsetof(ShmPayload, reserved) == 12, "Frame shm payload layout changed");
-static_assert(offsetof(ShmPayload, frame) == 16, "Frame shm payload layout changed");
-static_assert(offsetof(ShmPayload, timestampNs) == 24, "Frame shm payload layout changed");
 
 std::string frame_channel_name(uint32_t wrapper_pid) {
     char buf[64];
@@ -78,10 +83,6 @@ void set_socket_buffer_size_best_effort(int fd, int option) {
     setsockopt(fd, SOL_SOCKET, option, &size, sizeof(size));
 }
 
-bool is_new_frame(const SurfaceMetadata& metadata, uint64_t last_frame) {
-    return metadata.frame != 0 && metadata.frame != last_frame;
-}
-
 }  // namespace
 
 FrameConsumer::~FrameConsumer() { teardown(); }
@@ -93,7 +94,7 @@ bool FrameConsumer::create(uint32_t wrapper_pid) {
     if (shmFd_ < 0) {
         return false;
     }
-    totalSize_ = sizeof(ShmHeader) + sizeof(ShmPayload);
+    totalSize_ = sizeof(ShmHeader) + kMacmuFrameSlotCount * sizeof(ShmDisplaySlot);
     if (ftruncate(shmFd_, static_cast<off_t>(totalSize_)) != 0) {
         teardown();
         return false;
@@ -104,12 +105,14 @@ bool FrameConsumer::create(uint32_t wrapper_pid) {
         teardown();
         return false;
     }
+    std::memset(mapped_, 0, totalSize_);
     ShmHeader* header = static_cast<ShmHeader*>(mapped_);
     header->magic = kShmMagic;
     header->version = kShmVersion;
     header->payloadOffset = sizeof(ShmHeader);
-    payload_ = static_cast<char*>(mapped_) + sizeof(ShmHeader);
-    std::memset(payload_, 0, sizeof(ShmPayload));
+    header->slotCount = kMacmuFrameSlotCount;
+    header->slotStride = sizeof(ShmDisplaySlot);
+    slots_ = static_cast<char*>(mapped_) + sizeof(ShmHeader);
 
     int doorbellPair[2] = {-1, -1};
     if (socketpair(AF_UNIX, SOCK_DGRAM, 0, doorbellPair) != 0) {
@@ -136,31 +139,58 @@ void FrameConsumer::close_producer_doorbell_fd() {
     }
 }
 
-bool FrameConsumer::read(SurfaceMetadata* out) {
-    if (!valid_ || out == nullptr) return false;
-    ShmPayload* p = static_cast<ShmPayload*>(payload_);
+void FrameConsumer::reset_slots() {
+    if (!valid_ || !slots_) {
+        return;
+    }
+    std::memset(slots_, 0, kMacmuFrameSlotCount * sizeof(ShmDisplaySlot));
+    drain_notifications();
+}
+
+bool FrameConsumer::read(uint32_t display_id, SurfaceMetadata* out) {
+    if (!valid_ || out == nullptr || display_id >= kMacmuFrameSlotCount) return false;
+    ShmDisplaySlot* slot = static_cast<ShmDisplaySlot*>(slots_) + display_id;
     for (int attempt = 0; attempt < 8; ++attempt) {
-        const uint64_t f0 = p->frame;
+        const uint64_t s0 = slot->seq;
+        if (s0 & 1) {
+            continue;
+        }
         std::atomic_thread_fence(std::memory_order_acquire);
-        const MacmuIOSurfaceID iosurfaceId = static_cast<MacmuIOSurfaceID>(p->iosurfaceId);
-        const uint32_t width = p->width;
-        const uint32_t height = p->height;
+        const MacmuIOSurfaceID iosurfaceId = static_cast<MacmuIOSurfaceID>(slot->iosurfaceId);
+        const uint32_t width = slot->width;
+        const uint32_t height = slot->height;
+        const uint64_t frame = slot->frame;
         std::atomic_thread_fence(std::memory_order_acquire);
-        const uint64_t f1 = p->frame;
-        if (f0 == f1) {
+        const uint64_t s1 = slot->seq;
+        if (s0 == s1) {
+            out->displayId = display_id;
             out->iosurfaceId = iosurfaceId;
             out->width = width;
             out->height = height;
-            out->frame = f0;
-            return out->frame != 0;
+            out->frame = frame;
+            return frame != 0;
         }
     }
     return false;
 }
 
-bool FrameConsumer::wait_for_frame(uint64_t last_frame, uint64_t timeout_ms, SurfaceMetadata* out) {
-    if (!valid_) return false;
-    if (read(out) && is_new_frame(*out, last_frame)) return true;
+bool FrameConsumer::scan_slots(const uint64_t* last_frames, uint32_t* out_display_id) {
+    for (uint32_t id = 0; id < kMacmuFrameSlotCount; ++id) {
+        SurfaceMetadata meta = {};
+        if (read(id, &meta) && meta.frame != 0 && meta.frame != last_frames[id]) {
+            if (out_display_id) {
+                *out_display_id = id;
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
+bool FrameConsumer::wait_for_any_frame(const uint64_t* last_frames, uint64_t timeout_ms,
+                                       uint32_t* out_display_id) {
+    if (!valid_ || last_frames == nullptr) return false;
+    if (scan_slots(last_frames, out_display_id)) return true;
     const uint64_t deadline_ms = steady_now_ms() + timeout_ms;
     do {
         const uint64_t now = steady_now_ms();
@@ -168,11 +198,10 @@ bool FrameConsumer::wait_for_frame(uint64_t last_frame, uint64_t timeout_ms, Sur
         pollfd pfd = {};
         pfd.fd = doorbellFd_;
         pfd.events = POLLIN;
-        const int pollResult =
-            poll(&pfd, 1, static_cast<int>(deadline_ms - now));
+        const int pollResult = poll(&pfd, 1, static_cast<int>(deadline_ms - now));
         if (pollResult > 0 && (pfd.revents & POLLIN)) {
             drain_notifications();
-            if (read(out) && is_new_frame(*out, last_frame)) return true;
+            if (scan_slots(last_frames, out_display_id)) return true;
         } else if (pollResult == 0) {
             break;
         } else if (pollResult < 0 && errno == EINTR) {
@@ -181,7 +210,7 @@ bool FrameConsumer::wait_for_frame(uint64_t last_frame, uint64_t timeout_ms, Sur
             break;
         }
     } while (steady_now_ms() < deadline_ms);
-    return read(out) && is_new_frame(*out, last_frame);
+    return scan_slots(last_frames, out_display_id);
 }
 
 uint64_t FrameConsumer::steady_now_ms() {
@@ -193,8 +222,8 @@ uint64_t FrameConsumer::steady_now_ms() {
 
 void FrameConsumer::drain_notifications() {
     while (true) {
-        uint64_t frame = 0;
-        const ssize_t bytes = recv(doorbellFd_, &frame, sizeof(frame), MSG_DONTWAIT);
+        FrameDoorbellMsg msg = {};
+        const ssize_t bytes = recv(doorbellFd_, &msg, sizeof(msg), MSG_DONTWAIT);
         if (bytes > 0) {
             continue;
         }

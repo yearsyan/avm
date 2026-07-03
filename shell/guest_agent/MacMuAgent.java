@@ -20,6 +20,15 @@ import java.io.InputStreamReader;
 import java.io.OutputStreamWriter;
 import java.lang.reflect.Method;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+import org.json.JSONArray;
+import org.json.JSONObject;
 
 public final class MacMuAgent {
     private static final int INJECT_INPUT_EVENT_MODE_ASYNC = 0;
@@ -69,7 +78,15 @@ public final class MacMuAgent {
 
     public static void main(String[] args) throws Exception {
         String socketPath = systemProperty("ro.boot.macmu_rpc_socket", "");
-        new MacMuAgent(socketPath).run();
+        String ctrlSocketPath = systemProperty("ro.boot.macmu_ctrl_socket", "");
+        MacMuAgent agent = new MacMuAgent(socketPath);
+        if (!ctrlSocketPath.isEmpty()) {
+            Thread ctrlThread = new Thread(() -> agent.runControl(ctrlSocketPath),
+                    "macmu-ctrl");
+            ctrlThread.setDaemon(true);
+            ctrlThread.start();
+        }
+        agent.run();
     }
 
     private void run() throws Exception {
@@ -169,6 +186,221 @@ public final class MacMuAgent {
         return ("pipe:unix:" + socketPath + "\0").getBytes(StandardCharsets.US_ASCII);
     }
 
+    // ------------------------------------------------------------------
+    // Control RPC connection: request/response line protocol used by the host
+    // shell for app management ("<id> apps", "<id> launch <component> <display>").
+    // Kept on a separate host socket so bulky responses never block input.
+    // ------------------------------------------------------------------
+
+    private void runControl(String ctrlSocketPath) {
+        while (true) {
+            try (HostPipe pipe = connectHostPipe(ctrlSocketPath)) {
+                // The emulator's MultiDisplayService is normally started via an
+                // adb broadcast the MacMu host does not have; send the same
+                // broadcast from inside the guest instead. Idempotent.
+                startMultiDisplayService();
+                handleControl(pipe.input, pipe.output);
+            } catch (Exception e) {
+                e.printStackTrace(System.err);
+                try {
+                    Thread.sleep(RECONNECT_DELAY_MS);
+                } catch (InterruptedException ignored) {
+                }
+            }
+        }
+    }
+
+    private void handleControl(FileInputStream input, FileOutputStream output) throws Exception {
+        try (BufferedReader reader =
+                        new BufferedReader(
+                                new InputStreamReader(input, StandardCharsets.US_ASCII), 65536);
+                BufferedWriter writer =
+                        new BufferedWriter(
+                                new OutputStreamWriter(output, StandardCharsets.US_ASCII),
+                                65536)) {
+            String line;
+            while ((line = reader.readLine()) != null) {
+                try {
+                    handleControlLine(line, writer);
+                } catch (Exception e) {
+                    e.printStackTrace(System.err);
+                }
+            }
+        }
+    }
+
+    private void handleControlLine(String line, BufferedWriter writer) throws Exception {
+        if (line.isEmpty()) {
+            return;
+        }
+        if ("v".equals(line)) {
+            writer.write("ok\n");
+            writer.flush();
+            return;
+        }
+        int space = line.indexOf(' ');
+        if (space <= 0) {
+            return;
+        }
+        String id = line.substring(0, space);
+        String[] fields = line.substring(space + 1).split(" ");
+        try {
+            if (fields.length == 1 && "apps".equals(fields[0])) {
+                writer.write(id + " ok " + listLauncherApps() + "\n");
+                writer.flush();
+                return;
+            }
+            if (fields.length == 3 && "launch".equals(fields[0])) {
+                String component = fields[1];
+                int displayId = Integer.parseInt(fields[2]);
+                String error = launchComponent(component, displayId);
+                if (error == null) {
+                    writer.write(id + " ok\n");
+                } else {
+                    writer.write(id + " err " + error.replace('\n', ' ') + "\n");
+                }
+                writer.flush();
+                return;
+            }
+            writer.write(id + " err unsupported command\n");
+            writer.flush();
+        } catch (Exception e) {
+            writer.write(id + " err " + String.valueOf(e.getMessage()).replace('\n', ' ')
+                    + "\n");
+            writer.flush();
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Display id translation. The host control plane addresses displays by the
+    // emulator MultiDisplay index (1..5, also the frame-channel slot). Android
+    // assigns its own logical display id to the backing VirtualDisplay
+    // (uniqueId "virtual:com.android.emulator.multidisplay:<1234561+index>").
+    // Everything that talks to Android framework APIs (input injection,
+    // start-activity --display) must use the logical id.
+    // ------------------------------------------------------------------
+
+    private static final int MULTI_DISPLAY_UNIQUE_ID_BASE = 1234561;
+    private static final Pattern VIRTUAL_DISPLAY_PATTERN = Pattern.compile(
+            "displayId=(\\d+), uniqueId='virtual:com\\.android\\.emulator\\.multidisplay:(\\d+)'");
+
+    private final Map<Integer, Integer> displayIdCache = new HashMap<>();
+
+    private synchronized int resolveAndroidDisplayId(int emulatorDisplayId) {
+        if (emulatorDisplayId <= 0) {
+            return 0;
+        }
+        Integer cached = displayIdCache.get(emulatorDisplayId);
+        if (cached != null) {
+            return cached;
+        }
+        refreshDisplayIdCache();
+        cached = displayIdCache.get(emulatorDisplayId);
+        return cached != null ? cached : -1;
+    }
+
+    private void refreshDisplayIdCache() {
+        displayIdCache.clear();
+        try {
+            List<String> lines = execForLines(
+                    new String[] {"/system/bin/dumpsys", "display"});
+            for (String line : lines) {
+                Matcher matcher = VIRTUAL_DISPLAY_PATTERN.matcher(line);
+                while (matcher.find()) {
+                    int androidId = Integer.parseInt(matcher.group(1));
+                    int uniqueSuffix = Integer.parseInt(matcher.group(2));
+                    displayIdCache.put(uniqueSuffix - MULTI_DISPLAY_UNIQUE_ID_BASE, androidId);
+                }
+            }
+        } catch (Exception e) {
+            e.printStackTrace(System.err);
+        }
+    }
+
+    // Returns a JSON array of {"pkg": ..., "activity": ...} launcher entries.
+    private String listLauncherApps() throws Exception {
+        List<String> output = execForLines(new String[] {
+                "/system/bin/cmd", "package", "query-activities", "--components",
+                "-a", "android.intent.action.MAIN",
+                "-c", "android.intent.category.LAUNCHER"});
+        JSONArray apps = new JSONArray();
+        for (String rawLine : output) {
+            String candidate = rawLine.trim();
+            int slash = candidate.indexOf('/');
+            if (slash <= 0 || candidate.indexOf(' ') >= 0) {
+                continue;
+            }
+            String pkg = candidate.substring(0, slash);
+            String activity = candidate.substring(slash + 1);
+            if (activity.startsWith(".")) {
+                activity = pkg + activity;
+            }
+            JSONObject app = new JSONObject();
+            app.put("pkg", pkg);
+            app.put("activity", activity);
+            apps.put(app);
+        }
+        return apps.toString();
+    }
+
+    // Returns null on success, an error message otherwise.
+    private String launchComponent(String component, int displayId) throws Exception {
+        if (component.indexOf('/') <= 0 || component.indexOf(' ') >= 0) {
+            return "invalid component";
+        }
+        List<String> command = new ArrayList<>();
+        command.add("/system/bin/cmd");
+        command.add("activity");
+        command.add("start-activity");
+        if (displayId > 0) {
+            int androidDisplayId = resolveAndroidDisplayId(displayId);
+            if (androidDisplayId < 0) {
+                return "display " + displayId + " not found in guest";
+            }
+            command.add("--display");
+            command.add(Integer.toString(androidDisplayId));
+        }
+        command.add("-n");
+        command.add(component);
+        List<String> output = execForLines(command.toArray(new String[0]));
+        for (String outLine : output) {
+            if (outLine.contains("Error") || outLine.contains("Exception")) {
+                return outLine.trim();
+            }
+        }
+        return null;
+    }
+
+    private void startMultiDisplayService() {
+        try {
+            execForLines(new String[] {
+                    "/system/bin/cmd", "activity", "broadcast", "--user", "0",
+                    "-a", "com.android.emulator.multidisplay.START",
+                    "-n",
+                    "com.android.emulator.multidisplay/.MultiDisplayServiceReceiver"});
+        } catch (Exception e) {
+            e.printStackTrace(System.err);
+        }
+    }
+
+    private static List<String> execForLines(String[] command) throws Exception {
+        ProcessBuilder builder = new ProcessBuilder(command);
+        builder.redirectErrorStream(true);
+        Process process = builder.start();
+        List<String> lines = new ArrayList<>();
+        try (BufferedReader reader =
+                new BufferedReader(
+                        new InputStreamReader(
+                                process.getInputStream(), StandardCharsets.UTF_8))) {
+            String outLine;
+            while ((outLine = reader.readLine()) != null) {
+                lines.add(outLine);
+            }
+        }
+        process.waitFor();
+        return lines;
+    }
+
     private void handleLine(String line, BufferedWriter writer) throws Exception {
         if (line.isEmpty()) {
             return;
@@ -180,7 +412,7 @@ public final class MacMuAgent {
             return;
         }
         if (fields.length == 4 && "h".equals(fields[0])) {
-            int displayId = Integer.parseInt(fields[1]);
+            int displayId = resolveAndroidDisplayId(Integer.parseInt(fields[1]));
             float x = Float.parseFloat(fields[2]);
             float y = Float.parseFloat(fields[3]);
             injectHover(displayId, x, y);
@@ -191,7 +423,7 @@ public final class MacMuAgent {
             return;
         }
         if (fields.length == 6 && "s".equals(fields[0])) {
-            int displayId = Integer.parseInt(fields[1]);
+            int displayId = resolveAndroidDisplayId(Integer.parseInt(fields[1]));
             float x = Float.parseFloat(fields[2]);
             float y = Float.parseFloat(fields[3]);
             float hscroll = Integer.parseInt(fields[4]) / 1000.0f;
@@ -200,7 +432,7 @@ public final class MacMuAgent {
             return;
         }
         if (fields.length == 6 && "t".equals(fields[0])) {
-            int displayId = Integer.parseInt(fields[1]);
+            int displayId = resolveAndroidDisplayId(Integer.parseInt(fields[1]));
             int pointerId = Integer.parseInt(fields[2]);
             String phase = fields[3];
             float x = Float.parseFloat(fields[4]);
@@ -209,7 +441,7 @@ public final class MacMuAgent {
             return;
         }
         if (fields.length == 5 && "m".equals(fields[0])) {
-            int displayId = Integer.parseInt(fields[1]);
+            int displayId = resolveAndroidDisplayId(Integer.parseInt(fields[1]));
             float x = Float.parseFloat(fields[2]);
             float y = Float.parseFloat(fields[3]);
             int buttons = Integer.parseInt(fields[4]);
@@ -217,7 +449,7 @@ public final class MacMuAgent {
             return;
         }
         if (fields.length == 5 && "b".equals(fields[0])) {
-            int displayId = Integer.parseInt(fields[1]);
+            int displayId = resolveAndroidDisplayId(Integer.parseInt(fields[1]));
             float x = Float.parseFloat(fields[2]);
             float y = Float.parseFloat(fields[3]);
             int buttons = Integer.parseInt(fields[4]);
@@ -226,6 +458,9 @@ public final class MacMuAgent {
     }
 
     private synchronized void injectHover(int displayId, float x, float y) throws Exception {
+        if (displayId < 0) {
+            return;
+        }
         if (hoverActive && displayId != hoverDisplayId) {
             injectHoverExitLocked();
         }
@@ -254,7 +489,7 @@ public final class MacMuAgent {
 
     private synchronized void injectTouch(
             int displayId, int pointerId, String phase, float x, float y) throws Exception {
-        if (phase.isEmpty()) {
+        if (phase.isEmpty() || displayId < 0) {
             return;
         }
 

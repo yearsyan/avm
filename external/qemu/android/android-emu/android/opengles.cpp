@@ -933,6 +933,19 @@ void android_redrawOpenglesWindow(void) {
     getActiveOpenglesFuncs()->redrawOpenglesWindow();
 }
 
+void android_notifyDisplayColorBufferChanged(uint32_t displayId,
+                                             uint32_t colorBufferHandle) {
+    if (sRenderer) {
+        sRenderer->notifyDisplayColorBufferChanged(displayId, colorBufferHandle);
+    }
+}
+
+void android_exportDisplayFrame(uint32_t displayId) {
+    if (sRenderer) {
+        sRenderer->exportDisplayFrame(displayId);
+    }
+}
+
 static void setShouldSkipDrawImpl(bool skip) {
     if (sRenderer) {
         sRenderer->setShouldSkipDraw(skip);
