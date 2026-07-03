@@ -9,6 +9,9 @@ macOS arm64 headless Android Emulator / QEMU build.
 
 Graphics architecture: [docs/GRAPHICS_ARCHITECTURE.md](docs/GRAPHICS_ARCHITECTURE.md)
 
+AOSP image build and launch notes:
+[docs/AOSP_OFFICIAL_IMAGES.md](docs/AOSP_OFFICIAL_IMAGES.md)
+
 ## Build
 
 ```sh

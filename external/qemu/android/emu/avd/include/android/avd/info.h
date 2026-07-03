@@ -74,6 +74,7 @@ ANDROID_BEGIN_HEADER
     _AVD_IMG(ENCRYPTIONKEY,"encryptionkey.img","Encryption Key") \
     _AVD_IMG(SNAPSHOTS,"snapshots.img","snapshots") \
     _AVD_IMG(VERIFIEDBOOTPARAMS, "VerifiedBootParams.textproto","Verified Boot Parameters") \
+    _AVD_IMG(VENDORBOOT,"vendor_boot.img","vendor boot") \
 
 /* define the enumared values corresponding to each AVD image type
  * examples are: AVD_IMAGE_KERNEL, AVD_IMAGE_SYSTEM, etc..
@@ -221,6 +222,7 @@ char*  avdInfo_getKernelPath( const AvdInfo*  i );
 char*  avdInfo_getRanchuKernelPath( const AvdInfo*  i );
 char*  avdInfo_getKernelCmdLinePath( const AvdInfo*  i );
 char*  avdInfo_getRamdiskPath( const AvdInfo*  i );
+char*  avdInfo_getVendorBootPath( const AvdInfo*  i );
 char*  avdInfo_getSdCardPath( const AvdInfo* i );
 char*  avdInfo_getEncryptionKeyImagePath( const AvdInfo* i );
 char*  avdInfo_getSnapStoragePath( const AvdInfo* i );

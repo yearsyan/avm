@@ -141,15 +141,19 @@ extern "C" {
 #include <limits.h>
 #include <signal.h>
 #include <stdio.h>
+#include <stdint.h>
 #include <string.h>
 #ifndef _MSC_VER
 #include <unistd.h>
 #endif
 #include <algorithm>
+#include <limits>
+#include <memory>
 #include <regex>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <vector>
 
 #ifdef __APPLE__
 #include <sys/resource.h>
@@ -1409,6 +1413,154 @@ static int appendFileToStream(FILE* out, const char* srcPath) {
     }
 
     if (fclose(in) != 0 && result == 0) {
+        result = errno ? errno : EIO;
+    }
+    return result;
+}
+
+static uint32_t readLe32(const unsigned char* p) {
+    return static_cast<uint32_t>(p[0]) |
+           (static_cast<uint32_t>(p[1]) << 8) |
+           (static_cast<uint32_t>(p[2]) << 16) |
+           (static_cast<uint32_t>(p[3]) << 24);
+}
+
+static bool roundUpToMultiple(uint64_t value, uint64_t multiple, uint64_t* out) {
+    if (multiple == 0 || !out) {
+        return false;
+    }
+
+    const uint64_t remainder = value % multiple;
+    if (remainder == 0) {
+        *out = value;
+        return true;
+    }
+
+    const uint64_t delta = multiple - remainder;
+    if (value > std::numeric_limits<uint64_t>::max() - delta) {
+        return false;
+    }
+    *out = value + delta;
+    return true;
+}
+
+static int appendFileRangeToStream(FILE* out,
+                                   const char* srcPath,
+                                   uint64_t offset,
+                                   uint64_t bytes) {
+    if (!out || !srcPath) {
+        return EINVAL;
+    }
+    if (offset > static_cast<uint64_t>(LONG_MAX)) {
+        return EFBIG;
+    }
+
+    FILE* in = fopen(srcPath, "rb");
+    if (!in) {
+        return errno ? errno : ENOENT;
+    }
+
+    int result = 0;
+    if (fseek(in, static_cast<long>(offset), SEEK_SET) != 0) {
+        result = errno ? errno : EIO;
+    }
+
+    char buffer[64 * 1024];
+    uint64_t remaining = bytes;
+    while (result == 0 && remaining > 0) {
+        const size_t toRead = static_cast<size_t>(
+                std::min<uint64_t>(remaining, sizeof(buffer)));
+        const size_t readBytes = fread(buffer, 1, toRead, in);
+        if (readBytes == 0) {
+            result = ferror(in) ? (errno ? errno : EIO) : EIO;
+            break;
+        }
+        if (fwrite(buffer, 1, readBytes, out) != readBytes) {
+            result = errno ? errno : EIO;
+            break;
+        }
+        remaining -= readBytes;
+    }
+
+    if (fclose(in) != 0 && result == 0) {
+        result = errno ? errno : EIO;
+    }
+    return result;
+}
+
+static int extractVendorBootRamdisk(const char* vendorBootPath,
+                                    const char* outPath) {
+    if (!vendorBootPath || !outPath || !outPath[0]) {
+        return EINVAL;
+    }
+
+    static constexpr size_t kVendorBootMagicSize = 8;
+    static constexpr size_t kVendorBootV3HeaderSize = 2112;
+    static constexpr size_t kVendorBootV4HeaderSize = 2128;
+    static constexpr size_t kHeaderVersionOffset = 8;
+    static constexpr size_t kPageSizeOffset = 12;
+    static constexpr size_t kVendorRamdiskSizeOffset = 24;
+    static constexpr size_t kHeaderSizeOffset = 2096;
+
+    unsigned char header[kVendorBootV4HeaderSize] = {};
+    FILE* in = fopen(vendorBootPath, "rb");
+    if (!in) {
+        return errno ? errno : ENOENT;
+    }
+
+    int result = 0;
+    const size_t readBytes = fread(header, 1, sizeof(header), in);
+    if (readBytes < kVendorBootV3HeaderSize) {
+        result = ferror(in) ? (errno ? errno : EIO) : EINVAL;
+    }
+    if (fclose(in) != 0 && result == 0) {
+        result = errno ? errno : EIO;
+    }
+    if (result != 0) {
+        return result;
+    }
+
+    if (memcmp(header, "VNDRBOOT", kVendorBootMagicSize) != 0) {
+        return EINVAL;
+    }
+
+    const uint32_t headerVersion = readLe32(header + kHeaderVersionOffset);
+    const uint32_t pageSize = readLe32(header + kPageSizeOffset);
+    const uint32_t vendorRamdiskSize =
+            readLe32(header + kVendorRamdiskSizeOffset);
+    const uint32_t headerSize = readLe32(header + kHeaderSizeOffset);
+    const size_t minimumHeaderSize =
+            headerVersion >= 4 ? kVendorBootV4HeaderSize
+                               : kVendorBootV3HeaderSize;
+
+    if (headerVersion < 3 || readBytes < minimumHeaderSize ||
+        pageSize == 0 || vendorRamdiskSize == 0 ||
+        headerSize < minimumHeaderSize) {
+        return EINVAL;
+    }
+
+    uint64_t vendorRamdiskOffset = 0;
+    if (!roundUpToMultiple(headerSize, pageSize, &vendorRamdiskOffset)) {
+        return EINVAL;
+    }
+
+    uint64_t vendorBootSize = 0;
+    if (path_get_size(vendorBootPath, &vendorBootSize) < 0) {
+        return errno ? errno : EIO;
+    }
+    if (vendorRamdiskOffset > vendorBootSize ||
+        vendorRamdiskSize > vendorBootSize - vendorRamdiskOffset) {
+        return EINVAL;
+    }
+
+    FILE* out = fopen(outPath, "wb");
+    if (!out) {
+        return errno ? errno : EIO;
+    }
+
+    result = appendFileRangeToStream(out, vendorBootPath, vendorRamdiskOffset,
+                                     vendorRamdiskSize);
+    if (fclose(out) != 0 && result == 0) {
         result = errno ? errno : EIO;
     }
     return result;
@@ -2952,7 +3104,9 @@ extern "C" int main(int argc, char** argv) {
 
     std::string bootconfigInitrdPath;
     std::string macmuGuestInitrdPath;
-    const char* ramdiskWithMacMuOverlayPath = hw->disk_ramdisk_path;
+    std::string vendorBootRamdiskPath;
+    std::string vendorBootInitrdPath;
+    const char* selectedRamdiskPath = hw->disk_ramdisk_path;
 
     if (hw->disk_ramdisk_path) {
         args.add2("-kernel", hw->kernel_path);
@@ -2964,7 +3118,7 @@ extern "C" int main(int argc, char** argv) {
                               macmuGuestRamdiskPath);
                 return ENOENT;
             }
-            ramdiskWithMacMuOverlayPath = macmuGuestRamdiskPath;
+            selectedRamdiskPath = macmuGuestRamdiskPath;
             dinfo("MacMu guest ramdisk selected: %s", macmuGuestRamdiskPath);
         } else if (const char* macmuGuestOverlayPath =
                            getNonEmptyEnv("MACMU_GUEST_RAMDISK_OVERLAY")) {
@@ -2981,9 +3135,42 @@ extern "C" int main(int argc, char** argv) {
                               macmuGuestInitrdPath.c_str());
                 return result;
             }
-            ramdiskWithMacMuOverlayPath = macmuGuestInitrdPath.c_str();
+            selectedRamdiskPath = macmuGuestInitrdPath.c_str();
             dinfo("MacMu guest initrd overlay appended: %s",
                   macmuGuestOverlayPath);
+        }
+
+        std::unique_ptr<char, void (*)(void*)> vendorBootPath(
+                avdInfo_getVendorBootPath(avd), free);
+        if (vendorBootPath && path_exists(vendorBootPath.get())) {
+            vendorBootRamdiskPath = getWriteableFilename(
+                    hw->disk_dataPartition_path, "vendor-ramdisk");
+            int result = extractVendorBootRamdisk(
+                    vendorBootPath.get(), vendorBootRamdiskPath.c_str());
+            if (result) {
+                android_panic("Could not extract vendor_boot ramdisk, "
+                              "error=%d src=%s dst=%s",
+                              result, vendorBootPath.get(),
+                              vendorBootRamdiskPath.c_str());
+                return result;
+            }
+
+            vendorBootInitrdPath = getWriteableFilename(
+                    hw->disk_dataPartition_path, "vendor-initrd");
+            result = createMacMuGuestRamdisk(
+                    selectedRamdiskPath, vendorBootRamdiskPath.c_str(),
+                    vendorBootInitrdPath.c_str());
+            if (result) {
+                android_panic("Could not append vendor_boot ramdisk, "
+                              "error=%d base=%s overlay=%s dst=%s",
+                              result, selectedRamdiskPath,
+                              vendorBootRamdiskPath.c_str(),
+                              vendorBootInitrdPath.c_str());
+                return result;
+            }
+
+            selectedRamdiskPath = vendorBootInitrdPath.c_str();
+            dinfo("vendor_boot ramdisk appended: %s", vendorBootPath.get());
         }
 
         if (fc::isEnabled(fc::AndroidbootProps) ||
@@ -2992,7 +3179,7 @@ extern "C" int main(int argc, char** argv) {
                     hw->disk_dataPartition_path, "initrd");
             args.add2("-initrd", bootconfigInitrdPath.c_str());
         } else {
-            args.add2("-initrd", ramdiskWithMacMuOverlayPath);
+            args.add2("-initrd", selectedRamdiskPath);
         }
     } else {
         android_panic("disk_ramdisk_path is required but missing");
@@ -3661,12 +3848,12 @@ extern "C" int main(int argc, char** argv) {
             }
 
             const int r = createRamdiskWithBootconfig(
-                    ramdiskWithMacMuOverlayPath, bootconfigInitrdPath.c_str(),
+                    selectedRamdiskPath, bootconfigInitrdPath.c_str(),
                     userspaceBootOpts);
             if (r) {
                 android_panic("%s:%d Could not prepare the ramdisk with bootconfig, "
                        "error=%d src=%s dst=%s",
-                       __func__, __LINE__, r, ramdiskWithMacMuOverlayPath,
+                       __func__, __LINE__, r, selectedRamdiskPath,
                        bootconfigInitrdPath.c_str());
 
                 return r;

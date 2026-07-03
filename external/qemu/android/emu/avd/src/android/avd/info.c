@@ -1283,6 +1283,11 @@ char* avdInfo_getRamdiskPath(const AvdInfo* i) {
     return _avdInfo_getContentOrSdkFilePath(i, imageName);
 }
 
+char* avdInfo_getVendorBootPath(const AvdInfo* i) {
+    const char* imageName = _imageFileNames[AVD_IMAGE_VENDORBOOT];
+    return _avdInfo_getContentOrSdkFilePath(i, imageName);
+}
+
 char* avdInfo_getCachePath(const AvdInfo* i) {
     const char* imageName = _imageFileNames[AVD_IMAGE_CACHE];
     return _avdInfo_getContentFilePath(i, imageName);
