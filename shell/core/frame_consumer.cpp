@@ -7,6 +7,7 @@
 #include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -23,6 +24,10 @@ constexpr uint64_t kShmMagic = 0x4d41434d5546524dull;  // 'MACMUFRM'
 constexpr uint32_t kShmVersion = 1;
 constexpr int kDoorbellSocketBufferBytes = 1 << 20;
 
+// Shell-side copy of the cross-process wire layout. Keep this byte-for-byte in
+// sync with the producer copy in
+// hardware/google/gfxstream/host/common/iosurface_export.cpp. Update both files
+// together and bump kShmVersion for incompatible layout changes.
 struct ShmHeader {
     uint64_t magic;
     uint32_t version;
@@ -37,6 +42,18 @@ struct ShmPayload {
     uint64_t frame;
     uint64_t timestampNs;
 };
+
+static_assert(sizeof(ShmHeader) == 16, "Frame shm header layout changed");
+static_assert(offsetof(ShmHeader, magic) == 0, "Frame shm header layout changed");
+static_assert(offsetof(ShmHeader, version) == 8, "Frame shm header layout changed");
+static_assert(offsetof(ShmHeader, payloadOffset) == 12, "Frame shm header layout changed");
+static_assert(sizeof(ShmPayload) == 32, "Frame shm payload layout changed");
+static_assert(offsetof(ShmPayload, iosurfaceId) == 0, "Frame shm payload layout changed");
+static_assert(offsetof(ShmPayload, width) == 4, "Frame shm payload layout changed");
+static_assert(offsetof(ShmPayload, height) == 8, "Frame shm payload layout changed");
+static_assert(offsetof(ShmPayload, reserved) == 12, "Frame shm payload layout changed");
+static_assert(offsetof(ShmPayload, frame) == 16, "Frame shm payload layout changed");
+static_assert(offsetof(ShmPayload, timestampNs) == 24, "Frame shm payload layout changed");
 
 std::string frame_channel_name(uint32_t wrapper_pid) {
     char buf[64];

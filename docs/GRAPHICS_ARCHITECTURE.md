@@ -31,13 +31,16 @@ The shell sets:
 
 ```text
 MACMU_IOSURFACE_EXPORT=1
-MACMU_IOSURFACE_EXPORT_PATH=/tmp/macmu-iosurface.json
+ANDROID_EMULATOR_WRAPPER_PID=<macmu pid>
+MACMU_FRAME_DOORBELL_FD=<inherited child fd>
 ANDROID_EMULATOR_LAUNCHER_DIR=<app>/Contents/Resources/emulator
 DYLD_LIBRARY_PATH=<emulator>/lib64:<emulator>/lib64/gles_angle:<emulator>/lib64/vulkan
 ```
 
 For transition compatibility with older local gfxstream builds, the shell also
-sets the old `AEMU_IOSURFACE_EXPORT` and `AEMU_IOSURFACE_EXPORT_PATH` variables.
+sets the old `AEMU_IOSURFACE_EXPORT` and `AEMU_FRAME_DOORBELL_FD` variables.
+It no longer sets `MACMU_IOSURFACE_EXPORT_PATH` or
+`AEMU_IOSURFACE_EXPORT_PATH`.
 
 ## Frame Export Path
 
@@ -62,34 +65,55 @@ transforms are intentionally ignored in this first implementation.
 
 ## qemu to Shell Communication
 
-There is no socket, gRPC, shared command channel, or frame byte stream between
-qemu and the shell.
+Pixel data is not sent through a socket, file, gRPC stream, or shared command
+channel. The IOSurface itself carries the GPU pixels across the process
+boundary. The only frame control plane between qemu and the shell is a small
+POSIX shared-memory metadata payload plus an inherited Unix datagram socket
+doorbell.
 
 The communication contract is:
 
-1. qemu/gfxstream creates or reuses a global IOSurface.
-2. qemu/gfxstream publishes a posted ColorBuffer's IOSurface when available;
+1. `macmu` creates a POSIX shm object named `/macmu.frame.<wrapper-pid>`, where
+   `<wrapper-pid>` is the shell pid exported to qemu as
+   `ANDROID_EMULATOR_WRAPPER_PID`.
+2. `macmu` creates an `AF_UNIX` `SOCK_DGRAM` socketpair and passes the producer
+   endpoint to qemu by fd inheritance. The inherited child fd is advertised
+   through `MACMU_FRAME_DOORBELL_FD` and, for transition compatibility,
+   `AEMU_FRAME_DOORBELL_FD`.
+3. qemu/gfxstream opens the existing shm object, validates its magic/version,
+   and uses the inherited doorbell fd.
+4. qemu/gfxstream creates or reuses a global IOSurface.
+5. qemu/gfxstream publishes a posted ColorBuffer's IOSurface when available;
    otherwise it GPU-blits the final ColorBuffer into an export IOSurface.
-3. qemu/gfxstream writes a small JSON metadata file atomically.
-4. `macmu` polls the metadata file.
-5. `macmu` calls `IOSurfaceLookup(iosurface_id)`.
-6. `macmu` imports the IOSurface as a Metal texture and draws it.
+6. qemu/gfxstream writes the latest metadata into shm, publishes the frame
+   number last with release ordering, then rings the doorbell best-effort.
+7. `macmu` waits on the doorbell, drains coalesced notifications, reads the
+   shm payload with a seqlock-style frame-counter check, and calls
+   `IOSurfaceLookup(iosurface_id)`.
+8. `macmu` imports the IOSurface as a Metal texture and draws it.
 
-The metadata file looks like:
+The shm wire layout is:
 
-```json
-{
-  "iosurface_id": 69,
-  "width": 1080,
-  "height": 2400,
-  "pixel_format": "BGRA8Unorm",
-  "frame": 70,
-  "timestamp_ns": 929738659083416
-}
+```c
+struct ShmHeader {
+    uint64_t magic;          // 'MACMUFRM'
+    uint32_t version;        // 1
+    uint32_t payloadOffset;  // sizeof(ShmHeader)
+};
+
+struct ShmPayload {
+    uint32_t iosurfaceId;
+    uint32_t width;
+    uint32_t height;
+    uint32_t reserved;
+    uint64_t frame;
+    uint64_t timestampNs;
+};
 ```
 
-The JSON file is only a handle exchange and frame counter. Pixel data is not
-serialized through the file.
+The struct is duplicated in `hardware/google/gfxstream/host/common/iosurface_export.cpp`
+and `shell/core/frame_consumer.cpp` so the MIT shell remains self-contained.
+Any incompatible layout change must update both copies and bump the shm version.
 
 ## Copy and Synchronization Model
 
@@ -169,10 +193,12 @@ The app bundle keeps qemu and its runtime libraries under
 ## Current Limitations
 
 - Single display export path.
+- Single shm payload and doorbell; the protocol is not yet display-indexed for
+  multi-display export.
 - Only the first posted layer is exported.
 - Rotation and color transforms are ignored.
-- Frame delivery is metadata polling, not event-driven.
 - Non-RGBA/BGRA, non-exportable, or non-mirrorable ColorBuffers still use an
   extra GPU blit from ColorBuffer to IOSurface.
-- The `AEMU_*` exporter variables are still emitted for compatibility with
-  older local builds; they can be removed after all builds consume `MACMU_*`.
+- The `AEMU_*` exporter and frame-doorbell variables are still emitted for
+  compatibility with older local builds; they can be removed after all builds
+  consume `MACMU_*`.
