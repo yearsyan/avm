@@ -74,6 +74,20 @@ constexpr uint32_t kNewDisplayWidth = 1280;
 constexpr uint32_t kNewDisplayHeight = 720;
 constexpr uint32_t kNewDisplayDpi = 240;
 
+// DisplayManager virtual-display flags, copied here so MacMu can request
+// scrcpy-like secondary displays without depending on Android framework
+// headers. Deliberately excludes SHOULD_SHOW_SYSTEM_DECORATIONS.
+constexpr uint32_t kVirtualDisplayFlagPublic = 1u << 0;
+constexpr uint32_t kVirtualDisplayFlagPresentation = 1u << 1;
+constexpr uint32_t kVirtualDisplayFlagOwnContentOnly = 1u << 3;
+constexpr uint32_t kVirtualDisplayFlagSupportsTouch = 1u << 6;
+constexpr uint32_t kVirtualDisplayFlagRotatesWithContent = 1u << 7;
+constexpr uint32_t kVirtualDisplayFlagTrusted = 1u << 10;
+constexpr uint32_t kNewDisplayFlags =
+    kVirtualDisplayFlagPublic | kVirtualDisplayFlagPresentation |
+    kVirtualDisplayFlagOwnContentOnly | kVirtualDisplayFlagSupportsTouch |
+    kVirtualDisplayFlagRotatesWithContent | kVirtualDisplayFlagTrusted;
+
 struct DisplayWindow {
     NSWindow* __strong window = nil;
     MTKView* __strong view = nil;
@@ -110,6 +124,10 @@ struct DisplayWindow {
     // Display ids being closed because the guest/event said so; suppresses the
     // windowWillClose -> DISPLAY_REMOVE echo.
     std::map<uint32_t, bool> _suppressRemoveOnClose;
+    // Secondary displays created by "Launch in New Display" are bound to the
+    // launched app. Closing the host window stops that app before removing the
+    // guest display so Android does not reparent the task to display 0.
+    std::map<uint32_t, std::string> _displayAppBindings;
 
     NSWindow* _appsWindow;
     NSTableView* _appsTable;
@@ -233,7 +251,9 @@ struct DisplayWindow {
         if (displayId != 0) {
             [self setDisplayStreaming:displayId enabled:NO];
             if (!suppressed) {
-                [self requestDisplayRemove:displayId];
+                [self closeBoundAppAndRemoveDisplay:displayId];
+            } else {
+                _displayAppBindings.erase(displayId);
             }
         }
         break;
@@ -628,6 +648,7 @@ struct DisplayWindow {
     macmu::ControlEventDisplay event;
     std::memcpy(&event, payload.data(), sizeof(event));
     if (event.state == macmu::kControlDisplayRemoved && event.displayId != 0) {
+        _displayAppBindings.erase(event.displayId);
         auto it = _displayWindows.find(event.displayId);
         if (it != _displayWindows.end()) {
             _suppressRemoveOnClose[event.displayId] = true;
@@ -651,6 +672,38 @@ struct DisplayWindow {
                      });
 }
 
+- (void)closeBoundAppAndRemoveDisplay:(uint32_t)displayId {
+    auto binding = _displayAppBindings.find(displayId);
+    if (binding == _displayAppBindings.end()) {
+        [self requestDisplayRemove:displayId];
+        return;
+    }
+
+    const std::string component = binding->second;
+    _displayAppBindings.erase(binding);
+    if (!_guestControlClient || !_guestControlClient->ready()) {
+        NSLog(@"MacMu display %u app close skipped; guest control is not connected.",
+              displayId);
+        [self requestDisplayRemove:displayId];
+        return;
+    }
+
+    std::string command = "close ";
+    command += component;
+    command += " " + std::to_string(displayId);
+    MacMuAppDelegate* delegate = self;
+    _guestControlClient->request(command, 5000,
+                                 [delegate, displayId](bool ok, std::string payload) {
+                                     if (!ok) {
+                                         NSLog(@"MacMu display %u bound app close failed: %s",
+                                               displayId, payload.c_str());
+                                     }
+                                     dispatch_async(dispatch_get_main_queue(), ^{
+                                         [delegate requestDisplayRemove:displayId];
+                                     });
+                                 });
+}
+
 - (void)newDisplay:(id)sender {
     auto channel = [self controlChannel];
     if (!channel || !channel->alive()) {
@@ -663,7 +716,7 @@ struct DisplayWindow {
     request.width = kNewDisplayWidth;
     request.height = kNewDisplayHeight;
     request.dpi = kNewDisplayDpi;
-    request.flags = 0;
+    request.flags = kNewDisplayFlags;
     MacMuAppDelegate* delegate = self;
     channel->request(
         macmu::ControlMessageType::kDisplayAdd, &request, sizeof(request), 10000,
@@ -786,7 +839,7 @@ struct DisplayWindow {
     request.width = kNewDisplayWidth;
     request.height = kNewDisplayHeight;
     request.dpi = kNewDisplayDpi;
-    request.flags = 0;
+    request.flags = kNewDisplayFlags;
     MacMuAppDelegate* delegate = self;
     channel->request(
         macmu::ControlMessageType::kDisplayAdd, &request, sizeof(request), 10000,
@@ -801,6 +854,7 @@ struct DisplayWindow {
                 macmu::ControlDisplayAddOk ok;
                 std::memcpy(&ok, response.payload.data(), sizeof(ok));
                 [delegate openDisplayWindowForDisplay:ok.displayId];
+                delegate->_displayAppBindings[ok.displayId] = [component UTF8String];
                 // Give the guest a moment to bring the new display up before
                 // targeting it; am start on a not-yet-ready display falls back
                 // to display 0.

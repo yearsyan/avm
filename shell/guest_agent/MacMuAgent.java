@@ -188,8 +188,9 @@ public final class MacMuAgent {
 
     // ------------------------------------------------------------------
     // Control RPC connection: request/response line protocol used by the host
-    // shell for app management ("<id> apps", "<id> launch <component> <display>").
-    // Kept on a separate host socket so bulky responses never block input.
+    // shell for app management ("<id> apps", "<id> launch <component> <display>",
+    // "<id> close <component> <display>"). Kept on a separate host socket so
+    // bulky responses never block input.
     // ------------------------------------------------------------------
 
     private void runControl(String ctrlSocketPath) {
@@ -254,6 +255,18 @@ public final class MacMuAgent {
                 String component = fields[1];
                 int displayId = Integer.parseInt(fields[2]);
                 String error = launchComponent(component, displayId);
+                if (error == null) {
+                    writer.write(id + " ok\n");
+                } else {
+                    writer.write(id + " err " + error.replace('\n', ' ') + "\n");
+                }
+                writer.flush();
+                return;
+            }
+            if (fields.length == 3 && "close".equals(fields[0])) {
+                String component = fields[1];
+                int displayId = Integer.parseInt(fields[2]);
+                String error = closeComponent(component, displayId);
                 if (error == null) {
                     writer.write(id + " ok\n");
                 } else {
@@ -365,6 +378,53 @@ public final class MacMuAgent {
         List<String> output = execForLines(command.toArray(new String[0]));
         for (String outLine : output) {
             if (outLine.contains("Error") || outLine.contains("Exception")) {
+                return outLine.trim();
+            }
+        }
+        return null;
+    }
+
+    // Returns null on success, an error message otherwise.
+    private String closeComponent(String component, int displayId) throws Exception {
+        String pkg = packageNameFromComponent(component);
+        if (pkg == null) {
+            return "invalid component";
+        }
+        // Resolve while the display still exists; this also refreshes the cache
+        // before qemu removes the VirtualDisplay. A missing display should not
+        // prevent stopping the bound package.
+        if (displayId > 0) {
+            resolveAndroidDisplayId(displayId);
+        }
+
+        String error = stopPackage(pkg, false);
+        if (error != null && error.toLowerCase().contains("unknown command")) {
+            error = stopPackage(pkg, true);
+        }
+        return error;
+    }
+
+    private static String packageNameFromComponent(String component) {
+        int slash = component.indexOf('/');
+        if (slash <= 0 || component.indexOf(' ') >= 0) {
+            return null;
+        }
+        String pkg = component.substring(0, slash);
+        return pkg.isEmpty() ? null : pkg;
+    }
+
+    private String stopPackage(String pkg, boolean force) throws Exception {
+        List<String> output = execForLines(new String[] {
+                "/system/bin/cmd", "activity", force ? "force-stop" : "stop-app",
+                "--user", "current", pkg});
+        return firstCommandError(output);
+    }
+
+    private static String firstCommandError(List<String> output) {
+        for (String outLine : output) {
+            String lower = outLine.toLowerCase();
+            if (lower.contains("error") || lower.contains("exception")
+                    || lower.contains("unknown command")) {
                 return outLine.trim();
             }
         }
