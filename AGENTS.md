@@ -1,5 +1,16 @@
 # AGENTS.md
 
+## Instruction Files
+
+`AGENTS.md` is the source of truth for repository instructions. `CLAUDE.md` is
+only a thin pointer for Claude-style tooling.
+
+When opening or relying on `CLAUDE.md`, immediately read this `AGENTS.md` file
+too. If a requested change appears to belong in `CLAUDE.md`, make the
+substantive update here in `AGENTS.md` instead, then check this file for
+adjacent stale guidance that should be updated at the same time. Keep
+`CLAUDE.md` as a short redirect unless the redirect policy itself changes.
+
 ## Project Purpose
 
 MacMu is a macOS arm64 focused cut of Android Emulator / QEMU.
@@ -41,32 +52,43 @@ build/cmake/distribution/emulator/qemu/darwin-aarch64/qemu-system-aarch64-headle
 
 ## Image Type
 
-Use a normal non-ATD AOSP arm64 system image for graphical validation:
+Use a normal non-ATD Android 16 AOSP arm64 emulator image for graphical
+validation. The source-built image flow is documented in
+`docs/AOSP_OFFICIAL_IMAGES.md`; do not treat SDK ATD images as graphics proof.
 
-```text
-system-images;android-35;default;arm64-v8a
-```
-
-The local validation AVD created for this image is:
-
-```text
-aemu_aosp35_arm64
-```
-
-This image reports as:
+The current validated target is:
 
 ```text
 product=sdk_phone64_arm64
-model=Android_SDK_built_for_arm64
+device=emu64a
+variant=user
+target=android-36
 ```
 
-It has a real Launcher:
+The MacMu-managed default AVD is:
 
 ```text
-com.android.launcher3/.uioverrides.QuickstepLauncher
+macmu_aosp16_arm64
 ```
 
-Do not use the ATD image for graphics/scrcpy validation:
+The MacMu-managed default system image directory is:
+
+```text
+~/Library/MacMu/images/aosp16-arm64
+```
+
+The system image directory must contain the normal emulator image files used by
+MacMu, including:
+
+```text
+kernel-ranchu
+ramdisk.img
+vendor_boot.img
+system.img
+vendor.img
+```
+
+Do not use ATD images for graphics/scrcpy validation. One known-bad example is:
 
 ```text
 system-images;android-35;aosp_atd;arm64-v8a
@@ -90,17 +112,20 @@ Recommended launch shape:
 ANDROID_EMULATOR_LAUNCHER_DIR=build/cmake/distribution/emulator \
 DYLD_LIBRARY_PATH=build/cmake/distribution/emulator/lib64:build/cmake/distribution/emulator/lib64/gles_angle:build/cmake/distribution/emulator/lib64/vulkan \
 build/cmake/distribution/emulator/qemu/darwin-aarch64/qemu-system-aarch64-headless \
-  -avd aemu_aosp35_arm64 \
-  -sysdir <path-to>/system-images/android-35/default/arm64-v8a \
+  -avd macmu_aosp16_arm64 \
+  -sysdir "$HOME/Library/MacMu/images/aosp16-arm64" \
   -no-window -no-audio -no-snapshot -no-boot-anim \
   -gpu host
 ```
 
 No `ANDROID_SDK_ROOT` / `ANDROID_HOME` is required: qemu resolves the AVD's
 image search path from `-sysdir` directly, and the AVD itself is located via
-`ANDROID_AVD_HOME` / `$HOME/.android/avd` (independent of the SDK root). The
-shell passes the same `-sysdir` through when launched with `--system-path
-<dir>` (or the `MACMU_SYSTEM_PATH` / `AEMU_SHELL_SYSTEM_PATH` env var).
+`ANDROID_AVD_HOME` or MacMu's managed AVD home under `~/Library/MacMu/avd`
+(independent of the SDK root). The shell passes the same `-sysdir` through when
+launched with `--system-path <dir>` (or the `MACMU_SYSTEM_PATH` /
+`AEMU_SHELL_SYSTEM_PATH` env var). Product-style shell runs default to
+`~/Library/MacMu/images/aosp16-arm64` and can import an AOSP16 image archive
+into that directory.
 
 If a previous emulator session was killed while it was writing a snapshot, the
 next cold boot can segfault inside `drive_init` / `blk_bs` (the qcow2-on-qcow2
@@ -110,12 +135,12 @@ on the same AVD. Recover by wiping the AVD's userdata/snapshot state:
 
 ```sh
 # add -wipe-data to the launch flags once to reset the AVD, then boot normally
-... qemu-system-aarch64-headless -avd aemu_aosp35_arm64 -no-window \
+... qemu-system-aarch64-headless -avd macmu_aosp16_arm64 -no-window \
     -no-audio -no-snapshot -no-boot-anim -wipe-data -gpu host
 ```
 
 Alternatively remove the AVD lock files:
-`rm -f ~/.android/avd/aemu_aosp35_arm64.avd/*.lock`
+`rm -f ~/Library/MacMu/avd/macmu_aosp16_arm64.avd/*.lock`
 
 GPU acceleration is expected to show host Apple GPU paths, for example:
 
@@ -175,8 +200,9 @@ scripts/package_macos_app.sh \
 The toolchain expects a populated `build/cmake/toolchain/` (compilers)
 and `prebuilts/` (binary deps), restored via `android/scripts/unix/build-qemu-android.sh`.
 
-Verified boot evidence on this pruned tree (aemu_aosp35_arm64, `-wipe-data`
-recovery boot): `Boot completed in 10571 ms`, `GLES: Google (Apple), Android
-Emulator OpenGL ES Translator (Apple M4), OpenGL ES 3.0 (4.1 Metal - 90.5)`,
-`Selecting Vulkan device: Apple M4`, guest `[ro.hardware.vulkan]: [ranchu]`,
-SurfaceFlinger rendering 110 active layers (launcher/status bar/settings).
+For Android 16 validation, use the checklist in `docs/AOSP_OFFICIAL_IMAGES.md`.
+Expected evidence includes `sys.boot_completed=1`, `ro.build.type=user`,
+`ro.debuggable=0`, `ro.secure=1`, virtio block/GPU modules loaded, and
+SurfaceFlinger reporting host Apple GPU OpenGL/Vulkan paths. Older android-35
+default-image boot evidence remains useful only as a historical graphics
+baseline for this pruned tree.
