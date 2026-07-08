@@ -343,6 +343,10 @@ MacMuSurfaceRendererRef macmu_surface_renderer_create(MTKView* view,
                                             displayId:display_id];
 }
 
+NSSize macmu_fitted_window_content_size(uint32_t pixel_width, uint32_t pixel_height) {
+    return fitted_window_content_size(pixel_width, pixel_height);
+}
+
 bool macmu_surface_renderer_map_view_point(MacMuSurfaceRendererRef renderer,
                                            MTKView* view,
                                            double point_x,

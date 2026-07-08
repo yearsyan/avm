@@ -13,6 +13,7 @@ find_library(IOSURFACE_FRAMEWORK IOSurface REQUIRED)
 find_library(METAL_FRAMEWORK Metal REQUIRED)
 find_library(METALKIT_FRAMEWORK MetalKit REQUIRED)
 find_library(QUARTZCORE_FRAMEWORK QuartzCore REQUIRED)
+find_library(UNIFORMTYPEIDENTIFIERS_FRAMEWORK UniformTypeIdentifiers REQUIRED)
 
 add_executable(macmu_shell
     protocol/viewport.cpp
@@ -49,6 +50,7 @@ target_link_libraries(macmu_shell PRIVATE
     "${METAL_FRAMEWORK}"
     "${METALKIT_FRAMEWORK}"
     "${QUARTZCORE_FRAMEWORK}"
+    "${UNIFORMTYPEIDENTIFIERS_FRAMEWORK}"
 )
 
 set(MACMU_ANDROID_SDK_ROOT "$ENV{ANDROID_SDK_ROOT}" CACHE PATH "Android SDK root for MacMu guest helpers")

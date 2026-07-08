@@ -40,6 +40,14 @@ bool file_exists(const std::string& path) {
     return fs::is_regular_file(path, ec);
 }
 
+bool system_image_exists_at(const std::string& path) {
+    return file_exists(path_join(path, "kernel-ranchu")) &&
+           file_exists(path_join(path, "ramdisk.img")) &&
+           file_exists(path_join(path, "system.img")) &&
+           file_exists(path_join(path, "vendor.img")) &&
+           file_exists(path_join(path, "vendor_boot.img"));
+}
+
 bool write_text_file(const std::string& path, const std::string& text, std::string* error) {
     std::ofstream out(path, std::ios::out | std::ios::trunc);
     if (!out) {
@@ -58,7 +66,36 @@ bool write_text_file(const std::string& path, const std::string& text, std::stri
     return true;
 }
 
+bool ensure_sized_file(const std::string& path, uintmax_t size, std::string* error) {
+    std::error_code ec;
+    if (fs::is_regular_file(path, ec) && fs::file_size(path, ec) == size) {
+        return true;
+    }
+    if (!fs::exists(path, ec)) {
+        std::ofstream out(path, std::ios::out | std::ios::binary);
+        if (!out) {
+            if (error) {
+                *error = "failed to create disk image: " + path;
+            }
+            return false;
+        }
+    }
+    fs::resize_file(path, size, ec);
+    if (!ec && fs::is_regular_file(path, ec) && fs::file_size(path, ec) == size) {
+        return true;
+    }
+    if (error) {
+        *error = "failed to create disk image: " + path + " (" + ec.message() + ")";
+    }
+    return false;
+}
+
 std::string config_ini_for(const ShellOptions& options) {
+    std::string sysdir = options.systemPath;
+    if (!sysdir.empty() && sysdir.back() != '/') {
+        sysdir += "/";
+    }
+
     std::ostringstream out;
     out
         << "PlayStore.enabled=no\n"
@@ -118,7 +155,7 @@ std::string config_ini_for(const ShellOptions& options) {
         << "hw.sensors.proximity=yes\n"
         << "hw.trackBall=no\n"
         << "hw.useext4=yes\n"
-        << "image.sysdir.1=images/android-35-arm64/\n"
+        << "image.sysdir.1=" << sysdir << "\n"
         << "kernel.newDeviceNaming=autodetect\n"
         << "kernel.supportsYaffs2=autodetect\n"
         << "runtime.network.latency=none\n"
@@ -129,7 +166,7 @@ std::string config_ini_for(const ShellOptions& options) {
         << "tag.displaynames=Default Android System Image\n"
         << "tag.id=default\n"
         << "tag.ids=default\n"
-        << "target=android-35\n"
+        << "target=android-36\n"
         << "test.delayAdbTillBootComplete=0\n"
         << "test.monitorAdb=0\n"
         << "test.quitAfterBootTimeOut=-1\n"
@@ -155,15 +192,13 @@ bool macmu_ensure_runtime_directories(const ShellOptions& options, std::string* 
 }
 
 bool macmu_system_image_exists(const ShellOptions& options) {
-    return file_exists(path_join(options.systemPath, "kernel-ranchu")) &&
-           file_exists(path_join(options.systemPath, "ramdisk.img")) &&
-           file_exists(path_join(options.systemPath, "system.img")) &&
-           file_exists(path_join(options.systemPath, "vendor.img"));
+    return system_image_exists_at(options.systemPath);
 }
 
 bool macmu_machine_exists(const ShellOptions& options) {
     return file_exists(macmu_machine_ini_path(options)) &&
-           file_exists(path_join(macmu_machine_path(options), "config.ini"));
+           file_exists(path_join(macmu_machine_path(options), "config.ini")) &&
+           file_exists(path_join(macmu_machine_path(options), "encryptionkey.img"));
 }
 
 bool macmu_create_default_machine(const ShellOptions& options, std::string* error) {
@@ -186,9 +221,134 @@ bool macmu_create_default_machine(const ShellOptions& options, std::string* erro
         "avd.ini.encoding=UTF-8\n"
         "path=" + machinePath + "\n"
         "path.rel=avd/" + options.avdName + ".avd\n"
-        "target=android-35\n";
+        "target=android-36\n";
     if (!write_text_file(macmu_machine_ini_path(options), rootIni, error)) {
         return false;
     }
-    return write_text_file(path_join(machinePath, "config.ini"), config_ini_for(options), error);
+    if (!write_text_file(path_join(machinePath, "config.ini"), config_ini_for(options), error)) {
+        return false;
+    }
+    if (!ensure_sized_file(path_join(machinePath, "encryptionkey.img"), 64ull * 1024ull * 1024ull,
+                           error)) {
+        return false;
+    }
+    return ensure_sized_file(path_join(machinePath, "cache.img"), 66ull * 1024ull * 1024ull,
+                             error);
+}
+
+bool macmu_find_system_image_directory(const std::string& root,
+                                       std::string* system_image_dir,
+                                       std::string* error) {
+    if (system_image_exists_at(root)) {
+        if (system_image_dir) {
+            *system_image_dir = root;
+        }
+        return true;
+    }
+
+    std::error_code ec;
+    if (!fs::is_directory(root, ec)) {
+        if (error) {
+            *error = "not a directory: " + root;
+        }
+        return false;
+    }
+
+    for (fs::recursive_directory_iterator it(root, fs::directory_options::skip_permission_denied,
+                                             ec);
+         !ec && it != fs::recursive_directory_iterator(); it.increment(ec)) {
+        if (!it->is_directory(ec)) {
+            continue;
+        }
+        const std::string candidate = it->path().string();
+        if (system_image_exists_at(candidate)) {
+            if (system_image_dir) {
+                *system_image_dir = candidate;
+            }
+            return true;
+        }
+    }
+
+    if (error) {
+        *error = "archive does not contain a MacMu AOSP16 arm64 system image";
+    }
+    return false;
+}
+
+bool macmu_replace_system_image_from_directory(const ShellOptions& options,
+                                               const std::string& source_dir,
+                                               std::string* error) {
+    if (!system_image_exists_at(source_dir)) {
+        if (error) {
+            *error = "missing required image files in: " + source_dir;
+        }
+        return false;
+    }
+    if (!macmu_ensure_runtime_directories(options, error)) {
+        return false;
+    }
+
+    const fs::path destination(options.systemPath);
+    const fs::path parent = destination.parent_path();
+    const fs::path importing(destination.string() + ".importing");
+    const fs::path previous(destination.string() + ".previous");
+
+    std::error_code ec;
+    fs::remove_all(importing, ec);
+    fs::remove_all(previous, ec);
+
+    fs::create_directories(parent, ec);
+    if (ec) {
+        if (error) {
+            *error = "failed to create image parent directory: " + parent.string() + " (" +
+                     ec.message() + ")";
+        }
+        return false;
+    }
+
+    fs::copy(source_dir, importing,
+             fs::copy_options::recursive | fs::copy_options::overwrite_existing |
+                 fs::copy_options::copy_symlinks,
+             ec);
+    if (ec) {
+        fs::remove_all(importing, ec);
+        if (error) {
+            *error = "failed to copy system image: " + ec.message();
+        }
+        return false;
+    }
+    if (!system_image_exists_at(importing.string())) {
+        fs::remove_all(importing, ec);
+        if (error) {
+            *error = "copied image did not pass validation";
+        }
+        return false;
+    }
+
+    if (fs::exists(destination, ec)) {
+        fs::rename(destination, previous, ec);
+        if (ec) {
+            fs::remove_all(importing, ec);
+            if (error) {
+                *error = "failed to replace existing system image: " + ec.message();
+            }
+            return false;
+        }
+    }
+
+    fs::rename(importing, destination, ec);
+    if (ec) {
+        std::error_code restore_ec;
+        if (fs::exists(previous, restore_ec)) {
+            fs::rename(previous, destination, restore_ec);
+        }
+        fs::remove_all(importing, restore_ec);
+        if (error) {
+            *error = "failed to activate imported system image: " + ec.message();
+        }
+        return false;
+    }
+
+    fs::remove_all(previous, ec);
+    return true;
 }

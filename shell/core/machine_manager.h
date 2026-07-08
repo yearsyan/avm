@@ -13,5 +13,11 @@ bool macmu_ensure_runtime_directories(const ShellOptions& options, std::string* 
 bool macmu_system_image_exists(const ShellOptions& options);
 bool macmu_machine_exists(const ShellOptions& options);
 bool macmu_create_default_machine(const ShellOptions& options, std::string* error);
+bool macmu_find_system_image_directory(const std::string& root,
+                                       std::string* system_image_dir,
+                                       std::string* error);
+bool macmu_replace_system_image_from_directory(const ShellOptions& options,
+                                               const std::string& source_dir,
+                                               std::string* error);
 
 #endif  // MACMU_SHELL_MACHINE_MANAGER_H

@@ -10,7 +10,7 @@ namespace macmu {
 
 inline constexpr const char* kQemuHeadlessRelativePath =
     "qemu/darwin-aarch64/qemu-system-aarch64-headless";
-inline constexpr const char* kDefaultAvdName = "aemu_aosp35_arm64";
+inline constexpr const char* kDefaultAvdName = "macmu_aosp16_arm64";
 
 }  // namespace macmu
 

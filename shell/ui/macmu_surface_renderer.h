@@ -45,6 +45,13 @@ bool macmu_surface_renderer_map_view_point(MacMuSurfaceRendererRef renderer,
                                            int* out_x,
                                            int* out_y,
                                            uint32_t* out_display_id);
+
+// Fit a guest framebuffer of |pixel_width|x|pixel_height| into the main
+// screen's visible frame (85% cap, never upscaled below 1:1), returning the
+// suggested window content size. Exposed so the shell can size a secondary
+// display window to the requested aspect ratio before the first frame
+// arrives, avoiding a first-frame geometry jump.
+NSSize macmu_fitted_window_content_size(uint32_t pixel_width, uint32_t pixel_height);
 #endif
 
 #endif  // MACMU_SHELL_SURFACE_RENDERER_H

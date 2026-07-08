@@ -77,7 +77,7 @@ std::string current_working_directory() {
 std::string default_app_data_dir() {
     const char* home = std::getenv("HOME");
     if (home && home[0] != '\0') {
-        return path_join(path_join(path_join(home, "Library"), "Application Support"), "MacMu");
+        return path_join(path_join(home, "Library"), "MacMu");
     }
     return "MacMuData";
 }
@@ -87,7 +87,7 @@ std::string default_avd_home(const std::string& app_data_dir) {
 }
 
 std::string default_system_path(const std::string& app_data_dir) {
-    return path_join(app_data_dir, "images/android-35-arm64");
+    return path_join(app_data_dir, "images/aosp16-arm64");
 }
 
 std::string executable_directory() {

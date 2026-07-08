@@ -2,17 +2,25 @@
 
 package dev.macmu.agent;
 
+import android.content.Context;
+import android.content.pm.ApplicationInfo;
+import android.content.pm.PackageManager;
+import android.graphics.Bitmap;
+import android.graphics.Canvas;
+import android.graphics.drawable.Drawable;
 import android.os.IBinder;
 import android.os.SystemClock;
 import android.system.Os;
 import android.system.OsConstants;
 import android.system.VmSocketAddress;
+import android.util.Base64;
 import android.view.InputDevice;
 import android.view.InputEvent;
 import android.view.MotionEvent;
 
 import java.io.BufferedReader;
 import java.io.BufferedWriter;
+import java.io.ByteArrayOutputStream;
 import java.io.FileDescriptor;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
@@ -41,6 +49,15 @@ public final class MacMuAgent {
     private final Method injectInputEvent;
     private final Method setDisplayId;
     private final String socketPath;
+
+    // Lazily-initialized system Context + PackageManager used to resolve app
+    // labels and launcher icons. This process is a bare app_process main with
+    // no Application, so reach ActivityThread.systemMain()/getSystemContext()
+    // via reflection the same way the input manager is reached. Stays null if
+    // the platform blocks the hidden-API call; listLauncherApps degrades to
+    // pkg/activity-only entries.
+    private Context systemContext;
+    private PackageManager pm;
     private boolean hoverActive;
     private int hoverDisplayId = -1;
     private float hoverX;
@@ -312,6 +329,41 @@ public final class MacMuAgent {
         return cached != null ? cached : -1;
     }
 
+    private synchronized void invalidateDisplayId(int emulatorDisplayId) {
+        displayIdCache.remove(emulatorDisplayId);
+    }
+
+    // Polls the DisplayManager dump until the emulator display id resolves to
+    // an Android logical display id, or |timeoutMs| elapses. The guest may
+    // register the VirtualDisplay slightly after the host confirms DISPLAY_ADD
+    // (the control-plane ACK means "host accepted", not "guest live").
+    private int waitForAndroidDisplayId(int emulatorDisplayId, long timeoutMs) {
+        if (emulatorDisplayId <= 0) {
+            return 0;
+        }
+        // Emulator display ids are reused after remove/re-add, but Android
+        // assigns the new VirtualDisplay a fresh logical id. A cached mapping
+        // from the previous display at this id would point at a destroyed
+        // display, so drop it and re-read dumpsys.
+        invalidateDisplayId(emulatorDisplayId);
+        final long deadline = SystemClock.elapsedRealtime() + timeoutMs;
+        while (true) {
+            int resolved = resolveAndroidDisplayId(emulatorDisplayId);
+            if (resolved >= 0) {
+                return resolved;
+            }
+            if (SystemClock.elapsedRealtime() >= deadline) {
+                return -1;
+            }
+            try {
+                Thread.sleep(200);
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                return -1;
+            }
+        }
+    }
+
     private void refreshDisplayIdCache() {
         displayIdCache.clear();
         try {
@@ -330,12 +382,18 @@ public final class MacMuAgent {
         }
     }
 
-    // Returns a JSON array of {"pkg": ..., "activity": ...} launcher entries.
+    // Returns a JSON array of launcher entries. The baseline fields
+    // {"pkg", "activity"} come from `cmd package query-activities`; when the
+    // PackageManager is reachable each entry is enriched with {"name", "icon"}
+    // where icon is a base64-encoded PNG (192x192) of the app's launcher icon.
+    // Enrichment failures never drop an entry: a missing name/icon simply
+    // means the host falls back to pkg/activity for that row.
     private String listLauncherApps() throws Exception {
         List<String> output = execForLines(new String[] {
                 "/system/bin/cmd", "package", "query-activities", "--components",
                 "-a", "android.intent.action.MAIN",
                 "-c", "android.intent.category.LAUNCHER"});
+        boolean pmReady = ensurePackageManager();
         JSONArray apps = new JSONArray();
         for (String rawLine : output) {
             String candidate = rawLine.trim();
@@ -351,9 +409,81 @@ public final class MacMuAgent {
             JSONObject app = new JSONObject();
             app.put("pkg", pkg);
             app.put("activity", activity);
+            if (pmReady) {
+                enrichAppEntry(app, pkg);
+            }
             apps.put(app);
         }
         return apps.toString();
+    }
+
+    // Best-effort: add "name" and "icon" to |app| for the given package. Any
+    // failure is logged and swallowed so the caller still emits the row.
+    private void enrichAppEntry(JSONObject app, String pkg) {
+        try {
+            ApplicationInfo info = pm.getApplicationInfo(pkg, 0);
+            CharSequence label = pm.getApplicationLabel(info);
+            if (label != null && label.length() > 0) {
+                app.put("name", label.toString());
+            }
+            String icon = loadIconPngBase64(info);
+            if (icon != null) {
+                app.put("icon", icon);
+            }
+        } catch (Exception e) {
+            e.printStackTrace(System.err);
+        }
+    }
+
+    // Renders the app launcher icon into a 192x192 ARGB_8888 bitmap and returns
+    // it as a base64 (NO_WRAP) PNG string. Returns null on any failure.
+    // getApplicationIcon never throws (returns the default robot icon on miss),
+    // so a null return means the bitmap/encode step failed.
+    private String loadIconPngBase64(ApplicationInfo info) {
+        Drawable drawable = pm.getApplicationIcon(info);
+        final int size = 192;
+        Bitmap bmp = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888);
+        try {
+            Canvas canvas = new Canvas(bmp);
+            drawable.setBounds(0, 0, size, size);
+            drawable.draw(canvas);
+            ByteArrayOutputStream baos = new ByteArrayOutputStream(8 * 1024);
+            if (!bmp.compress(Bitmap.CompressFormat.PNG, 100, baos)) {
+                return null;
+            }
+            return Base64.encodeToString(baos.toByteArray(), Base64.NO_WRAP);
+        } catch (Exception e) {
+            e.printStackTrace(System.err);
+            return null;
+        } finally {
+            bmp.recycle();
+        }
+    }
+
+    // Lazily resolve a system Context + PackageManager via reflection on
+    // ActivityThread. Returns true on success, false if the platform blocks
+    // the hidden-API call (in which case pm stays null and the host renders
+    // pkg/activity only).
+    private synchronized boolean ensurePackageManager() {
+        if (pm != null) {
+            return true;
+        }
+        try {
+            Class<?> at = Class.forName("android.app.ActivityThread");
+            Object thread = at.getDeclaredMethod("systemMain").invoke(null);
+            Method getSystemContext = at.getDeclaredMethod("getSystemContext");
+            systemContext = (Context) getSystemContext.invoke(thread);
+            if (systemContext == null) {
+                return false;
+            }
+            pm = systemContext.getPackageManager();
+            return pm != null;
+        } catch (Exception e) {
+            e.printStackTrace(System.err);
+            systemContext = null;
+            pm = null;
+            return false;
+        }
     }
 
     // Returns null on success, an error message otherwise.
@@ -366,9 +496,16 @@ public final class MacMuAgent {
         command.add("activity");
         command.add("start-activity");
         if (displayId > 0) {
-            int androidDisplayId = resolveAndroidDisplayId(displayId);
+            // The host may call launch within a few hundred ms of DISPLAY_ADD_OK;
+            // the guest VirtualDisplay is not guaranteed to be registered with
+            // DisplayManager by then. Poll the dumpsys-backed cache for a few
+            // seconds instead of failing on the first miss — otherwise
+            // am start --display falls back to display 0 silently.
+            int androidDisplayId = waitForAndroidDisplayId(displayId, 3000);
+            System.err.println("MacMu [diag] launchComponent emulatorDisplayId=" + displayId
+                    + " -> androidDisplayId=" + androidDisplayId + " cache=" + displayIdCache);
             if (androidDisplayId < 0) {
-                return "display " + displayId + " not found in guest";
+                return "display " + displayId + " not found in guest after waiting";
             }
             command.add("--display");
             command.add(Integer.toString(androidDisplayId));
@@ -390,16 +527,15 @@ public final class MacMuAgent {
         if (pkg == null) {
             return "invalid component";
         }
-        // Resolve while the display still exists; this also refreshes the cache
-        // before qemu removes the VirtualDisplay. A missing display should not
-        // prevent stopping the bound package.
-        if (displayId > 0) {
-            resolveAndroidDisplayId(displayId);
-        }
-
         String error = stopPackage(pkg, false);
         if (error != null && error.toLowerCase().contains("unknown command")) {
             error = stopPackage(pkg, true);
+        }
+        // The host removes the guest display right after this returns; the
+        // cached emulator->Android id mapping is about to go stale, and the
+        // slot may be reused by a later display with a different Android id.
+        if (displayId > 0) {
+            invalidateDisplayId(displayId);
         }
         return error;
     }

@@ -11,8 +11,9 @@
 
 struct ShellOptions {
     // MacMu-owned writable data root. Defaults to
-    // ~/Library/Application Support/MacMu and is used for managed machines and
-    // product-owned Android images.
+    // ~/Library/MacMu and is used for managed machines and product-owned
+    // Android images. Keep this path free of spaces: upstream emulator paths
+    // are not uniformly robust when AVD_HOME contains spaces.
     std::string appDataDir;
     // Directory containing <name>.ini and <name>.avd entries. This is exported
     // to qemu as ANDROID_AVD_HOME so -avd resolves under MacMu's data root by

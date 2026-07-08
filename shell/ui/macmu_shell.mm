@@ -10,6 +10,7 @@
 #import <AppKit/AppKit.h>
 #import <Metal/Metal.h>
 #import <MetalKit/MetalKit.h>
+#import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 
 #include <atomic>
 #include <cerrno>
@@ -20,6 +21,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <sys/wait.h>
 #include <thread>
@@ -69,10 +71,100 @@ NSTextField* make_value(NSString* text, NSRect frame) {
     return value;
 }
 
-// Defaults for user-created secondary displays.
-constexpr uint32_t kNewDisplayWidth = 1280;
-constexpr uint32_t kNewDisplayHeight = 720;
+// A rounded "card" container with a subtle background fill. Children are added
+// as subviews in caller-supplied (card-local) coordinates.
+NSView* make_card(NSRect frame) {
+    NSView* card = [[NSView alloc] initWithFrame:frame];
+    card.wantsLayer = YES;
+    card.layer.cornerRadius = 10.0;
+    card.layer.masksToBounds = YES;
+    card.layer.backgroundColor = [NSColor controlBackgroundColor].CGColor;
+    card.layer.borderColor = [NSColor separatorColor].CGColor;
+    card.layer.borderWidth = 1.0;
+    return card;
+}
+
+NSButton* make_button(NSString* title, SEL action, id target, NSRect frame) {
+    NSButton* button = [NSButton buttonWithTitle:title target:target action:action];
+    button.frame = frame;
+    button.bezelStyle = NSBezelStyleRounded;
+    button.controlSize = NSControlSizeRegular;
+    return button;
+}
+
+// Returns a placeholder icon: a rounded-rect filled with a neutral tint and
+// the first code unit of |label| centered. Used when a launcher entry has no
+// decodable icon or while icons are still loading.
+NSImage* placeholder_icon(NSString* label, NSSize size) {
+    NSImage* image = [[NSImage alloc] initWithSize:size];
+    [image lockFocus];
+    NSBezierPath* path =
+        [NSBezierPath bezierPathWithRoundedRect:NSMakeRect(0, 0, size.width, size.height)
+                                      xRadius:size.width * 0.22
+                                      yRadius:size.height * 0.22];
+    [[NSColor secondarySystemFillColor] setFill];
+    [path fill];
+    NSString* initial = label.length > 0
+                            ? [[label substringToIndex:1] uppercaseString]
+                            : @"?";
+    NSDictionary* attrs = @{
+        NSFontAttributeName : [NSFont systemFontOfSize:size.width * 0.46
+                                              weight:NSFontWeightSemibold],
+        NSForegroundColorAttributeName : [NSColor secondaryLabelColor]
+    };
+    NSRect textRect = [initial boundingRectWithSize:size
+                                            options:0
+                                         attributes:attrs];
+    NSPoint origin = NSMakePoint((size.width - textRect.size.width) * 0.5 - textRect.origin.x,
+                                 (size.height - textRect.size.height) * 0.5 - textRect.origin.y);
+    [initial drawAtPoint:origin withAttributes:attrs];
+    [image unlockFocus];
+    return image;
+}
+
+struct DisplayLaunchProfile {
+    const char* title;
+    uint32_t width;
+    uint32_t height;
+    uint32_t dpi;
+};
+
 constexpr uint32_t kNewDisplayDpi = 240;
+
+// User-creatable display ids on the qemu side are 1..kMaxUserDisplayId; ids
+// above that are the emulator-internal range. Must match
+// kMaxUserDisplayId in macmu-control-receiver.cpp.
+constexpr uint32_t kMaxUserDisplayId = 5;
+
+// Common app-window aspect ratios. 16:9 remains the default button path.
+constexpr DisplayLaunchProfile kDisplayLaunchProfiles[] = {
+    {"16:9  1280 x 720", 1280, 720, kNewDisplayDpi},
+    {"9:16  720 x 1280", 720, 1280, kNewDisplayDpi},
+    {"16:10 1280 x 800", 1280, 800, kNewDisplayDpi},
+    {"10:16 800 x 1280", 800, 1280, kNewDisplayDpi},
+    {"18.5:9 1480 x 720", 1480, 720, kNewDisplayDpi},
+    {"9:18.5 720 x 1480", 720, 1480, kNewDisplayDpi},
+    {"18:9  1440 x 720", 1440, 720, kNewDisplayDpi},
+    {"9:18  720 x 1440", 720, 1440, kNewDisplayDpi},
+    {"19:9  1520 x 720", 1520, 720, kNewDisplayDpi},
+    {"9:19  720 x 1520", 720, 1520, kNewDisplayDpi},
+    {"19.5:9 1560 x 720", 1560, 720, kNewDisplayDpi},
+    {"9:19.5 720 x 1560", 720, 1560, kNewDisplayDpi},
+    {"20:9  1600 x 720", 1600, 720, kNewDisplayDpi},
+    {"9:20  720 x 1600", 720, 1600, kNewDisplayDpi},
+    {"21:9  1680 x 720", 1680, 720, kNewDisplayDpi},
+    {"32:9  1920 x 540", 1920, 540, kNewDisplayDpi},
+    {"4:3   1024 x 768", 1024, 768, kNewDisplayDpi},
+    {"3:4   768 x 1024", 768, 1024, kNewDisplayDpi},
+    {"3:2   1200 x 800", 1200, 800, kNewDisplayDpi},
+    {"2:3   800 x 1200", 800, 1200, kNewDisplayDpi},
+    {"5:4   1000 x 800", 1000, 800, kNewDisplayDpi},
+    {"4:5   800 x 1000", 800, 1000, kNewDisplayDpi},
+    {"1:1   900 x 900", 900, 900, kNewDisplayDpi},
+};
+constexpr size_t kDisplayLaunchProfileCount =
+    sizeof(kDisplayLaunchProfiles) / sizeof(kDisplayLaunchProfiles[0]);
+constexpr size_t kDefaultDisplayLaunchProfile = 0;
 
 // DisplayManager virtual-display flags, copied here so MacMu can request
 // scrcpy-like secondary displays without depending on Android framework
@@ -92,14 +184,48 @@ struct DisplayWindow {
     NSWindow* __strong window = nil;
     MTKView* __strong view = nil;
     MacMuSurfaceRendererRef __strong renderer = nil;
+    // Requested geometry captured at DISPLAY_ADD time, used for the
+    // "requested vs actual" window title suffix on secondary displays.
+    // Zero on display 0 and on auto-opened secondary displays.
+    uint32_t requestedWidth = 0;
+    uint32_t requestedHeight = 0;
+    uint32_t requestedDpi = 0;
+    bool reportedActual = false;  // true once the actual-size title suffix is set
 };
 
 }  // namespace
+
+@interface MacMuAppsTableView : NSTableView
+@end
+
+@implementation MacMuAppsTableView
+- (NSMenu*)menuForEvent:(NSEvent*)event {
+    NSPoint point = [self convertPoint:event.locationInWindow fromView:nil];
+    NSInteger row = [self rowAtPoint:point];
+    if (row >= 0) {
+        [self selectRowIndexes:[NSIndexSet indexSetWithIndex:row] byExtendingSelection:NO];
+        return self.menu;
+    }
+    return [super menuForEvent:event];
+}
+@end
 
 @interface MacMuAppDelegate
     : NSObject <NSApplicationDelegate, NSWindowDelegate, NSTableViewDataSource,
                 NSTableViewDelegate>
 - (instancetype)initWithOptions:(const ShellOptions&)options;
+// Opens (or focuses) the window bound to guest display |displayId|. The aspect
+// variant seeds a secondary display's initial geometry from the requested
+// dimensions; pass 0/0 to use the legacy default geometry.
+- (void)openDisplayWindowForDisplay:(uint32_t)displayId
+                        aspectWidth:(uint32_t)aspectWidth
+                       aspectHeight:(uint32_t)aspectHeight
+                               dpi:(uint32_t)dpi;
+// Picks the smallest user display id (1..kMaxUserDisplayId) not currently in
+// _activeUserDisplayIds, marks it active, and returns it. Returns 0 if all are
+// in use. Pair with releaseUserDisplayId: when the window closes / is removed.
+- (uint32_t)allocateUserDisplayId;
+- (void)releaseUserDisplayId:(uint32_t)displayId;
 @end
 
 @implementation MacMuAppDelegate {
@@ -128,11 +254,24 @@ struct DisplayWindow {
     // launched app. Closing the host window stops that app before removing the
     // guest display so Android does not reparent the task to display 0.
     std::map<uint32_t, std::string> _displayAppBindings;
+    // User display ids (1..kMaxUserDisplayId) we have an open window + binding
+    // for. The qemu control plane's auto-allocate (displayId == AUTO) does NOT
+    // reliably skip displays we still have open: a second "launch in new
+    // display" can be handed the same id as the first (the underlying
+    // multi_display agent's enabled-tracking is incomplete in this build),
+    // which makes the new app land on the existing display. We avoid that by
+    // allocating an explicit id here — the smallest id in 1..5 not in this set
+    // — and releasing it when the window closes / is removed.
+    std::set<uint32_t> _activeUserDisplayIds;
 
     NSWindow* _appsWindow;
     NSTableView* _appsTable;
     NSTextField* _appsStatusValue;
     NSMutableArray<NSDictionary*>* _apps;
+    // pkg -> friendly label and decoded icon, populated in applyAppList:.
+    // Used by the icon table cell; missing entries fall back to a placeholder.
+    NSMutableDictionary<NSString*, NSString*>* _appNames;
+    NSMutableDictionary<NSString*, NSImage*>* _appIcons;
 
     NSStatusItem* _statusItem;
 
@@ -173,6 +312,8 @@ struct DisplayWindow {
     _appsTable = nil;
     _appsStatusValue = nil;
     _apps = [[NSMutableArray alloc] init];
+    _appNames = [[NSMutableDictionary alloc] init];
+    _appIcons = [[NSMutableDictionary alloc] init];
     _statusItem = nil;
     _shuttingDown.store(false, std::memory_order_relaxed);
     _runtimeShutdownComplete.store(false, std::memory_order_relaxed);
@@ -237,6 +378,10 @@ struct DisplayWindow {
             continue;
         }
         const uint32_t displayId = it->first;
+        NSLog(@"MacMu [diag] windowWillClose displayId=%u suppressed=%d binding=%s", displayId,
+              _suppressRemoveOnClose.count(displayId) > 0,
+              (_displayAppBindings.count(displayId) ? _displayAppBindings[displayId].c_str()
+                                                    : "<none>"));
         [self teardownDisplayWindowEntry:it->second];
         _displayWindows.erase(it);
 
@@ -254,6 +399,13 @@ struct DisplayWindow {
                 [self closeBoundAppAndRemoveDisplay:displayId];
             } else {
                 _displayAppBindings.erase(displayId);
+            }
+            // Release the id whether or not we issued DISPLAY_REMOVE, so the
+            // next "launch in new display" can reuse the slot. The guest-remove
+            // path calls releaseUserDisplayId: after the ack to avoid a race
+            // with a re-add at the same id while qemu is still tearing down.
+            if (suppressed) {
+                [self releaseUserDisplayId:displayId];
             }
         }
         break;
@@ -385,7 +537,7 @@ struct DisplayWindow {
         return;
     }
 
-    const NSRect frame = NSMakeRect(0, 0, 760, 620);
+    const NSRect frame = NSMakeRect(0, 0, 760, 640);
     _statusWindow = [[NSWindow alloc]
         initWithContentRect:frame
                   styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
@@ -395,105 +547,161 @@ struct DisplayWindow {
     _statusWindow.title = @"MacMu";
     _statusWindow.releasedWhenClosed = NO;
     _statusWindow.delegate = self;
-    _statusWindow.minSize = NSMakeSize(680, 500);
+    _statusWindow.minSize = NSMakeSize(700, 560);
+    _statusWindow.backgroundColor = [NSColor windowBackgroundColor];
 
     NSView* content = [[NSView alloc] initWithFrame:frame];
     _statusWindow.contentView = content;
 
-    NSTextField* title = make_label(@"MacMu", NSMakeRect(28, 566, 360, 26));
-    title.font = [NSFont systemFontOfSize:22.0 weight:NSFontWeightSemibold];
+    // --- Title region ----------------------------------------------------
+    NSTextField* title = make_label(@"MacMu", NSMakeRect(24, 596, 360, 30));
+    title.font = [NSFont systemFontOfSize:26.0 weight:NSFontWeightBold];
     title.textColor = [NSColor labelColor];
     [content addSubview:title];
 
     NSTextField* subtitle =
-        make_label(@"Android emulator core status", NSMakeRect(30, 542, 360, 18));
+        make_label(@"Android emulator core", NSMakeRect(26, 572, 360, 18));
     subtitle.font = [NSFont systemFontOfSize:13.0 weight:NSFontWeightRegular];
+    subtitle.textColor = [NSColor secondaryLabelColor];
     [content addSubview:subtitle];
 
-    [content addSubview:make_label(@"QEMU", NSMakeRect(30, 496, 130, 20))];
-    _qemuStatusValue = make_value(@"Starting", NSMakeRect(170, 496, 550, 20));
-    [content addSubview:_qemuStatusValue];
+    // --- System card -----------------------------------------------------
+    // Card spans the full content width minus side margins; its subviews are
+    // positioned in card-local coordinates (origin at card bottom-left).
+    const CGFloat cardX = 20.0;
+    const CGFloat cardW = frame.size.width - cardX * 2.0;
+    NSView* systemCard = make_card(NSMakeRect(cardX, 388, cardW, 168));
+    systemCard.autoresizingMask = NSViewWidthSizable | NSViewMaxYMargin;
+    [content addSubview:systemCard];
 
-    [content addSubview:make_label(@"Data Root", NSMakeRect(30, 456, 130, 20))];
-    _appDataPathValue = make_value(ns_string(_options.appDataDir), NSMakeRect(170, 456, 550, 20));
-    [content addSubview:_appDataPathValue];
+    NSTextField* systemHeader = make_label(@"SYSTEM", NSMakeRect(16, 140, 200, 16));
+    systemHeader.font = [NSFont systemFontOfSize:11.0 weight:NSFontWeightSemibold];
+    systemHeader.textColor = [NSColor tertiaryLabelColor];
+    [systemCard addSubview:systemHeader];
 
-    [content addSubview:make_label(@"Machine", NSMakeRect(30, 416, 130, 20))];
-    _avdPathValue = make_value(ns_string(macmu_machine_path(_options)),
-                               NSMakeRect(170, 416, 550, 20));
-    [content addSubview:_avdPathValue];
+    const CGFloat labelX = 16.0;
+    const CGFloat valueX = 130.0;
+    const CGFloat valueW = cardW - valueX - 16.0;
+    auto add_system_row = ^(NSString* label, NSString* value, CGFloat y) {
+        NSTextField* l = make_label(label, NSMakeRect(labelX, y, valueX - labelX - 8, 18));
+        l.font = [NSFont systemFontOfSize:12.0 weight:NSFontWeightMedium];
+        l.textColor = [NSColor tertiaryLabelColor];
+        [systemCard addSubview:l];
+        NSTextField* v = make_value(value, NSMakeRect(valueX, y, valueW, 18));
+        v.textColor = [NSColor labelColor];
+        [systemCard addSubview:v];
+        return v;
+    };
+    _qemuStatusValue = add_system_row(@"QEMU", @"Starting", 108);
+    _appDataPathValue = add_system_row(@"Storage", @"Managed by MacMu", 84);
+    _avdPathValue = add_system_row(@"Device", @"Checking", 60);
+    _systemPathValue = add_system_row(@"System Image", @"Checking", 36);
 
-    [content addSubview:make_label(@"System Image", NSMakeRect(30, 376, 130, 20))];
-    _systemPathValue = make_value(ns_string(_options.systemPath), NSMakeRect(170, 376, 550, 20));
-    [content addSubview:_systemPathValue];
+    // --- Apps card -------------------------------------------------------
+    // The card's scroll view grows with the window; the button row below it
+    // is pinned to the bottom.
+    const CGFloat appsCardY = 84.0;
+    const CGFloat appsCardH = 292.0;
+    NSView* appsCard = make_card(NSMakeRect(cardX, appsCardY, cardW, appsCardH));
+    appsCard.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+    [content addSubview:appsCard];
 
-    [content addSubview:make_label(@"Apps", NSMakeRect(30, 328, 130, 20))];
+    NSTextField* appsHeader = make_label(@"APPS", NSMakeRect(16, appsCardH - 26, 120, 16));
+    appsHeader.font = [NSFont systemFontOfSize:11.0 weight:NSFontWeightSemibold];
+    appsHeader.textColor = [NSColor tertiaryLabelColor];
+    appsHeader.autoresizingMask = NSViewMaxYMargin;
+    [appsCard addSubview:appsHeader];
 
-    NSScrollView* scroll = [[NSScrollView alloc] initWithFrame:NSMakeRect(30, 78, 700, 240)];
+    _appsStatusValue = make_value(@"", NSMakeRect(cardW - 280, appsCardH - 26, 264, 16));
+    _appsStatusValue.font = [NSFont systemFontOfSize:11.0 weight:NSFontWeightRegular];
+    _appsStatusValue.textColor = [NSColor tertiaryLabelColor];
+    _appsStatusValue.alignment = NSTextAlignmentRight;
+    _appsStatusValue.autoresizingMask = NSViewMinXMargin | NSViewMaxYMargin;
+    [appsCard addSubview:_appsStatusValue];
+
+    NSScrollView* scroll =
+        [[NSScrollView alloc] initWithFrame:NSMakeRect(8, 8, cardW - 16, appsCardH - 44)];
     scroll.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
     scroll.hasVerticalScroller = YES;
+    scroll.drawsBackground = NO;
 
-    _appsTable = [[NSTableView alloc] initWithFrame:scroll.bounds];
-    NSTableColumn* packageColumn = [[NSTableColumn alloc] initWithIdentifier:@"package"];
-    packageColumn.title = @"Package";
-    packageColumn.width = 320;
-    [_appsTable addTableColumn:packageColumn];
-    NSTableColumn* activityColumn = [[NSTableColumn alloc] initWithIdentifier:@"activity"];
-    activityColumn.title = @"Launcher Activity";
-    activityColumn.width = 360;
-    [_appsTable addTableColumn:activityColumn];
+    _appsTable = [[MacMuAppsTableView alloc] initWithFrame:scroll.bounds];
+    // Single column carrying the icon + name + package cell. The identifier is
+    // arbitrary but must match what tableView:viewForTableColumn: returns.
+    NSTableColumn* appColumn = [[NSTableColumn alloc] initWithIdentifier:@"app"];
+    appColumn.width = scroll.bounds.size.width;
+    appColumn.resizingMask = NSTableColumnAutoresizingMask;
+    [_appsTable addTableColumn:appColumn];
     _appsTable.dataSource = self;
     _appsTable.delegate = self;
-    _appsTable.usesAlternatingRowBackgroundColors = YES;
+    _appsTable.usesAlternatingRowBackgroundColors = NO;
+    _appsTable.backgroundColor = [NSColor clearColor];
+    _appsTable.style = NSTableViewStylePlain;
+    _appsTable.rowSizeStyle = NSTableViewRowSizeStyleDefault;
+    _appsTable.intercellSpacing = NSMakeSize(0, 0);
     _appsTable.doubleAction = @selector(launchAppOnNewDisplay:);
     _appsTable.target = self;
+    NSMenu* appsMenu = [[NSMenu alloc] initWithTitle:@"Apps"];
+    NSMenuItem* launchPrimary = [appsMenu addItemWithTitle:@"Launch on Primary Display"
+                                                    action:@selector(launchAppOnPrimary:)
+                                             keyEquivalent:@""];
+    launchPrimary.target = self;
+    NSMenuItem* launchInDisplay =
+        [appsMenu addItemWithTitle:@"Launch in New Display"
+                             action:nil
+                      keyEquivalent:@""];
+    NSMenu* ratioMenu = [[NSMenu alloc] initWithTitle:@"Launch in New Display"];
+    for (size_t i = 0; i < kDisplayLaunchProfileCount; ++i) {
+        NSMenuItem* item =
+            [ratioMenu addItemWithTitle:[NSString stringWithUTF8String:kDisplayLaunchProfiles[i].title]
+                                 action:@selector(launchAppWithProfile:)
+                          keyEquivalent:@""];
+        item.target = self;
+        item.representedObject = @(i);
+    }
+    [appsMenu setSubmenu:ratioMenu forItem:launchInDisplay];
+    _appsTable.menu = appsMenu;
     scroll.documentView = _appsTable;
-    [content addSubview:scroll];
+    [appsCard addSubview:scroll];
 
-    NSButton* refresh = [NSButton buttonWithTitle:@"Refresh Apps"
-                                           target:self
-                                           action:@selector(refreshApps:)];
-    refresh.frame = NSMakeRect(30, 28, 118, 34);
-    refresh.bezelStyle = NSBezelStyleRounded;
+    // --- Bottom button row ----------------------------------------------
+    // Two groups: Refresh / Import on the left, Display / Launch / New Display
+    // on the right, separated by a thin separator that spans the card width.
+    NSBox* separator = [[NSBox alloc] initWithFrame:NSMakeRect(cardX, 70, cardW, 1)];
+    separator.boxType = NSBoxSeparator;
+    separator.autoresizingMask = NSViewWidthSizable | NSViewMaxYMargin;
+    [content addSubview:separator];
+
+    NSButton* refresh = make_button(@"Refresh", @selector(refreshApps:), self,
+                                    NSMakeRect(cardX, 24, 110, 32));
     refresh.autoresizingMask = NSViewMaxXMargin | NSViewMaxYMargin;
     [content addSubview:refresh];
 
-    _appsStatusValue = make_value(@"", NSMakeRect(160, 35, 172, 20));
-    _appsStatusValue.autoresizingMask = NSViewMaxXMargin | NSViewMaxYMargin;
-    [content addSubview:_appsStatusValue];
-
-    _createMachineButton = [NSButton buttonWithTitle:@"Create Machine"
-                                              target:self
-                                              action:@selector(createMachine:)];
-    _createMachineButton.frame = NSMakeRect(350, 28, 136, 34);
-    _createMachineButton.bezelStyle = NSBezelStyleRounded;
-    _createMachineButton.autoresizingMask = NSViewMinXMargin | NSViewMaxYMargin;
+    _createMachineButton = make_button(@"Import Image…", @selector(prepareDevice:), self,
+                                       NSMakeRect(cardX + 120, 24, 140, 32));
+    _createMachineButton.autoresizingMask = NSViewMaxXMargin | NSViewMaxYMargin;
     [content addSubview:_createMachineButton];
 
-    _startButton = [NSButton buttonWithTitle:@"Display"
-                                      target:self
-                                      action:@selector(openPrimaryDisplayWindow:)];
-    _startButton.frame = NSMakeRect(500, 28, 92, 34);
-    _startButton.bezelStyle = NSBezelStyleRounded;
+    // Right-anchored action group, laid out right-to-left.
+    const CGFloat btnH = 32.0;
+    const CGFloat btnY = 24.0;
+    NSButton* launchNew =
+        make_button(@"New Display", @selector(launchAppOnNewDisplay:), self,
+                    NSMakeRect(cardX + cardW - 130, btnY, 130, btnH));
+    launchNew.autoresizingMask = NSViewMinXMargin | NSViewMaxYMargin;
+    [content addSubview:launchNew];
+
+    NSButton* launchPrimaryBtn =
+        make_button(@"Launch", @selector(launchAppOnPrimary:), self,
+                    NSMakeRect(launchNew.frame.origin.x - 8 - 90, btnY, 90, btnH));
+    launchPrimaryBtn.autoresizingMask = NSViewMinXMargin | NSViewMaxYMargin;
+    [content addSubview:launchPrimaryBtn];
+
+    _startButton = make_button(@"Display", @selector(openPrimaryDisplayWindow:), self,
+                               NSMakeRect(launchPrimaryBtn.frame.origin.x - 8 - 96, btnY, 96, btnH));
     _startButton.autoresizingMask = NSViewMinXMargin | NSViewMaxYMargin;
     _startButton.enabled = _channelReady && _metalDevice != nil;
     [content addSubview:_startButton];
-
-    NSButton* launchHere = [NSButton buttonWithTitle:@"Launch"
-                                              target:self
-                                              action:@selector(launchAppOnPrimary:)];
-    launchHere.frame = NSMakeRect(606, 28, 92, 34);
-    launchHere.bezelStyle = NSBezelStyleRounded;
-    launchHere.autoresizingMask = NSViewMinXMargin | NSViewMaxYMargin;
-    [content addSubview:launchHere];
-
-    NSButton* launchNew = [NSButton buttonWithTitle:@"Launch in New Display"
-                                             target:self
-                                             action:@selector(launchAppOnNewDisplay:)];
-    launchNew.frame = NSMakeRect(500, 328, 198, 32);
-    launchNew.bezelStyle = NSBezelStyleRounded;
-    launchNew.autoresizingMask = NSViewMinXMargin | NSViewMinYMargin;
-    [content addSubview:launchNew];
 
     [_statusWindow center];
 }
@@ -511,6 +719,17 @@ struct DisplayWindow {
 // Idempotent: brings the display's window to front, creating it if needed.
 // Main thread only.
 - (void)openDisplayWindowForDisplay:(uint32_t)displayId {
+    [self openDisplayWindowForDisplay:displayId aspectWidth:0 aspectHeight:0 dpi:0];
+}
+
+// Same as above but seeds a secondary display's initial content size and aspect
+// ratio from the requested dimensions, so the window opens already shaped like
+// the chosen profile instead of jumping from a 16:9 default on the first frame.
+// aspectWidth/aspectHeight of 0 fall back to the legacy default geometry.
+- (void)openDisplayWindowForDisplay:(uint32_t)displayId
+                        aspectWidth:(uint32_t)aspectWidth
+                       aspectHeight:(uint32_t)aspectHeight
+                               dpi:(uint32_t)dpi {
     if (!_channelReady || !_frameConsumer || !_frameConsumer->valid() || !_metalDevice) {
         NSBeep();
         return;
@@ -522,7 +741,17 @@ struct DisplayWindow {
         return;
     }
 
-    NSRect frame = displayId == 0 ? NSMakeRect(0, 0, 420, 720) : NSMakeRect(0, 0, 640, 360);
+    NSSize initialSize;
+    if (displayId == 0) {
+        initialSize = NSMakeSize(420, 720);
+    } else if (aspectWidth > 0 && aspectHeight > 0) {
+        // Reuse the renderer's fit-to-screen math so the window opens at the
+        // same size the first frame will resize it to (no jump).
+        initialSize = macmu_fitted_window_content_size(aspectWidth, aspectHeight);
+    } else {
+        initialSize = NSMakeSize(640, 360);
+    }
+    NSRect frame = NSMakeRect(0, 0, initialSize.width, initialSize.height);
     NSWindow* window = [[NSWindow alloc]
         initWithContentRect:frame
                   styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
@@ -534,6 +763,12 @@ struct DisplayWindow {
                        : [NSString stringWithFormat:@"MacMu Display %u", displayId];
     window.releasedWhenClosed = NO;
     window.delegate = self;
+    // Lock the window's content aspect ratio to the request immediately; the
+    // renderer also reasserts this on the first frame, but setting it now
+    // keeps the resize handle honest before pixels arrive.
+    if (displayId != 0 && aspectWidth > 0 && aspectHeight > 0) {
+        [window setContentAspectRatio:NSMakeSize(aspectWidth, aspectHeight)];
+    }
     [window center];
 
     MTKView* view =
@@ -559,6 +794,11 @@ struct DisplayWindow {
     entry.window = window;
     entry.view = view;
     entry.renderer = renderer;
+    if (displayId != 0 && aspectWidth > 0 && aspectHeight > 0) {
+        entry.requestedWidth = aspectWidth;
+        entry.requestedHeight = aspectHeight;
+        entry.requestedDpi = dpi;
+    }
     _displayWindows[displayId] = entry;
 
     // VirtualDisplay-backed secondary displays have no per-frame host signal;
@@ -590,22 +830,175 @@ struct DisplayWindow {
     [NSApp terminate:nil];
 }
 
+- (uint32_t)allocateUserDisplayId {
+    for (uint32_t candidate = 1; candidate <= kMaxUserDisplayId; ++candidate) {
+        if (_activeUserDisplayIds.find(candidate) == _activeUserDisplayIds.end()) {
+            _activeUserDisplayIds.insert(candidate);
+            NSLog(@"MacMu [diag] allocateUserDisplayId -> %u (active now: {%s})", candidate,
+                  [self describeActiveIds].UTF8String);
+            return candidate;
+        }
+    }
+    NSLog(@"MacMu [diag] allocateUserDisplayId -> 0 (none free, active: {%s})",
+          [self describeActiveIds].UTF8String);
+    return 0;
+}
+
+- (void)releaseUserDisplayId:(uint32_t)displayId {
+    if (displayId != 0) {
+        const auto erased = _activeUserDisplayIds.erase(displayId);
+        NSLog(@"MacMu [diag] releaseUserDisplayId(%u) %s (active now: {%s})", displayId,
+              erased ? "released" : "was-not-active", [self describeActiveIds].UTF8String);
+    }
+}
+
+- (NSString*)describeActiveIds {
+    NSMutableArray* parts = [NSMutableArray array];
+    for (uint32_t id : _activeUserDisplayIds) {
+        [parts addObject:[NSString stringWithFormat:@"%u", id]];
+    }
+    return [parts componentsJoinedByString:@", "];
+}
+
 - (void)updateMachineControls {
     const bool hasSystemImage = macmu_system_image_exists(_options);
     const bool hasMachine = macmu_machine_exists(_options);
+    const bool qemuRunning = [self currentQemuPid] > 0;
     if (_createMachineButton) {
-        _createMachineButton.enabled = hasSystemImage && !hasMachine;
-        _createMachineButton.title = hasMachine ? @"Machine Ready" : @"Create Machine";
+        _createMachineButton.enabled = !qemuRunning && (!hasSystemImage || !hasMachine);
+        if (!hasSystemImage) {
+            _createMachineButton.title = @"Import Image…";
+        } else if (!hasMachine) {
+            _createMachineButton.title = @"Prepare Device";
+        } else {
+            _createMachineButton.title = @"Device Ready";
+        }
     }
     if (_appDataPathValue) {
-        _appDataPathValue.stringValue = ns_string(_options.appDataDir);
+        _appDataPathValue.stringValue = qemuRunning ? @"Managed by MacMu - running"
+                                                    : @"Managed by MacMu";
     }
     if (_avdPathValue) {
-        _avdPathValue.stringValue = ns_string(macmu_machine_path(_options));
+        _avdPathValue.stringValue = hasMachine ? @"Ready"
+                                               : (hasSystemImage ? @"Needs preparation"
+                                                                 : @"Waiting for image");
     }
     if (_systemPathValue) {
-        _systemPathValue.stringValue = ns_string(_options.systemPath);
+        _systemPathValue.stringValue = hasSystemImage ? @"Ready" : @"Import required";
     }
+}
+
+- (void)prepareDevice:(id)sender {
+    if (!macmu_system_image_exists(_options)) {
+        [self importSystemImage:sender];
+        return;
+    }
+    [self createMachine:sender];
+}
+
+- (void)importSystemImage:(id)sender {
+    if ([self currentQemuPid] > 0) {
+        [self publishQemuStatus:@"Quit MacMu before importing an image"];
+        NSBeep();
+        return;
+    }
+
+    [self showStatusWindow:nil];
+    NSOpenPanel* panel = [NSOpenPanel openPanel];
+    panel.title = @"Import MacMu System Image";
+    panel.message = @"Choose a MacMu AOSP16 arm64 system image zip.";
+    panel.prompt = @"Import";
+    panel.canChooseFiles = YES;
+    panel.canChooseDirectories = NO;
+    panel.allowsMultipleSelection = NO;
+    panel.allowedContentTypes = @[ [UTType typeWithIdentifier:@"public.zip-archive"] ];
+
+    MacMuAppDelegate* delegate = self;
+    [panel beginSheetModalForWindow:_statusWindow
+                  completionHandler:^(NSModalResponse result) {
+                      if (result != NSModalResponseOK || panel.URL == nil) {
+                          return;
+                      }
+                      [delegate importSystemImageArchive:panel.URL];
+                  }];
+}
+
+- (void)importSystemImageArchive:(NSURL*)archiveURL {
+    ShellOptions options = _options;
+    NSString* archivePath = archiveURL.path;
+    if (archivePath.length == 0) {
+        [self publishQemuStatus:@"Import failed: empty path"];
+        return;
+    }
+
+    [self publishQemuStatus:@"Importing system image"];
+    if (_createMachineButton) {
+        _createMachineButton.enabled = NO;
+    }
+
+    MacMuAppDelegate* delegate = self;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        @autoreleasepool {
+            std::string error;
+            BOOL ok = YES;
+
+            NSString* tempTemplate =
+                [NSTemporaryDirectory() stringByAppendingPathComponent:@"macmu-image-import.XXXXXX"];
+            std::vector<char> tempBuffer(strlen(tempTemplate.fileSystemRepresentation) + 1);
+            std::strcpy(tempBuffer.data(), tempTemplate.fileSystemRepresentation);
+            char* tempPath = mkdtemp(tempBuffer.data());
+            if (!tempPath) {
+                ok = NO;
+                error = "failed to create temporary import directory: ";
+                error += std::strerror(errno);
+            }
+
+            NSString* tempRoot = tempPath ? [NSString stringWithUTF8String:tempPath] : nil;
+            if (ok) {
+                NSTask* task = [[NSTask alloc] init];
+                task.launchPath = @"/usr/bin/ditto";
+                task.arguments = @[ @"-x", @"-k", archivePath, tempRoot ];
+                NSError* launchError = nil;
+                if (![task launchAndReturnError:&launchError]) {
+                    ok = NO;
+                    error = "failed to launch ditto: ";
+                    error += launchError.localizedDescription.UTF8String ?: "unknown error";
+                } else {
+                    [task waitUntilExit];
+                    if (task.terminationStatus != 0) {
+                        ok = NO;
+                        error = "failed to extract zip";
+                    }
+                }
+            }
+
+            std::string extractedImageDir;
+            if (ok) {
+                ok = macmu_find_system_image_directory(tempRoot.UTF8String, &extractedImageDir,
+                                                       &error);
+            }
+            if (ok) {
+                ok = macmu_replace_system_image_from_directory(options, extractedImageDir, &error);
+            }
+            if (ok) {
+                ok = macmu_create_default_machine(options, &error);
+            }
+
+            if (tempRoot) {
+                [[NSFileManager defaultManager] removeItemAtPath:tempRoot error:nil];
+            }
+
+            dispatch_async(dispatch_get_main_queue(), ^{
+                if (ok) {
+                    [delegate publishQemuStatus:@"System image imported"];
+                } else {
+                    [delegate publishQemuStatus:ns_string("Import failed: " + error)];
+                    NSLog(@"MacMu image import failed: %s", error.c_str());
+                }
+                [delegate updateMachineControls];
+            });
+        }
+    });
 }
 
 - (void)createMachine:(id)sender {
@@ -663,12 +1056,19 @@ struct DisplayWindow {
         return;
     }
     macmu::ControlDisplayRemove request = {displayId};
+    MacMuAppDelegate* delegate = self;
     channel->request(macmu::ControlMessageType::kDisplayRemove, &request, sizeof(request), 5000,
-                     [displayId](ControlChannel::Response response) {
+                     [delegate, displayId](ControlChannel::Response response) {
                          if (!response.ok) {
                              NSLog(@"MacMu display %u remove failed: %s", displayId,
                                    response.errorMessage.c_str());
                          }
+                         // Release the id now that qemu has torn the display
+                         // down (or we gave up); this lets a subsequent
+                         // "launch in new display" reuse the slot.
+                         dispatch_async(dispatch_get_main_queue(), ^{
+                             [delegate releaseUserDisplayId:displayId];
+                         });
                      });
 }
 
@@ -711,31 +1111,49 @@ struct DisplayWindow {
         NSBeep();
         return;
     }
+    // Allocate an explicit id up front (not AUTO): the qemu control plane's
+    // auto-allocate does not reliably skip displays we still have open, so a
+    // second new-display request could be handed the same id as the first.
+    const uint32_t displayId = [self allocateUserDisplayId];
+    if (displayId == 0) {
+        [self publishQemuStatus:@"No free display id (1..5 in use)"];
+        NSBeep();
+        return;
+    }
+    const DisplayLaunchProfile& profile = kDisplayLaunchProfiles[kDefaultDisplayLaunchProfile];
     macmu::ControlDisplayAdd request = {};
-    request.displayId = macmu::kControlDisplayIdAuto;
-    request.width = kNewDisplayWidth;
-    request.height = kNewDisplayHeight;
-    request.dpi = kNewDisplayDpi;
+    request.displayId = displayId;
+    request.width = profile.width;
+    request.height = profile.height;
+    request.dpi = profile.dpi;
     request.flags = kNewDisplayFlags;
+    const uint32_t aspectWidth = profile.width;
+    const uint32_t aspectHeight = profile.height;
+    const uint32_t aspectDpi = profile.dpi;
     MacMuAppDelegate* delegate = self;
     channel->request(
         macmu::ControlMessageType::kDisplayAdd, &request, sizeof(request), 10000,
-        [delegate](ControlChannel::Response response) {
+        [delegate, displayId, aspectWidth, aspectHeight, aspectDpi](
+            ControlChannel::Response response) {
             dispatch_async(dispatch_get_main_queue(), ^{
                 if (!response.ok ||
                     response.payload.size() < sizeof(macmu::ControlDisplayAddOk)) {
-                    NSString* message = [NSString
-                        stringWithFormat:@"New display failed: %s",
-                                         response.errorMessage.empty()
-                                             ? "malformed response"
-                                             : response.errorMessage.c_str()];
+                    NSString* message =
+                        [NSString stringWithFormat:@"New display failed: %s",
+                                                   response.errorMessage.empty()
+                                                       ? "malformed response"
+                                                       : response.errorMessage.c_str()];
                     [delegate publishQemuStatus:message];
                     NSLog(@"%@", message);
+                    [delegate releaseUserDisplayId:displayId];
                     return;
                 }
                 macmu::ControlDisplayAddOk ok;
                 std::memcpy(&ok, response.payload.data(), sizeof(ok));
-                [delegate openDisplayWindowForDisplay:ok.displayId];
+                [delegate openDisplayWindowForDisplay:ok.displayId
+                                          aspectWidth:aspectWidth
+                                         aspectHeight:aspectHeight
+                                                 dpi:aspectDpi];
             });
         });
 }
@@ -785,6 +1203,8 @@ struct DisplayWindow {
 
 - (void)applyAppList:(NSArray*)entries {
     [_apps removeAllObjects];
+    [_appNames removeAllObjects];
+    [_appIcons removeAllObjects];
     for (id entry in entries) {
         if (![entry isKindOfClass:[NSDictionary class]]) {
             continue;
@@ -794,10 +1214,32 @@ struct DisplayWindow {
             ![dict[@"activity"] isKindOfClass:[NSString class]]) {
             continue;
         }
+        NSString* pkg = dict[@"pkg"];
         [_apps addObject:dict];
+        // Cache friendly name (falls back to package name in the cell).
+        NSString* name = dict[@"name"];
+        if ([name isKindOfClass:[NSString class]] && name.length > 0) {
+            _appNames[pkg] = name;
+        }
+        // Decode base64 PNG icon if present; failures fall back to a
+        // placeholder rendered lazily by the cell.
+        NSString* iconB64 = dict[@"icon"];
+        if ([iconB64 isKindOfClass:[NSString class]] && iconB64.length > 0) {
+            NSData* pngData =
+                [[NSData alloc] initWithBase64EncodedString:iconB64
+                                                    options:NSDataBase64DecodingIgnoreUnknownCharacters];
+            NSImage* icon = pngData ? [[NSImage alloc] initWithData:pngData] : nil;
+            if (icon) {
+                _appIcons[pkg] = icon;
+            }
+        }
     }
+    // Sort by friendly name when available, else by package — names make the
+    // list more scannable than raw package ids.
     [_apps sortUsingComparator:^NSComparisonResult(NSDictionary* a, NSDictionary* b) {
-        return [a[@"pkg"] compare:b[@"pkg"]];
+        NSString* nameA = _appNames[a[@"pkg"]] ?: a[@"pkg"];
+        NSString* nameB = _appNames[b[@"pkg"]] ?: b[@"pkg"];
+        return [nameA localizedCaseInsensitiveCompare:nameB];
     }];
     [_appsTable reloadData];
     [self setAppsStatus:[NSString stringWithFormat:@"%lu apps",
@@ -824,6 +1266,29 @@ struct DisplayWindow {
 }
 
 - (void)launchAppOnNewDisplay:(id)sender {
+    [self launchSelectedAppInNewDisplayWithProfile:
+              kDisplayLaunchProfiles[kDefaultDisplayLaunchProfile]];
+}
+
+- (void)launchAppWithProfile:(id)sender {
+    if (![sender respondsToSelector:@selector(representedObject)]) {
+        NSBeep();
+        return;
+    }
+    NSNumber* profileIndex = [sender representedObject];
+    if (![profileIndex isKindOfClass:[NSNumber class]]) {
+        NSBeep();
+        return;
+    }
+    const NSUInteger index = profileIndex.unsignedIntegerValue;
+    if (index >= kDisplayLaunchProfileCount) {
+        NSBeep();
+        return;
+    }
+    [self launchSelectedAppInNewDisplayWithProfile:kDisplayLaunchProfiles[index]];
+}
+
+- (void)launchSelectedAppInNewDisplayWithProfile:(DisplayLaunchProfile)profile {
     NSString* component = [self selectedAppComponent];
     if (!component) {
         NSBeep();
@@ -834,32 +1299,52 @@ struct DisplayWindow {
         [self setAppsStatus:@"Control channel not connected"];
         return;
     }
+    // Allocate an explicit id up front (not AUTO). The qemu control plane's
+    // auto-allocate can hand back the same id as an already-open display, which
+    // makes the new app land on the existing display with the old aspect ratio.
+    const uint32_t displayId = [self allocateUserDisplayId];
+    if (displayId == 0) {
+        [self setAppsStatus:@"No free display id (1..5 in use)"];
+        NSBeep();
+        return;
+    }
     macmu::ControlDisplayAdd request = {};
-    request.displayId = macmu::kControlDisplayIdAuto;
-    request.width = kNewDisplayWidth;
-    request.height = kNewDisplayHeight;
-    request.dpi = kNewDisplayDpi;
+    request.displayId = displayId;
+    request.width = profile.width;
+    request.height = profile.height;
+    request.dpi = profile.dpi;
     request.flags = kNewDisplayFlags;
+    const uint32_t aspectWidth = profile.width;
+    const uint32_t aspectHeight = profile.height;
+    const uint32_t aspectDpi = profile.dpi;
     MacMuAppDelegate* delegate = self;
     channel->request(
         macmu::ControlMessageType::kDisplayAdd, &request, sizeof(request), 10000,
-        [delegate, component](ControlChannel::Response response) {
+        [delegate, component, displayId, aspectWidth, aspectHeight, aspectDpi](
+            ControlChannel::Response response) {
             dispatch_async(dispatch_get_main_queue(), ^{
                 if (!response.ok ||
                     response.payload.size() < sizeof(macmu::ControlDisplayAddOk)) {
                     [delegate setAppsStatus:ns_string("Display add failed: " +
                                                       response.errorMessage)];
+                    [delegate releaseUserDisplayId:displayId];
                     return;
                 }
                 macmu::ControlDisplayAddOk ok;
                 std::memcpy(&ok, response.payload.data(), sizeof(ok));
-                [delegate openDisplayWindowForDisplay:ok.displayId];
+                NSLog(@"MacMu: launched %@ on new display %u (%ux%u)", component, ok.displayId,
+                      aspectWidth, aspectHeight);
+                [delegate openDisplayWindowForDisplay:ok.displayId
+                                          aspectWidth:aspectWidth
+                                         aspectHeight:aspectHeight
+                                                 dpi:aspectDpi];
                 delegate->_displayAppBindings[ok.displayId] = [component UTF8String];
-                // Give the guest a moment to bring the new display up before
-                // targeting it; am start on a not-yet-ready display falls back
-                // to display 0.
+                // Give the guest a brief moment to register the new
+                // VirtualDisplay, then launch. The agent also waits on the
+                // display internally, so a short delay here is enough; the
+                // previous 1.5 s blind wait made launches feel sluggish.
                 dispatch_after(
-                    dispatch_time(DISPATCH_TIME_NOW, static_cast<int64_t>(1.5 * NSEC_PER_SEC)),
+                    dispatch_time(DISPATCH_TIME_NOW, static_cast<int64_t>(0.2 * NSEC_PER_SEC)),
                     dispatch_get_main_queue(), ^{
                         [delegate launchComponent:component onDisplay:ok.displayId];
                     });
@@ -876,11 +1361,14 @@ struct DisplayWindow {
     command += [component UTF8String];
     command += " " + std::to_string(displayId);
     MacMuAppDelegate* delegate = self;
-    _guestControlClient->request(command, 10000, [delegate](bool ok, std::string payload) {
+    _guestControlClient->request(command, 15000, [delegate, displayId, component](
+                                                     bool ok, std::string payload) {
         if (!ok) {
             [delegate setAppsStatus:ns_string("Launch failed: " + payload)];
         } else {
-            [delegate setAppsStatus:@"Launched"];
+            [delegate setAppsStatus:[NSString
+                                        stringWithFormat:@"Launched %@ on display %u",
+                                                         component.lastPathComponent, displayId]];
         }
     });
 }
@@ -891,21 +1379,84 @@ struct DisplayWindow {
     return static_cast<NSInteger>(_apps.count);
 }
 
+- (CGFloat)tableView:(NSTableView*)tableView heightOfRow:(NSInteger)row {
+    return 56.0;
+}
+
 - (NSView*)tableView:(NSTableView*)tableView
     viewForTableColumn:(NSTableColumn*)tableColumn
                    row:(NSInteger)row {
     if (row < 0 || row >= static_cast<NSInteger>(_apps.count)) {
         return nil;
     }
-    NSString* identifier = tableColumn.identifier;
-    NSTextField* text = [tableView makeViewWithIdentifier:identifier owner:self];
-    if (!text) {
-        text = make_value(@"", NSMakeRect(0, 0, tableColumn.width, 18));
-        text.identifier = identifier;
-    }
     NSDictionary* app = _apps[static_cast<NSUInteger>(row)];
-    text.stringValue = [identifier isEqualToString:@"package"] ? app[@"pkg"] : app[@"activity"];
-    return text;
+    NSString* pkg = app[@"pkg"];
+    NSString* activity = app[@"activity"];
+    NSString* name = _appNames[pkg] ?: pkg;
+
+    static NSString* const kCellIdentifier = @"MacMuAppCell";
+    NSView* cell = [tableView makeViewWithIdentifier:kCellIdentifier owner:self];
+    if (!cell) {
+        const CGFloat cellH = 56.0;
+        cell = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, tableColumn.width, cellH)];
+        cell.identifier = kCellIdentifier;
+
+        NSImageView* iconView = [[NSImageView alloc] initWithFrame:NSMakeRect(14, 8, 40, 40)];
+        iconView.identifier = @"icon";
+        iconView.imageScaling = NSImageScaleProportionallyDown;
+        iconView.imageAlignment = NSImageAlignCenter;
+        iconView.wantsLayer = YES;
+        iconView.layer.cornerRadius = 8.0;
+        iconView.layer.masksToBounds = YES;
+        [cell addSubview:iconView];
+
+        NSTextField* nameField =
+            [[NSTextField alloc] initWithFrame:NSMakeRect(64, 30, tableColumn.width - 78, 18)];
+        nameField.identifier = @"name";
+        nameField.bezeled = NO;
+        nameField.drawsBackground = NO;
+        nameField.editable = NO;
+        nameField.selectable = NO;
+        nameField.lineBreakMode = NSLineBreakByTruncatingTail;
+        nameField.font = [NSFont systemFontOfSize:13.0 weight:NSFontWeightSemibold];
+        nameField.textColor = [NSColor labelColor];
+        nameField.autoresizingMask = NSViewWidthSizable;
+        [cell addSubview:nameField];
+
+        NSTextField* subField =
+            [[NSTextField alloc] initWithFrame:NSMakeRect(64, 11, tableColumn.width - 78, 14)];
+        subField.identifier = @"sub";
+        subField.bezeled = NO;
+        subField.drawsBackground = NO;
+        subField.editable = NO;
+        subField.selectable = NO;
+        subField.lineBreakMode = NSLineBreakByTruncatingMiddle;
+        subField.font = [NSFont systemFontOfSize:11.0 weight:NSFontWeightRegular];
+        subField.textColor = [NSColor tertiaryLabelColor];
+        subField.autoresizingMask = NSViewWidthSizable;
+        [cell addSubview:subField];
+    }
+
+    NSImageView* iconView = nil;
+    NSTextField* nameField = nil;
+    NSTextField* subField = nil;
+    for (NSView* sub in cell.subviews) {
+        if ([sub.identifier isEqualToString:@"icon"]) {
+            iconView = (NSImageView*)sub;
+        } else if ([sub.identifier isEqualToString:@"name"]) {
+            nameField = (NSTextField*)sub;
+        } else if ([sub.identifier isEqualToString:@"sub"]) {
+            subField = (NSTextField*)sub;
+        }
+    }
+    NSImage* icon = _appIcons[pkg];
+    iconView.image = icon ?: placeholder_icon(name, NSMakeSize(40, 40));
+    nameField.stringValue = name;
+    // Sub line shows the package (and the launcher activity class when short
+    // enough), so the row stays useful even when the icon/name are missing.
+    NSString* activityClass = activity.lastPathComponent;
+    subField.stringValue = [NSString stringWithFormat:@"%@ · %@", pkg, activityClass];
+    return cell;
 }
 
 #pragma mark - qemu supervisor
@@ -923,9 +1474,17 @@ struct DisplayWindow {
             continue;
         }
         if (!macmu_machine_exists(_options)) {
-            [self publishQemuStatus:@"Machine missing"];
-            std::this_thread::sleep_for(std::chrono::seconds(2));
-            continue;
+            [self publishQemuStatus:@"Preparing device"];
+            std::string error;
+            if (!macmu_create_default_machine(_options, &error)) {
+                [self publishQemuStatus:ns_string("Device preparation failed: " + error)];
+                std::this_thread::sleep_for(std::chrono::seconds(2));
+                continue;
+            }
+            MacMuAppDelegate* delegate = self;
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [delegate updateMachineControls];
+            });
         }
         [self publishQemuStatus:@"Starting"];
         if (_channelReady && _frameConsumer) {
@@ -970,6 +1529,9 @@ struct DisplayWindow {
             terminate_qemu(pid);
         } else {
             [self publishQemuStatus:[NSString stringWithFormat:@"Running (pid %d)", pid]];
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [delegate updateMachineControls];
+            });
         }
 
         int status = 0;
@@ -992,6 +1554,10 @@ struct DisplayWindow {
         }
         controlChannel->stop();
         controlChannel.reset();
+
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [delegate updateMachineControls];
+        });
 
         if (_shuttingDown.load(std::memory_order_acquire)) {
             break;
@@ -1047,16 +1613,24 @@ struct DisplayWindow {
 
         MacMuAppDelegate* delegate = self;
         const uint32_t displayId = readyDisplayId;
+        const uint32_t actualWidth = meta.width;
+        const uint32_t actualHeight = meta.height;
         dispatch_async(dispatch_get_main_queue(), ^{
-            [delegate presentFrameForDisplay:displayId];
+            [delegate presentFrameForDisplay:displayId
+                                 actualWidth:actualWidth
+                                actualHeight:actualHeight];
         });
     }
 }
 
 // Main thread. Marks the display's view dirty; auto-opens a window when a
 // secondary display starts producing frames without one (shell restart,
-// guest-initiated display, or add-before-window races).
-- (void)presentFrameForDisplay:(uint32_t)displayId {
+// guest-initiated display, or add-before-window races). On the first real
+// frame for a secondary display, updates the window title with the
+// requested-vs-actual resolution so mismatched guest-side sizing is visible.
+- (void)presentFrameForDisplay:(uint32_t)displayId
+                   actualWidth:(uint32_t)actualWidth
+                  actualHeight:(uint32_t)actualHeight {
     if (_shuttingDown.load(std::memory_order_acquire)) {
         return;
     }
@@ -1072,6 +1646,34 @@ struct DisplayWindow {
         }
     }
     [it->second.view setNeedsDisplay:YES];
+    if (displayId != 0 && !it->second.reportedActual && actualWidth > 0 && actualHeight > 0) {
+        it->second.reportedActual = true;
+        [self updateDisplayWindowTitle:it->first entry:it->second
+                            actualWidth:actualWidth actualHeight:actualHeight];
+    }
+}
+
+// Main thread. Renders the secondary display title as
+// "MacMu Display N · req WxH · actual WxH" so a guest that allocated a
+// different resolution than requested is obvious. Primary display keeps its
+// plain title.
+- (void)updateDisplayWindowTitle:(uint32_t)displayId
+                            entry:(DisplayWindow&)entry
+                     actualWidth:(uint32_t)actualWidth
+                    actualHeight:(uint32_t)actualHeight {
+    if (displayId == 0 || !entry.window) {
+        return;
+    }
+    NSString* prefix = [NSString stringWithFormat:@"MacMu Display %u", displayId];
+    if (entry.requestedWidth > 0 && entry.requestedHeight > 0) {
+        entry.window.title =
+            [NSString stringWithFormat:@"%@ · req %ux%u · actual %ux%u", prefix,
+                                       entry.requestedWidth, entry.requestedHeight, actualWidth,
+                                       actualHeight];
+    } else {
+        entry.window.title = [NSString
+            stringWithFormat:@"%@ · actual %ux%u", prefix, actualWidth, actualHeight];
+    }
 }
 
 - (void)stopDoorbellThread {
