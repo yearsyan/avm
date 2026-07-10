@@ -14,6 +14,8 @@
 #include "android/macmu-opengles-hooks.h"
 #include "android/opengles-overrides.h"
 
+#include <atomic>
+
 #include "aemu/base/CpuUsage.h"
 #include "aemu/base/async/ThreadLooper.h"
 #include "aemu/base/files/PathUtils.h"
@@ -146,6 +148,21 @@ static bool sRendererUsesSubWindow = false;
 static bool sEgl2egl = false;
 static gfxstream::RenderLibPtr sRenderLib = nullptr;
 static gfxstream::RendererPtr sRenderer = nullptr;
+static std::atomic<gfxstream::Renderer*> sMacMuRenderer{nullptr};
+static std::atomic<uint32_t> sMacMuDisplayExportSubscriptions{0};
+
+static void applyMacMuDisplayExportSubscriptions() {
+    gfxstream::Renderer* renderer = sMacMuRenderer.load(std::memory_order_acquire);
+    if (!renderer) {
+        return;
+    }
+    const uint32_t subscriptions =
+            sMacMuDisplayExportSubscriptions.load(std::memory_order_acquire);
+    for (uint32_t displayId = 0; displayId < 16; ++displayId) {
+        renderer->setDisplayExportEnabled(displayId,
+                                          (subscriptions & (uint32_t{1} << displayId)) != 0);
+    }
+}
 
 static const EGLDispatch* sEgl = nullptr;
 static const GLESv2Dispatch* sGlesv2 = nullptr;
@@ -545,6 +562,9 @@ static int startOpenglesRendererImpl(
         return -2;
     }
 
+    sMacMuRenderer.store(sRenderer.get(), std::memory_order_release);
+    applyMacMuDisplayExportSubscriptions();
+
     gfxstream_android_setOpenglesRenderer(&sRenderer);
 
     sEgl = (const EGLDispatch*)sRenderer->getEglDispatch();
@@ -776,6 +796,7 @@ void android_getOpenglesVersion(int* maj, int* min) {
 
 static void stopOpenglesRendererImpl(bool wait) {
     if (sRenderer) {
+        sMacMuRenderer.store(nullptr, std::memory_order_release);
         sRenderer->stop(wait);
         if (wait) {
             sRenderer.reset();
@@ -942,8 +963,30 @@ void android_notifyDisplayColorBufferChanged(uint32_t displayId,
 }
 
 void android_exportDisplayFrame(uint32_t displayId) {
-    if (sRenderer) {
-        sRenderer->exportDisplayFrame(displayId);
+    if (gfxstream::Renderer* renderer = sMacMuRenderer.load(std::memory_order_acquire)) {
+        renderer->exportDisplayFrame(displayId);
+    }
+}
+
+void android_setDisplayExportEnabled(uint32_t displayId, int enabled) {
+    if (displayId >= 16) {
+        return;
+    }
+    const uint32_t mask = uint32_t{1} << displayId;
+    if (enabled) {
+        sMacMuDisplayExportSubscriptions.fetch_or(mask, std::memory_order_acq_rel);
+    } else {
+        sMacMuDisplayExportSubscriptions.fetch_and(~mask, std::memory_order_acq_rel);
+    }
+    if (gfxstream::Renderer* renderer = sMacMuRenderer.load(std::memory_order_acquire)) {
+        renderer->setDisplayExportEnabled(displayId, enabled != 0);
+    }
+}
+
+void android_resetDisplayExportSubscriptions(void) {
+    sMacMuDisplayExportSubscriptions.store(0, std::memory_order_release);
+    if (gfxstream::Renderer* renderer = sMacMuRenderer.load(std::memory_order_acquire)) {
+        renderer->resetDisplayExportSubscriptions();
     }
 }
 
@@ -1017,6 +1060,8 @@ const gfxstream::RendererPtr& android_getOpenglesRenderer() {
 
 void android_setOpenglesRenderer(gfxstream::RendererPtr* ptr) {
     sRenderer = *ptr;
+    sMacMuRenderer.store(sRenderer.get(), std::memory_order_release);
+    applyMacMuDisplayExportSubscriptions();
     // We inject our own opengles.cpp into gfxstream.
     ConsumerInterface interface = {
             // create

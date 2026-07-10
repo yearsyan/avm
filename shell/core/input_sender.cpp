@@ -6,18 +6,13 @@
 #include <cstdio>
 #include <cstring>
 #include <fcntl.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
-namespace {
+#include "posix_util.h"
 
-bool set_close_on_exec(int fd) {
-    const int flags = fcntl(fd, F_GETFD);
-    if (flags < 0) {
-        return false;
-    }
-    return fcntl(fd, F_SETFD, flags | FD_CLOEXEC) == 0;
-}
+namespace {
 
 macmu::InputEventPacket make_packet(macmu::InputEventKind kind,
                                     uint32_t display_id,
@@ -59,7 +54,8 @@ bool InputSender::create() {
                      std::strerror(errno));
         return false;
     }
-    if (!set_close_on_exec(pair[0]) || !set_close_on_exec(pair[1])) {
+    if (!macmu::shell::set_close_on_exec(pair[0]) ||
+        !macmu::shell::set_close_on_exec(pair[1])) {
         close(pair[0]);
         close(pair[1]);
         return false;
@@ -73,29 +69,65 @@ bool InputSender::create() {
     return true;
 }
 
-void InputSender::send_touch(macmu::InputEventKind kind,
+void InputSender::set_enabled(bool enabled) {
+    std::lock_guard<std::mutex> lock(m_sendMutex);
+    m_enabled = enabled;
+    if (!enabled) {
+        discard_pending_locked();
+    }
+}
+
+bool InputSender::send_touch(macmu::InputEventKind kind,
                              uint32_t display_id,
                              int pointer_id,
                              int x,
                              int y) {
-    send_packet(make_packet(kind, display_id, pointer_id, x, y, 0));
+    const bool reliable = kind == macmu::InputEventKind::kTouchBegin ||
+                          kind == macmu::InputEventKind::kTouchEnd;
+    return send_packet(make_packet(kind, display_id, pointer_id, x, y, 0), reliable);
 }
 
-void InputSender::send_mouse_move(uint32_t display_id, int x, int y, uint32_t buttons) {
-    send_packet(make_packet(macmu::InputEventKind::kMouseMove, display_id, 0, x, y, buttons));
+bool InputSender::send_mouse_move(uint32_t display_id, int x, int y, uint32_t buttons) {
+    return send_packet(
+        make_packet(macmu::InputEventKind::kMouseMove, display_id, 0, x, y, buttons), false);
 }
 
-void InputSender::send_mouse_button(uint32_t display_id, int x, int y, uint32_t buttons) {
-    send_packet(make_packet(macmu::InputEventKind::kMouseButton, display_id, 0, x, y, buttons));
+bool InputSender::send_mouse_button(uint32_t display_id, int x, int y, uint32_t buttons) {
+    return send_packet(
+        make_packet(macmu::InputEventKind::kMouseButton, display_id, 0, x, y, buttons), true);
 }
 
-void InputSender::send_packet(const macmu::InputEventPacket& packet) {
-    if (m_fd < 0) {
-        return;
+bool InputSender::send_packet(const macmu::InputEventPacket& packet, bool reliable) {
+    std::lock_guard<std::mutex> lock(m_sendMutex);
+    if (m_fd < 0 || !m_enabled) {
+        return false;
     }
-    const ssize_t sent = send(m_fd, &packet, sizeof(packet), 0);
+    ssize_t sent = send(m_fd, &packet, sizeof(packet), 0);
+    if (sent < 0 && reliable && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+        pollfd pfd = {m_fd, POLLOUT, 0};
+        int pollResult;
+        do {
+            pollResult = poll(&pfd, 1, 5);
+        } while (pollResult < 0 && errno == EINTR);
+        if (pollResult > 0 && (pfd.revents & POLLOUT)) {
+            sent = send(m_fd, &packet, sizeof(packet), 0);
+        }
+    }
+    if (sent == static_cast<ssize_t>(sizeof(packet))) {
+        return true;
+    }
     if (sent < 0 && errno != ENOENT && errno != ECONNREFUSED && errno != EAGAIN &&
         errno != EWOULDBLOCK) {
         std::fprintf(stderr, "Failed to send MacMu input packet: %s\n", std::strerror(errno));
+    }
+    return false;
+}
+
+void InputSender::discard_pending_locked() {
+    if (m_remoteFd < 0) {
+        return;
+    }
+    macmu::InputEventPacket packet = {};
+    while (recv(m_remoteFd, &packet, sizeof(packet), MSG_DONTWAIT) > 0) {
     }
 }

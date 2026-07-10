@@ -7,19 +7,12 @@
 #include <sstream>
 #include <system_error>
 
+#include "posix_util.h"
+
 namespace {
 
 namespace fs = std::filesystem;
-
-std::string path_join(const std::string& lhs, const std::string& rhs) {
-    if (lhs.empty()) {
-        return rhs;
-    }
-    if (lhs.back() == '/') {
-        return lhs + rhs;
-    }
-    return lhs + "/" + rhs;
-}
+using macmu::shell::path_join;
 
 bool ensure_directory(const std::string& path, std::string* error) {
     std::error_code ec;
@@ -175,6 +168,39 @@ std::string config_ini_for(const ShellOptions& options) {
     return out.str();
 }
 
+bool stage_system_image_directory(const fs::path& source,
+                                  const fs::path& importing,
+                                  std::string* error) {
+    std::error_code rename_ec;
+    fs::rename(source, importing, rename_ec);
+    if (!rename_ec) {
+        return true;
+    }
+
+    if (rename_ec != std::errc::cross_device_link) {
+        if (error) {
+            *error = "failed to move system image into place: " + rename_ec.message();
+        }
+        return false;
+    }
+
+    std::error_code copy_ec;
+    fs::copy(source, importing,
+             fs::copy_options::recursive | fs::copy_options::overwrite_existing |
+                 fs::copy_options::copy_symlinks,
+             copy_ec);
+    if (!copy_ec) {
+        return true;
+    }
+    std::error_code cleanup_ec;
+    fs::remove_all(importing, cleanup_ec);
+    if (error) {
+        *error = "failed to copy system image after cross-volume move failed: " +
+                 copy_ec.message();
+    }
+    return false;
+}
+
 }  // namespace
 
 std::string macmu_machine_path(const ShellOptions& options) {
@@ -306,15 +332,8 @@ bool macmu_replace_system_image_from_directory(const ShellOptions& options,
         return false;
     }
 
-    fs::copy(source_dir, importing,
-             fs::copy_options::recursive | fs::copy_options::overwrite_existing |
-                 fs::copy_options::copy_symlinks,
-             ec);
-    if (ec) {
+    if (!stage_system_image_directory(source_dir, importing, error)) {
         fs::remove_all(importing, ec);
-        if (error) {
-            *error = "failed to copy system image: " + ec.message();
-        }
         return false;
     }
     if (!system_image_exists_at(importing.string())) {

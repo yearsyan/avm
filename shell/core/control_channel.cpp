@@ -4,26 +4,14 @@
 
 #include <algorithm>
 #include <cerrno>
-#include <chrono>
 #include <cstdio>
 #include <cstring>
-#include <fcntl.h>
 #include <poll.h>
 #include <string>
 #include <sys/socket.h>
 #include <unistd.h>
 
-namespace {
-
-bool set_close_on_exec(int fd) {
-    const int flags = fcntl(fd, F_GETFD);
-    if (flags < 0) {
-        return false;
-    }
-    return fcntl(fd, F_SETFD, flags | FD_CLOEXEC) == 0;
-}
-
-}  // namespace
+#include "posix_util.h"
 
 ControlChannel::~ControlChannel() {
     stop();
@@ -36,27 +24,31 @@ bool ControlChannel::create() {
     }
     localFd_ = fds[0];
     remoteFd_ = fds[1];
-    if (!set_close_on_exec(localFd_) || !set_close_on_exec(remoteFd_)) {
+    if (!macmu::shell::set_close_on_exec(localFd_) ||
+        !macmu::shell::set_close_on_exec(remoteFd_)) {
         stop();
         return false;
     }
     return true;
 }
 
-void ControlChannel::start(EventCallback on_event, ClosedCallback on_closed) {
+void ControlChannel::start(EventCallback on_event, ClosedCallback on_closed,
+                           ReadyCallback on_ready) {
     if (localFd_ < 0 || readerThread_.joinable()) {
         return;
     }
     onEvent_ = std::move(on_event);
     onClosed_ = std::move(on_closed);
+    onReady_ = std::move(on_ready);
     alive_.store(true, std::memory_order_release);
+    ready_.store(false, std::memory_order_release);
     stopRequested_.store(false, std::memory_order_release);
     readerThread_ = std::thread([this] { reader_thread(); });
 
     // Open the conversation. The HELLO_ACK is delivered like any response.
     macmu::ControlHello hello = {macmu::kControlProtocolVersion};
-    request(macmu::ControlMessageType::kHello, &hello, sizeof(hello), 10000,
-            [](Response response) {
+    request(macmu::ControlMessageType::kHello, &hello, sizeof(hello), 30000,
+            [this](Response response) {
                 if (response.ok && response.payload.size() >= sizeof(macmu::ControlHelloAck)) {
                     macmu::ControlHelloAck ack;
                     std::memcpy(&ack, response.payload.data(), sizeof(ack));
@@ -64,6 +56,10 @@ void ControlChannel::start(EventCallback on_event, ClosedCallback on_closed) {
                                  "MacMu control channel ready (proto=%u maxDisplays=%u "
                                  "frameShm=v%u).\n",
                                  ack.protoVersion, ack.maxDisplays, ack.frameShmVersion);
+                    ready_.store(true, std::memory_order_release);
+                    if (onReady_) {
+                        onReady_();
+                    }
                 }
             });
 }
@@ -83,12 +79,18 @@ void ControlChannel::stop() {
     if (readerThread_.joinable()) {
         readerThread_.join();
     }
-    if (localFd_ >= 0) {
-        close(localFd_);
-        localFd_ = -1;
+    {
+        // Close under writeMutex_ so a concurrent write_frame can never send
+        // on a closed (and possibly kernel-reused) fd number.
+        std::lock_guard<std::mutex> lock(writeMutex_);
+        if (localFd_ >= 0) {
+            close(localFd_);
+            localFd_ = -1;
+        }
     }
     close_remote_fd();
     fail_all_pending(macmu::kControlErrInternal, "channel stopped");
+    ready_.store(false, std::memory_order_release);
     alive_.store(false, std::memory_order_release);
 }
 
@@ -106,19 +108,10 @@ void ControlChannel::request(macmu::ControlMessageType type, const void* payload
     }
     const uint32_t requestId = nextRequestId_.fetch_add(1, std::memory_order_relaxed);
     if (callback) {
-        std::lock_guard<std::mutex> lock(pendingMutex_);
-        pending_[requestId] = Pending{std::move(callback), steady_now_ms() + timeout_ms};
+        pending_.add(requestId, std::move(callback), timeout_ms);
     }
     if (!write_frame(static_cast<uint16_t>(type), requestId, payload, length)) {
-        ResponseCallback failed;
-        {
-            std::lock_guard<std::mutex> lock(pendingMutex_);
-            auto it = pending_.find(requestId);
-            if (it != pending_.end()) {
-                failed = std::move(it->second.callback);
-                pending_.erase(it);
-            }
-        }
+        ResponseCallback failed = pending_.take(requestId);
         if (failed) {
             Response response;
             response.ok = false;
@@ -219,15 +212,7 @@ void ControlChannel::reader_thread() {
             continue;
         }
 
-        ResponseCallback callback;
-        {
-            std::lock_guard<std::mutex> lock(pendingMutex_);
-            auto it = pending_.find(header.requestId);
-            if (it != pending_.end()) {
-                callback = std::move(it->second.callback);
-                pending_.erase(it);
-            }
-        }
+        ResponseCallback callback = pending_.take(header.requestId);
         if (!callback) {
             continue;  // late response after timeout: drop
         }
@@ -259,6 +244,7 @@ void ControlChannel::reader_thread() {
     }
 
     alive_.store(false, std::memory_order_release);
+    ready_.store(false, std::memory_order_release);
     fail_all_pending(macmu::kControlErrInternal, "control channel closed");
     if (onClosed_ && !stopRequested_.load(std::memory_order_acquire)) {
         onClosed_();
@@ -283,49 +269,21 @@ bool ControlChannel::read_exact(void* buffer, size_t size) {
 }
 
 void ControlChannel::fail_all_pending(int32_t code, const char* message) {
-    std::map<uint32_t, Pending> failed;
-    {
-        std::lock_guard<std::mutex> lock(pendingMutex_);
-        failed.swap(pending_);
-    }
-    for (auto& entry : failed) {
-        if (entry.second.callback) {
-            Response response;
-            response.ok = false;
-            response.errorCode = code;
-            response.errorMessage = message;
-            entry.second.callback(std::move(response));
-        }
-    }
+    pending_.fail_all([&](ResponseCallback callback) {
+        Response response;
+        response.ok = false;
+        response.errorCode = code;
+        response.errorMessage = message;
+        callback(std::move(response));
+    });
 }
 
 void ControlChannel::sweep_timeouts() {
-    const uint64_t now = steady_now_ms();
-    std::vector<ResponseCallback> expired;
-    {
-        std::lock_guard<std::mutex> lock(pendingMutex_);
-        for (auto it = pending_.begin(); it != pending_.end();) {
-            if (it->second.deadlineMs <= now) {
-                expired.push_back(std::move(it->second.callback));
-                it = pending_.erase(it);
-            } else {
-                ++it;
-            }
-        }
-    }
-    for (auto& callback : expired) {
-        if (callback) {
-            Response response;
-            response.ok = false;
-            response.errorCode = macmu::kControlErrInternal;
-            response.errorMessage = "request timed out";
-            callback(std::move(response));
-        }
-    }
-}
-
-uint64_t ControlChannel::steady_now_ms() {
-    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
-                                     std::chrono::steady_clock::now().time_since_epoch())
-                                     .count());
+    pending_.sweep_timeouts([](ResponseCallback callback) {
+        Response response;
+        response.ok = false;
+        response.errorCode = macmu::kControlErrInternal;
+        response.errorMessage = "request timed out";
+        callback(std::move(response));
+    });
 }

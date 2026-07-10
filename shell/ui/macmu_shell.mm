@@ -13,8 +13,10 @@
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 
 #include <atomic>
+#include <array>
 #include <cerrno>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -226,6 +228,9 @@ struct DisplayWindow {
 // in use. Pair with releaseUserDisplayId: when the window closes / is removed.
 - (uint32_t)allocateUserDisplayId;
 - (void)releaseUserDisplayId:(uint32_t)displayId;
+- (void)resetSecondaryDisplayStateAfterQemuExit;
+- (void)restoreDisplaySubscriptions;
+- (void)enqueueFramePresentationForDisplay:(uint32_t)displayId;
 @end
 
 @implementation MacMuAppDelegate {
@@ -282,11 +287,13 @@ struct DisplayWindow {
     std::atomic<bool> _runtimeShutdownComplete;
     std::atomic<bool> _doorbellShutdown;
     std::atomic<uint64_t> _qemuGeneration;
+    std::array<std::atomic_bool, kMacmuFrameSlotCount> _framePresentationPending;
     std::thread _qemuMonitorThread;
     std::thread _doorbellThread;
-    std::mutex _qemuMutex;
+    std::mutex _qemuExitMutex;
+    std::condition_variable _qemuExitCondition;
     std::mutex _guestInputMutex;
-    pid_t _qemuPid;
+    std::atomic<pid_t> _qemuPid;
     bool _channelReady;
 }
 
@@ -319,7 +326,10 @@ struct DisplayWindow {
     _runtimeShutdownComplete.store(false, std::memory_order_relaxed);
     _doorbellShutdown.store(true, std::memory_order_relaxed);
     _qemuGeneration.store(0, std::memory_order_relaxed);
-    _qemuPid = -1;
+    for (auto& pending : _framePresentationPending) {
+        pending.store(false, std::memory_order_relaxed);
+    }
+    _qemuPid.store(-1, std::memory_order_relaxed);
     _channelReady = false;
     return self;
 }
@@ -368,7 +378,18 @@ struct DisplayWindow {
     return YES;
 }
 
+// True once termination has begun. The runtime channel objects
+// (_frameConsumer, _guestControlClient, ...) are deleted on a background
+// thread from that point, so main-thread entry points that dereference them
+// must bail out early instead.
+- (BOOL)isShuttingDown {
+    return _shuttingDown.load(std::memory_order_acquire);
+}
+
 - (void)windowWillClose:(NSNotification*)notification {
+    if ([self isShuttingDown]) {
+        return;  // hideWindowsForTermination already tore the entries down
+    }
     NSWindow* window = [notification object];
     if (window == _appsWindow) {
         return;
@@ -382,6 +403,7 @@ struct DisplayWindow {
               _suppressRemoveOnClose.count(displayId) > 0,
               (_displayAppBindings.count(displayId) ? _displayAppBindings[displayId].c_str()
                                                     : "<none>"));
+        [self setDisplayStreaming:displayId enabled:NO];
         [self teardownDisplayWindowEntry:it->second];
         _displayWindows.erase(it);
 
@@ -394,7 +416,6 @@ struct DisplayWindow {
         // (which also stops its export streaming). Display 0 is the built-in
         // panel: its window closes, the display stays.
         if (displayId != 0) {
-            [self setDisplayStreaming:displayId enabled:NO];
             if (!suppressed) {
                 [self closeBoundAppAndRemoveDisplay:displayId];
             } else {
@@ -410,6 +431,33 @@ struct DisplayWindow {
         }
         break;
     }
+}
+
+- (void)setDisplayStreamingForWindow:(NSWindow*)window enabled:(BOOL)enabled {
+    if ([self isShuttingDown]) {
+        return;
+    }
+    for (const auto& entry : _displayWindows) {
+        if (entry.second.window == window) {
+            [self setDisplayStreaming:entry.first enabled:enabled];
+            return;
+        }
+    }
+}
+
+- (void)windowDidMiniaturize:(NSNotification*)notification {
+    [self setDisplayStreamingForWindow:notification.object enabled:NO];
+}
+
+- (void)windowDidDeminiaturize:(NSNotification*)notification {
+    [self setDisplayStreamingForWindow:notification.object enabled:YES];
+}
+
+- (void)windowDidChangeOcclusionState:(NSNotification*)notification {
+    NSWindow* window = notification.object;
+    const BOOL visible = (window.occlusionState & NSWindowOcclusionStateVisible) != 0 &&
+                         !window.miniaturized;
+    [self setDisplayStreamingForWindow:window enabled:visible];
 }
 
 - (void)teardownDisplayWindowEntry:(DisplayWindow&)entry {
@@ -730,6 +778,9 @@ struct DisplayWindow {
                         aspectWidth:(uint32_t)aspectWidth
                        aspectHeight:(uint32_t)aspectHeight
                                dpi:(uint32_t)dpi {
+    if ([self isShuttingDown]) {
+        return;
+    }
     if (!_channelReady || !_frameConsumer || !_frameConsumer->valid() || !_metalDevice) {
         NSBeep();
         return;
@@ -737,6 +788,7 @@ struct DisplayWindow {
     auto existing = _displayWindows.find(displayId);
     if (existing != _displayWindows.end()) {
         [existing->second.window makeKeyAndOrderFront:nil];
+        [self setDisplayStreaming:displayId enabled:YES];
         [NSApp activateIgnoringOtherApps:YES];
         return;
     }
@@ -800,12 +852,13 @@ struct DisplayWindow {
         entry.requestedDpi = dpi;
     }
     _displayWindows[displayId] = entry;
-
-    // VirtualDisplay-backed secondary displays have no per-frame host signal;
-    // ask qemu to pump exports while this window is sampling the display.
-    if (displayId != 0) {
-        [self setDisplayStreaming:displayId enabled:YES];
+    if (displayId > 0 && displayId <= kMaxUserDisplayId) {
+        _activeUserDisplayIds.insert(displayId);
     }
+
+    // Export is demand-driven for every display. Secondary displays also use
+    // this subscription to enable their shell-paced fallback ticker.
+    [self setDisplayStreaming:displayId enabled:YES];
 
     [self startDoorbellThreadIfNeeded];
     [NSApp activateIgnoringOtherApps:YES];
@@ -813,7 +866,7 @@ struct DisplayWindow {
 
 - (void)setDisplayStreaming:(uint32_t)displayId enabled:(BOOL)enabled {
     auto channel = [self controlChannel];
-    if (!channel || !channel->alive()) {
+    if (!channel || !channel->ready()) {
         return;
     }
     macmu::ControlDisplayStream request = {displayId, enabled ? 1u : 0u};
@@ -824,6 +877,41 @@ struct DisplayWindow {
                                    response.errorMessage.c_str());
                          }
                      });
+}
+
+// Main thread only. A secondary VirtualDisplay belongs to one QEMU process
+// generation; keeping its window/id across a backend restart would make the
+// shell send input and control requests to a display that no longer exists.
+- (void)resetSecondaryDisplayStateAfterQemuExit {
+    for (auto& entry : _displayWindows) {
+        macmu_input_view_reset_state(entry.second.view);
+    }
+    for (auto it = _displayWindows.begin(); it != _displayWindows.end();) {
+        if (it->first == 0) {
+            ++it;
+            continue;
+        }
+        NSWindow* window = it->second.window;
+        window.delegate = nil;
+        [self teardownDisplayWindowEntry:it->second];
+        [window orderOut:nil];
+        [window close];
+        it = _displayWindows.erase(it);
+    }
+    _suppressRemoveOnClose.clear();
+    _displayAppBindings.clear();
+    _activeUserDisplayIds.clear();
+}
+
+- (void)restoreDisplaySubscriptions {
+    for (const auto& entry : _displayWindows) {
+        NSWindow* window = entry.second.window;
+        const BOOL visible = window && !window.miniaturized &&
+                             (window.occlusionState & NSWindowOcclusionStateVisible) != 0;
+        if (visible) {
+            [self setDisplayStreaming:entry.first enabled:YES];
+        }
+    }
 }
 
 - (void)quitFromStatusItem:(id)sender {
@@ -956,7 +1044,7 @@ struct DisplayWindow {
             NSString* tempRoot = tempPath ? [NSString stringWithUTF8String:tempPath] : nil;
             if (ok) {
                 NSTask* task = [[NSTask alloc] init];
-                task.launchPath = @"/usr/bin/ditto";
+                task.executableURL = [NSURL fileURLWithPath:@"/usr/bin/ditto"];
                 task.arguments = @[ @"-x", @"-k", archivePath, tempRoot ];
                 NSError* launchError = nil;
                 if (![task launchAndReturnError:&launchError]) {
@@ -1034,18 +1122,32 @@ struct DisplayWindow {
 }
 
 - (void)handleControlEvent:(uint16_t)type payload:(std::vector<uint8_t>)payload {
+    if ([self isShuttingDown]) {
+        return;
+    }
     if (type != static_cast<uint16_t>(macmu::ControlMessageType::kEventDisplay) ||
         payload.size() < sizeof(macmu::ControlEventDisplay)) {
         return;
     }
     macmu::ControlEventDisplay event;
     std::memcpy(&event, payload.data(), sizeof(event));
+    if (event.state == macmu::kControlDisplayAdded && event.displayId != 0) {
+        [self openDisplayWindowForDisplay:event.displayId
+                              aspectWidth:event.width
+                             aspectHeight:event.height
+                                     dpi:event.dpi];
+        return;
+    }
     if (event.state == macmu::kControlDisplayRemoved && event.displayId != 0) {
         _displayAppBindings.erase(event.displayId);
         auto it = _displayWindows.find(event.displayId);
         if (it != _displayWindows.end()) {
             _suppressRemoveOnClose[event.displayId] = true;
             [it->second.window close];
+        } else {
+            // Guest removed a display we never opened a window for; release
+            // the id here since no windowWillClose will do it.
+            [self releaseUserDisplayId:event.displayId];
         }
     }
 }
@@ -1053,6 +1155,9 @@ struct DisplayWindow {
 - (void)requestDisplayRemove:(uint32_t)displayId {
     auto channel = [self controlChannel];
     if (!channel || !channel->alive()) {
+        // No control channel (qemu exited or is restarting): the guest-side
+        // display is already gone, but the id must still be freed locally.
+        [self releaseUserDisplayId:displayId];
         return;
     }
     macmu::ControlDisplayRemove request = {displayId};
@@ -1073,6 +1178,9 @@ struct DisplayWindow {
 }
 
 - (void)closeBoundAppAndRemoveDisplay:(uint32_t)displayId {
+    if ([self isShuttingDown]) {
+        return;
+    }
     auto binding = _displayAppBindings.find(displayId);
     if (binding == _displayAppBindings.end()) {
         [self requestDisplayRemove:displayId];
@@ -1105,6 +1213,9 @@ struct DisplayWindow {
 }
 
 - (void)newDisplay:(id)sender {
+    if ([self isShuttingDown]) {
+        return;
+    }
     auto channel = [self controlChannel];
     if (!channel || !channel->alive()) {
         [self publishQemuStatus:@"Control channel not connected"];
@@ -1154,8 +1265,19 @@ struct DisplayWindow {
                                           aspectWidth:aspectWidth
                                          aspectHeight:aspectHeight
                                                  dpi:aspectDpi];
+                if (![delegate hasDisplayWindow:ok.displayId]) {
+                    // The window could not be opened (no Metal device /
+                    // frame channel, or shutdown started). Tear the guest
+                    // display back down; the remove ack releases the id.
+                    [delegate requestDisplayRemove:ok.displayId];
+                }
             });
         });
+}
+
+// Main thread only.
+- (BOOL)hasDisplayWindow:(uint32_t)displayId {
+    return _displayWindows.find(displayId) != _displayWindows.end();
 }
 
 #pragma mark - Apps window
@@ -1176,6 +1298,9 @@ struct DisplayWindow {
 }
 
 - (void)refreshApps:(id)sender {
+    if ([self isShuttingDown]) {
+        return;
+    }
     if (!_guestControlClient || !_guestControlClient->ready()) {
         [self setAppsStatus:@"Agent not connected"];
         return;
@@ -1289,6 +1414,9 @@ struct DisplayWindow {
 }
 
 - (void)launchSelectedAppInNewDisplayWithProfile:(DisplayLaunchProfile)profile {
+    if ([self isShuttingDown]) {
+        return;
+    }
     NSString* component = [self selectedAppComponent];
     if (!component) {
         NSBeep();
@@ -1338,6 +1466,14 @@ struct DisplayWindow {
                                           aspectWidth:aspectWidth
                                          aspectHeight:aspectHeight
                                                  dpi:aspectDpi];
+                if (![delegate hasDisplayWindow:ok.displayId]) {
+                    // Window open failed (no Metal device / frame channel, or
+                    // shutdown started): don't bind or launch the app, and
+                    // tear the guest display back down so the id is released.
+                    [delegate setAppsStatus:@"Display window unavailable"];
+                    [delegate requestDisplayRemove:ok.displayId];
+                    return;
+                }
                 delegate->_displayAppBindings[ok.displayId] = [component UTF8String];
                 // Give the guest a brief moment to register the new
                 // VirtualDisplay, then launch. The agent also waits on the
@@ -1353,6 +1489,9 @@ struct DisplayWindow {
 }
 
 - (void)launchComponent:(NSString*)component onDisplay:(uint32_t)displayId {
+    if ([self isShuttingDown]) {
+        return;
+    }
     if (!_guestControlClient || !_guestControlClient->ready()) {
         [self setAppsStatus:@"Agent not connected"];
         return;
@@ -1504,8 +1643,15 @@ struct DisplayWindow {
             std::this_thread::sleep_for(std::chrono::seconds(2));
             continue;
         }
+        if (_inputSender) {
+            _inputSender->set_enabled(true);
+        }
 
         MacMuAppDelegate* delegate = self;
+        {
+            std::lock_guard<std::mutex> lock(_controlMutex);
+            _controlChannel = controlChannel;
+        }
         controlChannel->start(
             [delegate](uint16_t type, std::vector<uint8_t> payload) {
                 // Reader thread -> main queue.
@@ -1514,19 +1660,17 @@ struct DisplayWindow {
                     [delegate handleControlEvent:type payload:std::move(*shared)];
                 });
             },
-            [] {});
-        {
-            std::lock_guard<std::mutex> lock(_controlMutex);
-            _controlChannel = controlChannel;
-        }
+            [] {},
+            [delegate] {
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    [delegate restoreDisplaySubscriptions];
+                });
+            });
 
-        {
-            std::lock_guard<std::mutex> lock(_qemuMutex);
-            _qemuPid = pid;
-        }
+        _qemuPid.store(pid, std::memory_order_release);
         _qemuGeneration.fetch_add(1, std::memory_order_acq_rel);
         if (_shuttingDown.load(std::memory_order_acquire)) {
-            terminate_qemu(pid);
+            request_qemu_termination(pid);
         } else {
             [self publishQemuStatus:[NSString stringWithFormat:@"Running (pid %d)", pid]];
             dispatch_async(dispatch_get_main_queue(), ^{
@@ -1541,12 +1685,13 @@ struct DisplayWindow {
             }
             break;
         }
+        if (_inputSender) {
+            _inputSender->set_enabled(false);
+        }
 
-        {
-            std::lock_guard<std::mutex> lock(_qemuMutex);
-            if (_qemuPid == pid) {
-                _qemuPid = -1;
-            }
+        pid_t expectedPid = pid;
+        if (_qemuPid.compare_exchange_strong(expectedPid, -1, std::memory_order_acq_rel)) {
+            _qemuExitCondition.notify_all();
         }
         {
             std::lock_guard<std::mutex> lock(_controlMutex);
@@ -1555,13 +1700,13 @@ struct DisplayWindow {
         controlChannel->stop();
         controlChannel.reset();
 
-        dispatch_async(dispatch_get_main_queue(), ^{
-            [delegate updateMachineControls];
-        });
-
         if (_shuttingDown.load(std::memory_order_acquire)) {
             break;
         }
+        dispatch_sync(dispatch_get_main_queue(), ^{
+            [delegate resetSecondaryDisplayStateAfterQemuExit];
+            [delegate updateMachineControls];
+        });
         [self publishQemuStatus:@"Exited; restarting"];
         std::this_thread::sleep_for(std::chrono::seconds(1));
     }
@@ -1575,8 +1720,7 @@ struct DisplayWindow {
 }
 
 - (pid_t)currentQemuPid {
-    std::lock_guard<std::mutex> lock(_qemuMutex);
-    return _qemuPid;
+    return _qemuPid.load(std::memory_order_acquire);
 }
 
 #pragma mark - Frame doorbell
@@ -1611,16 +1755,41 @@ struct DisplayWindow {
         }
         lastFrames[readyDisplayId] = meta.frame;
 
-        MacMuAppDelegate* delegate = self;
         const uint32_t displayId = readyDisplayId;
-        const uint32_t actualWidth = meta.width;
-        const uint32_t actualHeight = meta.height;
-        dispatch_async(dispatch_get_main_queue(), ^{
-            [delegate presentFrameForDisplay:displayId
-                                 actualWidth:actualWidth
-                                actualHeight:actualHeight];
-        });
+        [self enqueueFramePresentationForDisplay:displayId];
     }
+}
+
+- (void)enqueueFramePresentationForDisplay:(uint32_t)displayId {
+    if (displayId >= kMacmuFrameSlotCount ||
+        _framePresentationPending[displayId].exchange(true, std::memory_order_acq_rel)) {
+        return;
+    }
+    MacMuAppDelegate* delegate = self;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        SurfaceMetadata latest = {};
+        uint64_t presentedFrame = 0;
+        if (![delegate isShuttingDown] && delegate->_frameConsumer &&
+            delegate->_frameConsumer->read(displayId, &latest)) {
+            presentedFrame = latest.frame;
+            [delegate presentFrameForDisplay:displayId
+                                 actualWidth:latest.width
+                                actualHeight:latest.height];
+        }
+
+        delegate->_framePresentationPending[displayId].store(false,
+                                                              std::memory_order_release);
+
+        // A doorbell may have advanced the consumer cursor while this main-
+        // queue block was pending. Re-arm exactly once for the newest slot so
+        // coalescing cannot lose the final redraw.
+        SurfaceMetadata after = {};
+        if (![delegate isShuttingDown] && delegate->_frameConsumer &&
+            delegate->_frameConsumer->read(displayId, &after) &&
+            after.frame != presentedFrame) {
+            [delegate enqueueFramePresentationForDisplay:displayId];
+        }
+    });
 }
 
 // Main thread. Marks the display's view dirty; auto-opens a window when a
@@ -1687,8 +1856,10 @@ struct DisplayWindow {
 
 - (void)hideWindowsForTermination {
     for (auto& entry : _displayWindows) {
+        NSWindow* window = entry.second.window;
+        window.delegate = nil;
         [self teardownDisplayWindowEntry:entry.second];
-        [entry.second.window orderOut:nil];
+        [window orderOut:nil];
     }
     _displayWindows.clear();
     [_appsWindow orderOut:nil];
@@ -1729,7 +1900,14 @@ struct DisplayWindow {
 
     const pid_t pid = [self currentQemuPid];
     if (pid > 0) {
-        terminate_qemu(pid);
+        request_qemu_termination(pid);
+        std::unique_lock<std::mutex> lock(_qemuExitMutex);
+        const bool exited = _qemuExitCondition.wait_for(
+            lock, std::chrono::seconds(5),
+            [self, pid] { return self->_qemuPid.load(std::memory_order_acquire) != pid; });
+        if (!exited && _qemuPid.load(std::memory_order_acquire) == pid) {
+            force_kill_qemu(pid);
+        }
     }
     if (_qemuMonitorThread.joinable()) {
         _qemuMonitorThread.join();

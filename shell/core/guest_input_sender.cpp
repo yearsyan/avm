@@ -18,19 +18,13 @@
 #include <sys/un.h>
 #include <unistd.h>
 
+#include "posix_util.h"
+#include "unix_listener.h"
+
 namespace {
 
 namespace fs = std::filesystem;
-
-std::string path_join(const std::string& lhs, const std::string& rhs) {
-    if (lhs.empty()) {
-        return rhs;
-    }
-    if (lhs.back() == '/') {
-        return lhs + rhs;
-    }
-    return lhs + "/" + rhs;
-}
+using macmu::shell::path_join;
 
 void ensure_directory_best_effort(const std::string& path) {
     std::error_code ec;
@@ -73,77 +67,6 @@ void close_fd(int fd) {
     }
 }
 
-void wake_listener(const std::string& path) {
-    if (path.empty()) {
-        return;
-    }
-    const int fd = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (fd < 0) {
-        return;
-    }
-
-    sockaddr_un addr = {};
-    addr.sun_family = AF_UNIX;
-    std::snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", path.c_str());
-    connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
-    close(fd);
-}
-
-int create_listener(const std::string& path, const std::string& log_path) {
-    sockaddr_un addr = {};
-    if (path.empty() || path.size() >= sizeof(addr.sun_path)) {
-        log_message(log_path, "invalid Unix socket path: %s", path.c_str());
-        return -1;
-    }
-
-    const int fd = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (fd < 0) {
-        log_message(log_path, "socket(listener) failed: %s", std::strerror(errno));
-        return -1;
-    }
-
-    unlink(path.c_str());
-
-    addr.sun_family = AF_UNIX;
-    std::snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", path.c_str());
-    if (bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
-        log_message(log_path, "bind(listener:%s) failed: %s", path.c_str(), std::strerror(errno));
-        close(fd);
-        return -1;
-    }
-    if (listen(fd, 1) != 0) {
-        log_message(log_path, "listen failed: %s", std::strerror(errno));
-        close(fd);
-        return -1;
-    }
-
-    return fd;
-}
-
-bool perform_handshake(int fd) {
-#ifdef SO_NOSIGPIPE
-    int enabled = 1;
-    setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &enabled, sizeof(enabled));
-#endif
-
-    const char ping[] = "v\n";
-    if (send(fd, ping, sizeof(ping) - 1, 0) != static_cast<ssize_t>(sizeof(ping) - 1)) {
-        return false;
-    }
-
-    pollfd pfd = {};
-    pfd.fd = fd;
-    pfd.events = POLLIN;
-    const int pollResult = poll(&pfd, 1, 2000);
-    if (pollResult <= 0 || !(pfd.revents & POLLIN)) {
-        return false;
-    }
-
-    char response[16] = {};
-    const ssize_t readBytes = read(fd, response, sizeof(response) - 1);
-    return readBytes >= 2 && std::strstr(response, "ok") != nullptr;
-}
-
 void set_nonblocking(int fd) {
     const int flags = fcntl(fd, F_GETFL, 0);
     if (flags >= 0) {
@@ -161,7 +84,10 @@ bool GuestInputSender::start(const std::string& socket_path, const std::string& 
     stop();
 
     m_logPath = log_path_for(app_data_dir);
-    const int fd = create_listener(socket_path, m_logPath);
+    const int fd = macmu::shell::create_unix_listener(
+        socket_path, [this](const std::string& message) {
+            log_message(m_logPath, "%s", message.c_str());
+        });
     if (fd < 0) {
         return false;
     }
@@ -182,7 +108,7 @@ void GuestInputSender::stop() {
         shutdown(listenFd, SHUT_RDWR);
         close(listenFd);
     }
-    wake_listener(m_socketPath);
+    macmu::shell::wake_unix_listener(m_socketPath);
 
     {
         std::lock_guard<std::mutex> lock(m_socketMutex);
@@ -199,21 +125,21 @@ void GuestInputSender::stop() {
     }
 }
 
-void GuestInputSender::send_hover(uint32_t display_id, int x, int y) {
+bool GuestInputSender::send_hover(uint32_t display_id, int x, int y) {
     char line[96];
     const int len = std::snprintf(line, sizeof(line), "h %u %d %d\n", display_id, x, y);
     if (len <= 0 || len >= static_cast<int>(sizeof(line))) {
-        return;
+        return false;
     }
-    send_line(line, len);
+    return send_line(line, len, false);
 }
 
-void GuestInputSender::send_hover_exit() {
+bool GuestInputSender::send_hover_exit() {
     static constexpr char kLine[] = "e\n";
-    send_line(kLine, static_cast<int>(sizeof(kLine) - 1));
+    return send_line(kLine, static_cast<int>(sizeof(kLine) - 1), true);
 }
 
-void GuestInputSender::send_scroll(uint32_t display_id,
+bool GuestInputSender::send_scroll(uint32_t display_id,
                                    int x,
                                    int y,
                                    float hscroll,
@@ -221,19 +147,19 @@ void GuestInputSender::send_scroll(uint32_t display_id,
     const int hscrollMilli = milliscroll(hscroll);
     const int vscrollMilli = milliscroll(vscroll);
     if (hscrollMilli == 0 && vscrollMilli == 0) {
-        return;
+        return true;
     }
 
     char line[128];
     const int len = std::snprintf(line, sizeof(line), "s %u %d %d %d %d\n", display_id, x, y,
                                   hscrollMilli, vscrollMilli);
     if (len <= 0 || len >= static_cast<int>(sizeof(line))) {
-        return;
+        return false;
     }
-    send_line(line, len);
+    return send_line(line, len, false);
 }
 
-void GuestInputSender::send_touch(macmu::InputEventKind kind,
+bool GuestInputSender::send_touch(macmu::InputEventKind kind,
                                   uint32_t display_id,
                                   int pointer_id,
                                   int x,
@@ -250,36 +176,36 @@ void GuestInputSender::send_touch(macmu::InputEventKind kind,
             phase = 'e';
             break;
         default:
-            return;
+            return false;
     }
 
     char line[128];
     const int len = std::snprintf(line, sizeof(line), "t %u %d %c %d %d\n", display_id,
                                   pointer_id, phase, x, y);
     if (len <= 0 || len >= static_cast<int>(sizeof(line))) {
-        return;
+        return false;
     }
-    send_line(line, len);
+    return send_line(line, len, phase != 'm');
 }
 
-void GuestInputSender::send_mouse_move(uint32_t display_id, int x, int y, uint32_t buttons) {
+bool GuestInputSender::send_mouse_move(uint32_t display_id, int x, int y, uint32_t buttons) {
     char line[128];
     const int len = std::snprintf(line, sizeof(line), "m %u %d %d %u\n", display_id, x, y,
                                   buttons);
     if (len <= 0 || len >= static_cast<int>(sizeof(line))) {
-        return;
+        return false;
     }
-    send_line(line, len);
+    return send_line(line, len, false);
 }
 
-void GuestInputSender::send_mouse_button(uint32_t display_id, int x, int y, uint32_t buttons) {
+bool GuestInputSender::send_mouse_button(uint32_t display_id, int x, int y, uint32_t buttons) {
     char line[128];
     const int len = std::snprintf(line, sizeof(line), "b %u %d %d %u\n", display_id, x, y,
                                   buttons);
     if (len <= 0 || len >= static_cast<int>(sizeof(line))) {
-        return;
+        return false;
     }
-    send_line(line, len);
+    return send_line(line, len, true);
 }
 
 void GuestInputSender::accept_thread() {
@@ -303,7 +229,13 @@ void GuestInputSender::accept_thread() {
             continue;
         }
 
-        if (!perform_handshake(fd)) {
+        if (!macmu::shell::set_close_on_exec(fd)) {
+            log_message(m_logPath, "failed to set FD_CLOEXEC on guest RPC connection");
+            close(fd);
+            continue;
+        }
+
+        if (!macmu::shell::perform_unix_pipe_handshake(fd)) {
             log_message(m_logPath, "guest RPC handshake failed");
             close(fd);
             continue;
@@ -326,18 +258,28 @@ void GuestInputSender::close_client_locked() {
     close_fd(fd);
 }
 
-bool GuestInputSender::send_line(const char* line, int len) {
+bool GuestInputSender::send_line(const char* line, int len, bool reliable) {
     std::lock_guard<std::mutex> lock(m_socketMutex);
     const int fd = m_writeFd.load(std::memory_order_acquire);
     if (fd < 0) {
         return false;
     }
 
-    const ssize_t written = send(fd, line, static_cast<size_t>(len), 0);
+    ssize_t written = send(fd, line, static_cast<size_t>(len), 0);
+    if (written < 0 && reliable && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+        pollfd pfd = {fd, POLLOUT, 0};
+        int pollResult;
+        do {
+            pollResult = poll(&pfd, 1, 5);
+        } while (pollResult < 0 && errno == EINTR);
+        if (pollResult > 0 && (pfd.revents & POLLOUT)) {
+            written = send(fd, line, static_cast<size_t>(len), 0);
+        }
+    }
     if (written == static_cast<ssize_t>(len)) {
         return true;
     }
-    if (written < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+    if (!reliable && written < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
         return false;
     }
 

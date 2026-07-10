@@ -38,6 +38,7 @@ using macmu::ControlMessageType;
 // User-creatable display ids are 1..kMaxUserDisplayId; ids above that are the
 // emulator-internal range used for guest-initiated displays.
 constexpr uint32_t kMaxUserDisplayId = 5;
+constexpr uint32_t kFrameSlotCount = 16;
 
 uint64_t steady_now_ns() {
     return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -69,6 +70,7 @@ public:
             return;
         }
         mFd = fd;
+        mStopRequested.store(false, std::memory_order_release);
         mRunning.store(true, std::memory_order_relaxed);
         mThread = std::thread([this] { thread_loop(); });
         dinfo("MacMu control receiver listening on inherited fd %d", mFd);
@@ -78,9 +80,7 @@ public:
         std::thread thread;
         {
             std::lock_guard<std::mutex> lock(mStateMutex);
-            if (!mRunning.load(std::memory_order_relaxed)) {
-                return;
-            }
+            mStopRequested.store(true, std::memory_order_release);
             mRunning.store(false, std::memory_order_relaxed);
             if (mFd >= 0) {
                 // Shut down reads so the reader thread unblocks; the write
@@ -125,6 +125,17 @@ private:
             handle_frame(header, std::move(payload));
         }
         mRunning.store(false, std::memory_order_relaxed);
+        android_resetDisplayExportSubscriptions();
+
+        if (!mStopRequested.load(std::memory_order_acquire) && android_getMainLooper()) {
+            dwarning("MacMu control: shell lease ended; requesting QEMU shutdown.");
+            android::base::ThreadLooper::runOnMainLooper([] {
+                const auto* agents = getConsoleAgents();
+                if (agents && agents->vm && agents->vm->system_shutdown_request) {
+                    agents->vm->system_shutdown_request(QEMU_SHUTDOWN_CAUSE_HOST_UI);
+                }
+            });
+        }
     }
 
     bool read_exact(void* buffer, size_t size) {
@@ -238,9 +249,9 @@ private:
                 }
                 macmu::ControlDisplayStream request;
                 std::memcpy(&request, payload.data(), sizeof(request));
-                if (request.displayId == 0) {
+                if (request.displayId >= kFrameSlotCount) {
                     send_error(header.requestId, macmu::kControlErrInvalidArgument,
-                               "display 0 streams via its own present path");
+                               "display id exceeds frame slot table");
                     return;
                 }
                 set_display_streaming(request.displayId, request.enabled != 0);
@@ -404,13 +415,20 @@ private:
     // Shell-paced display streaming: VirtualDisplay-backed secondary displays
     // update their bound ColorBuffer in place with no per-frame host signal,
     // so while the shell has a window on a display it asks us to pump exports
-    // at ~60 Hz. The set is tiny (user displays 1..5).
+    // as a low-rate liveness fallback. Normal frames are event-driven by
+    // ColorBuffer BIND/flush notifications; the fallback must not turn a
+    // static display into continuous GPU work. The set is tiny (1..5).
     // ------------------------------------------------------------------
 
     void set_display_streaming(uint32_t displayId, bool enabled) {
+        android_setDisplayExportEnabled(displayId, enabled);
+        if (displayId == 0) {
+            return;
+        }
         std::lock_guard<std::mutex> lock(mStreamMutex);
         if (enabled) {
             mStreamingDisplays.insert(displayId);
+            android_exportDisplayFrame(displayId);
             if (!mStreamThread.joinable()) {
                 mStreamThread = std::thread([this] { stream_loop(); });
             }
@@ -435,12 +453,15 @@ private:
             for (const uint32_t displayId : displays) {
                 android_exportDisplayFrame(displayId);
             }
-            std::this_thread::sleep_for(std::chrono::milliseconds(16));
             lock.lock();
+            mStreamCondition.wait_for(lock, std::chrono::seconds(1), [this] {
+                return !mRunning.load(std::memory_order_relaxed) || mStreamingDisplays.empty();
+            });
         }
     }
 
     void stop_stream_thread() {
+        android_resetDisplayExportSubscriptions();
         {
             std::lock_guard<std::mutex> lock(mStreamMutex);
             mStreamingDisplays.clear();
@@ -454,6 +475,7 @@ private:
     std::mutex mStateMutex;
     std::mutex mWriteMutex;
     std::atomic<bool> mRunning{false};
+    std::atomic<bool> mStopRequested{false};
     int mFd = -1;
     std::thread mThread;
     std::mutex mStreamMutex;

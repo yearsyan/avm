@@ -16,5 +16,6 @@ MTKView* macmu_input_view_create(NSRect frame,
                                  GuestInputSender* guest_input_sender);
 
 void macmu_input_view_set_renderer(MTKView* view, MacMuSurfaceRendererRef renderer);
+void macmu_input_view_reset_state(MTKView* view);
 
 #endif  // MACMU_SHELL_INPUT_VIEW_H

@@ -16,8 +16,10 @@
 #include <unistd.h>
 
 #include "macmu_input_protocol.h"
+#include "posix_util.h"
 
 namespace {
+using macmu::shell::path_join;
 
 std::string env_or_default(const char* name, const std::string& fallback) {
     if (const char* value = std::getenv(name)) {
@@ -31,16 +33,6 @@ std::string env_or_default(const char* name, const std::string& fallback) {
 std::string env_or_default(const char* name, const char* legacy_name,
                            const std::string& fallback) {
     return env_or_default(name, env_or_default(legacy_name, fallback));
-}
-
-std::string path_join(const std::string& lhs, const std::string& rhs) {
-    if (lhs.empty()) {
-        return rhs;
-    }
-    if (lhs.back() == '/') {
-        return lhs + rhs;
-    }
-    return lhs + "/" + rhs;
 }
 
 std::string directory_name(const std::string& path) {

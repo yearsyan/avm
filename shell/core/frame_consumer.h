@@ -22,6 +22,7 @@
 #define MACMU_SHELL_FRAME_CONSUMER_H
 
 #include <cstdint>
+#include <mutex>
 #include <string>
 
 #include "surface_metadata.h"
@@ -76,6 +77,8 @@ class FrameConsumer {
     void* slots_ = nullptr;  // ShmDisplaySlot* (defined locally in the .cpp)
     int doorbellFd_ = -1;
     int producerDoorbellFd_ = -1;
+    uint32_t nextScanStart_ = 0;
+    mutable std::mutex slotsMutex_;
     bool valid_ = false;
 };
 

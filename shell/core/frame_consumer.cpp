@@ -11,12 +11,13 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
-#include <fcntl.h>
 #include <poll.h>
 #include <string>
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <unistd.h>
+
+#include "posix_util.h"
 
 namespace {
 
@@ -70,14 +71,6 @@ std::string shm_path(const std::string& name) {
     return name.find('/') == std::string::npos ? std::string("/") + name : name;
 }
 
-bool set_close_on_exec(int fd) {
-    const int flags = fcntl(fd, F_GETFD);
-    if (flags < 0) {
-        return false;
-    }
-    return fcntl(fd, F_SETFD, flags | FD_CLOEXEC) == 0;
-}
-
 void set_socket_buffer_size_best_effort(int fd, int option) {
     int size = kDoorbellSocketBufferBytes;
     setsockopt(fd, SOL_SOCKET, option, &size, sizeof(size));
@@ -121,7 +114,8 @@ bool FrameConsumer::create(uint32_t wrapper_pid) {
     }
     doorbellFd_ = doorbellPair[0];
     producerDoorbellFd_ = doorbellPair[1];
-    if (!set_close_on_exec(doorbellFd_) || !set_close_on_exec(producerDoorbellFd_)) {
+    if (!macmu::shell::set_close_on_exec(doorbellFd_) ||
+        !macmu::shell::set_close_on_exec(producerDoorbellFd_)) {
         teardown();
         return false;
     }
@@ -140,6 +134,7 @@ void FrameConsumer::close_producer_doorbell_fd() {
 }
 
 void FrameConsumer::reset_slots() {
+    std::lock_guard<std::mutex> lock(slotsMutex_);
     if (!valid_ || !slots_) {
         return;
     }
@@ -148,20 +143,23 @@ void FrameConsumer::reset_slots() {
 }
 
 bool FrameConsumer::read(uint32_t display_id, SurfaceMetadata* out) {
+    std::lock_guard<std::mutex> lock(slotsMutex_);
     if (!valid_ || out == nullptr || display_id >= kMacmuFrameSlotCount) return false;
     ShmDisplaySlot* slot = static_cast<ShmDisplaySlot*>(slots_) + display_id;
     for (int attempt = 0; attempt < 8; ++attempt) {
-        const uint64_t s0 = slot->seq;
+        // The seq words are shared with another process; they must be read
+        // with atomic ops so the compiler cannot hoist or fold the loads
+        // across retries. The fences order the payload reads between them.
+        const uint64_t s0 = __atomic_load_n(&slot->seq, __ATOMIC_ACQUIRE);
         if (s0 & 1) {
             continue;
         }
-        std::atomic_thread_fence(std::memory_order_acquire);
         const MacmuIOSurfaceID iosurfaceId = static_cast<MacmuIOSurfaceID>(slot->iosurfaceId);
         const uint32_t width = slot->width;
         const uint32_t height = slot->height;
         const uint64_t frame = slot->frame;
         std::atomic_thread_fence(std::memory_order_acquire);
-        const uint64_t s1 = slot->seq;
+        const uint64_t s1 = __atomic_load_n(&slot->seq, __ATOMIC_RELAXED);
         if (s0 == s1) {
             out->displayId = display_id;
             out->iosurfaceId = iosurfaceId;
@@ -175,9 +173,12 @@ bool FrameConsumer::read(uint32_t display_id, SurfaceMetadata* out) {
 }
 
 bool FrameConsumer::scan_slots(const uint64_t* last_frames, uint32_t* out_display_id) {
-    for (uint32_t id = 0; id < kMacmuFrameSlotCount; ++id) {
+    const uint32_t start = nextScanStart_ % kMacmuFrameSlotCount;
+    for (uint32_t offset = 0; offset < kMacmuFrameSlotCount; ++offset) {
+        const uint32_t id = (start + offset) % kMacmuFrameSlotCount;
         SurfaceMetadata meta = {};
         if (read(id, &meta) && meta.frame != 0 && meta.frame != last_frames[id]) {
+            nextScanStart_ = (id + 1) % kMacmuFrameSlotCount;
             if (out_display_id) {
                 *out_display_id = id;
             }

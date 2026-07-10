@@ -47,6 +47,61 @@ bool renderer_debug_logs_enabled() {
     return enabled;
 }
 
+NSMutableDictionary<NSString*, id<MTLRenderPipelineState>>* surface_pipeline_cache() {
+    static NSMutableDictionary<NSString*, id<MTLRenderPipelineState>>* cache =
+        [[NSMutableDictionary alloc] init];
+    return cache;
+}
+
+id<MTLRenderPipelineState> cached_surface_pipeline(id<MTLDevice> device,
+                                                   MTLPixelFormat pixelFormat,
+                                                   NSError** error) {
+    NSMutableDictionary<NSString*, id<MTLRenderPipelineState>>* cache = surface_pipeline_cache();
+    NSString* key = [NSString stringWithFormat:@"%llu:%lu",
+                                               static_cast<unsigned long long>(device.registryID),
+                                               static_cast<unsigned long>(pixelFormat)];
+    @synchronized(cache) {
+        id<MTLRenderPipelineState> cached = [cache objectForKey:key];
+        if (cached) {
+            if (error) {
+                *error = nil;
+            }
+            return cached;
+        }
+
+        NSError* localError = nil;
+        id<MTLLibrary> library =
+            [device newLibraryWithSource:[NSString stringWithUTF8String:kSurfaceShaderSource]
+                                 options:nil
+                                   error:&localError];
+        if (!library) {
+            if (error) {
+                *error = localError;
+            }
+            return nil;
+        }
+
+        MTLRenderPipelineDescriptor* descriptor = [[MTLRenderPipelineDescriptor alloc] init];
+        descriptor.vertexFunction = [library newFunctionWithName:@"vertexMain"];
+        descriptor.fragmentFunction = [library newFunctionWithName:@"fragmentMain"];
+        descriptor.colorAttachments[0].pixelFormat = pixelFormat;
+        id<MTLRenderPipelineState> pipeline =
+            [device newRenderPipelineStateWithDescriptor:descriptor error:&localError];
+        if (!pipeline) {
+            if (error) {
+                *error = localError;
+            }
+            return nil;
+        }
+
+        [cache setObject:pipeline forKey:key];
+        if (error) {
+            *error = nil;
+        }
+        return pipeline;
+    }
+}
+
 }  // namespace
 
 @interface MacMuSurfaceRenderer : NSObject <MTKViewDelegate>
@@ -103,19 +158,7 @@ bool renderer_debug_logs_enabled() {
     _cachedViewport = Viewport{};
 
     NSError* error = nil;
-    id<MTLLibrary> library = [_device newLibraryWithSource:[NSString stringWithUTF8String:kSurfaceShaderSource]
-                                                   options:nil
-                                                     error:&error];
-    if (!library) {
-        NSLog(@"Failed to build Metal library: %@", error);
-        return nil;
-    }
-
-    MTLRenderPipelineDescriptor* descriptor = [[MTLRenderPipelineDescriptor alloc] init];
-    descriptor.vertexFunction = [library newFunctionWithName:@"vertexMain"];
-    descriptor.fragmentFunction = [library newFunctionWithName:@"fragmentMain"];
-    descriptor.colorAttachments[0].pixelFormat = view.colorPixelFormat;
-    _pipeline = [_device newRenderPipelineStateWithDescriptor:descriptor error:&error];
+    _pipeline = cached_surface_pipeline(_device, view.colorPixelFormat, &error);
     if (!_pipeline) {
         NSLog(@"Failed to create Metal pipeline: %@", error);
         return nil;

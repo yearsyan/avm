@@ -17,13 +17,13 @@
 #include <atomic>
 #include <cstdint>
 #include <functional>
-#include <map>
 #include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
 
 #include "macmu_control_protocol.h"
+#include "pending_request_table.h"
 
 class ControlChannel {
    public:
@@ -38,6 +38,7 @@ class ControlChannel {
     // type, payload. Fired on the reader thread.
     using EventCallback = std::function<void(uint16_t, std::vector<uint8_t>)>;
     using ClosedCallback = std::function<void()>;
+    using ReadyCallback = std::function<void()>;
 
     ControlChannel() = default;
     ~ControlChannel();
@@ -49,7 +50,8 @@ class ControlChannel {
 
     // Set callbacks, then start the reader thread and send HELLO. Call after
     // create(); safe to call before or after the child spawn.
-    void start(EventCallback on_event, ClosedCallback on_closed);
+    void start(EventCallback on_event, ClosedCallback on_closed,
+               ReadyCallback on_ready = {});
 
     // The end inherited by qemu (dup2 target: macmu::kControlChildFd). Close
     // it in the parent right after posix_spawn so EOF detection works.
@@ -57,6 +59,7 @@ class ControlChannel {
     void close_remote_fd();
 
     bool alive() const { return alive_.load(std::memory_order_acquire); }
+    bool ready() const { return ready_.load(std::memory_order_acquire); }
 
     // Send a request; |callback| fires with the response, an ERROR, or a
     // timeout/channel-death failure. |timeout_ms| is enforced by the reader
@@ -67,29 +70,24 @@ class ControlChannel {
     void stop();
 
    private:
-    struct Pending {
-        ResponseCallback callback;
-        uint64_t deadlineMs = 0;
-    };
-
     void reader_thread();
     bool read_exact(void* buffer, size_t size);
     bool write_frame(uint16_t type, uint32_t request_id, const void* payload, uint32_t length);
     void fail_all_pending(int32_t code, const char* message);
     void sweep_timeouts();
-    static uint64_t steady_now_ms();
 
     int localFd_ = -1;
     int remoteFd_ = -1;
     std::atomic<bool> alive_{false};
+    std::atomic<bool> ready_{false};
     std::atomic<bool> stopRequested_{false};
     std::atomic<uint32_t> nextRequestId_{1};
     std::thread readerThread_;
     std::mutex writeMutex_;
-    std::mutex pendingMutex_;
-    std::map<uint32_t, Pending> pending_;
+    macmu::shell::PendingRequestTable<uint32_t, ResponseCallback> pending_;
     EventCallback onEvent_;
     ClosedCallback onClosed_;
+    ReadyCallback onReady_;
 };
 
 #endif  // MACMU_SHELL_CONTROL_CHANNEL_H

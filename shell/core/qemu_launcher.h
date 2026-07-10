@@ -23,8 +23,9 @@
 pid_t launch_qemu(const ShellOptions& options, int frameDoorbellFd = -1, int inputFd = -1,
                   int controlFd = -1);
 
-// SIGTERM (then SIGKILL after ~5s) the process group rooted at |pid|. No-op for
-// non-positive pids; safe to call on an already-reaped child.
-void terminate_qemu(pid_t pid);
+// Signal the process group rooted at |pid|. These functions never call
+// waitpid(): the supervisor thread is the single owner of child reaping.
+void request_qemu_termination(pid_t pid);
+void force_kill_qemu(pid_t pid);
 
 #endif  // MACMU_SHELL_QEMU_LAUNCHER_H

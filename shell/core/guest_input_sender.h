@@ -24,21 +24,21 @@ public:
     std::string socket_path() const { return m_socketPath; }
     bool ready() const { return m_writeFd.load(std::memory_order_acquire) >= 0; }
 
-    void send_hover(uint32_t display_id, int x, int y);
-    void send_hover_exit();
-    void send_scroll(uint32_t display_id, int x, int y, float hscroll, float vscroll);
-    void send_touch(macmu::InputEventKind kind,
+    bool send_hover(uint32_t display_id, int x, int y);
+    bool send_hover_exit();
+    bool send_scroll(uint32_t display_id, int x, int y, float hscroll, float vscroll);
+    bool send_touch(macmu::InputEventKind kind,
                     uint32_t display_id,
                     int pointer_id,
                     int x,
                     int y);
-    void send_mouse_move(uint32_t display_id, int x, int y, uint32_t buttons);
-    void send_mouse_button(uint32_t display_id, int x, int y, uint32_t buttons);
+    bool send_mouse_move(uint32_t display_id, int x, int y, uint32_t buttons);
+    bool send_mouse_button(uint32_t display_id, int x, int y, uint32_t buttons);
 
 private:
     void accept_thread();
     void close_client_locked();
-    bool send_line(const char* line, int len);
+    bool send_line(const char* line, int len, bool reliable);
 
     std::mutex m_socketMutex;
     std::string m_socketPath;

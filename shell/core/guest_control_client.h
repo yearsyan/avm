@@ -17,10 +17,11 @@
 #include <atomic>
 #include <cstdint>
 #include <functional>
-#include <map>
 #include <mutex>
 #include <string>
 #include <thread>
+
+#include "pending_request_table.h"
 
 class GuestControlClient {
    public:
@@ -43,17 +44,11 @@ class GuestControlClient {
     void request(const std::string& command, uint64_t timeout_ms, ResponseCallback callback);
 
    private:
-    struct Pending {
-        ResponseCallback callback;
-        uint64_t deadlineMs = 0;
-    };
-
     void accept_thread();
     void serve_connection(int fd);
     void handle_line(const std::string& line);
     void fail_all_pending(const char* message);
     void sweep_timeouts();
-    static uint64_t steady_now_ms();
 
     std::string socketPath_;
     std::atomic<int> listenFd_{-1};
@@ -61,8 +56,7 @@ class GuestControlClient {
     std::atomic<bool> stopRequested_{false};
     std::thread acceptThread_;
     std::mutex writeMutex_;
-    std::mutex pendingMutex_;
-    std::map<uint64_t, Pending> pending_;
+    macmu::shell::PendingRequestTable<uint64_t, ResponseCallback> pending_;
     std::atomic<uint64_t> nextRequestId_{1};
 };
 

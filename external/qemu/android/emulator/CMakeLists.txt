@@ -92,6 +92,24 @@ if(TARGET RUNTIME_OS_DEPENDENCIES)
           RUNTIME DESTINATION lib64)
 endif()
 android_install_dependency_force_exec(all E2FSPROGS_DEPENDENCIES)
+if(APPLE)
+  # The prebuilt ext4 tools are unsigned. macOS 26 kills them at exec time
+  # when launched by the signed emulator, which makes userdata resize fail
+  # even though the files are present and executable. Ad-hoc sign the installed
+  # copies; these helpers do not require the emulator's HVF entitlements.
+  install(CODE [[
+    foreach(_helper e2fsck fsck.ext4 mkfs.ext4 resize2fs tune2fs)
+      set(_path "$ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}/bin64/${_helper}")
+      message(STATUS "Signing   : ${_path}")
+      execute_process(
+        COMMAND /usr/bin/codesign --force --sign - "${_path}"
+        RESULT_VARIABLE _codesign_result)
+      if(NOT _codesign_result EQUAL 0)
+        message(FATAL_ERROR "Failed to sign ${_path}: ${_codesign_result}")
+      endif()
+    endforeach()
+  ]])
+endif()
 android_install_dependency(all CERT_DEPEPENDENCIES)
 android_install_dependency(all EMULATOR_HW_DEPENDENCIES)
 # AEMU core-only: Vulkan prebuilts are installed file-by-file.

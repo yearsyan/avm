@@ -13,7 +13,6 @@
 #include <signal.h>
 #include <spawn.h>
 #include <string>
-#include <sys/wait.h>
 #include <unistd.h>
 #include <utility>
 #include <vector>
@@ -28,6 +27,7 @@ namespace {
 // Stable child fd used only for the frame doorbell. Keep it away from stdio and
 // the low-numbered fds qemu may inherit from its launcher.
 constexpr int kChildFrameDoorbellFd = 198;
+constexpr int kMinTemporarySpawnFd = 256;
 constexpr const char* kFrameDoorbellFdEnv = "MACMU_FRAME_DOORBELL_FD";
 constexpr const char* kLegacyFrameDoorbellFdEnv = "AEMU_FRAME_DOORBELL_FD";
 
@@ -66,15 +66,6 @@ std::vector<char*> make_cstring_vector(std::vector<std::string>& values) {
     }
     pointers.push_back(nullptr);
     return pointers;
-}
-
-bool set_close_on_exec(int fd, bool enabled) {
-    const int flags = fcntl(fd, F_GETFD);
-    if (flags < 0) {
-        return false;
-    }
-    const int nextFlags = enabled ? (flags | FD_CLOEXEC) : (flags & ~FD_CLOEXEC);
-    return fcntl(fd, F_SETFD, nextFlags) == 0;
 }
 
 }  // namespace
@@ -142,8 +133,14 @@ pid_t launch_qemu(const ShellOptions& options, int frameDoorbellFd, int inputFd,
 
     posix_spawn_file_actions_t fileActions;
     posix_spawn_file_actions_t* fileActionsPtr = nullptr;
-    bool restoreFrameDoorbellCloexec = false;
-    bool restoreInputCloexec = false;
+    std::vector<int> temporarySpawnFds;
+
+    auto close_temporary_spawn_fds = [&]() {
+        for (int fd : temporarySpawnFds) {
+            close(fd);
+        }
+        temporarySpawnFds.clear();
+    };
 
     auto ensure_file_actions = [&]() -> bool {
         if (fileActionsPtr) {
@@ -155,109 +152,114 @@ pid_t launch_qemu(const ShellOptions& options, int frameDoorbellFd, int inputFd,
         fileActionsPtr = &fileActions;
         return true;
     };
-    auto add_dup2 = [&](int parentFd, int childFd) -> bool {
-        int actionResult =
-            posix_spawn_file_actions_adddup2(&fileActions, parentFd, childFd);
-        if (actionResult == 0 && parentFd != childFd) {
-            actionResult = posix_spawn_file_actions_addclose(&fileActions, parentFd);
+
+    auto duplicate_for_spawn = [&](int parentFd, const char* label) -> int {
+        const int dupFd = fcntl(parentFd, F_DUPFD_CLOEXEC, kMinTemporarySpawnFd);
+        if (dupFd < 0) {
+            std::fprintf(stderr, "Failed to duplicate %s fd %d for qemu spawn: %s\n", label,
+                         parentFd, std::strerror(errno));
+            return -1;
+        }
+        temporarySpawnFds.push_back(dupFd);
+        return dupFd;
+    };
+
+    auto add_inherited_fd = [&](int parentFd, int childFd, const char* label) -> bool {
+        if (parentFd < 0) {
+            return true;
+        }
+        if (!ensure_file_actions()) {
+            std::fprintf(stderr, "Failed to initialize qemu spawn file actions\n");
+            return false;
+        }
+        // Always duplicate first. This prevents a source fd from colliding with
+        // another channel's fixed child fd while file actions are applied.
+        const int spawnFd = duplicate_for_spawn(parentFd, label);
+        if (spawnFd < 0) {
+            return false;
+        }
+        int actionResult = posix_spawn_file_actions_adddup2(&fileActions, spawnFd, childFd);
+        if (actionResult == 0) {
+            actionResult = posix_spawn_file_actions_addclose(&fileActions, spawnFd);
         }
         if (actionResult != 0) {
-            std::fprintf(stderr, "Failed to prepare fd %d inheritance: %s\n", parentFd,
-                         std::strerror(actionResult));
+            std::fprintf(stderr, "Failed to prepare %s fd %d -> %d inheritance: %s\n", label,
+                         parentFd, childFd, std::strerror(actionResult));
             return false;
         }
         return true;
     };
 
-    if (frameDoorbellFd >= 0) {
-        if (frameDoorbellFd == kChildFrameDoorbellFd) {
-            if (!set_close_on_exec(frameDoorbellFd, false)) {
-                std::fprintf(stderr, "Failed to prepare frame doorbell fd %d: %s\n",
-                             frameDoorbellFd, std::strerror(errno));
-                return -1;
-            }
-            restoreFrameDoorbellCloexec = true;
-        } else {
-            if (!ensure_file_actions()) {
-                std::fprintf(stderr, "Failed to initialize qemu spawn file actions\n");
-                return -1;
-            }
-            if (!add_dup2(frameDoorbellFd, kChildFrameDoorbellFd)) {
-                posix_spawn_file_actions_destroy(&fileActions);
-                return -1;
-            }
+#if defined(__APPLE__) && defined(POSIX_SPAWN_CLOEXEC_DEFAULT)
+    // CLOEXEC_DEFAULT is the fd allowlist. Preserve stdio explicitly for qemu
+    // diagnostics, then add only the three protocol descriptors below.
+    for (int fd : {STDIN_FILENO, STDOUT_FILENO, STDERR_FILENO}) {
+        if (fcntl(fd, F_GETFD) < 0) {
+            continue;
+        }
+        if (!ensure_file_actions()) {
+            std::fprintf(stderr, "Failed to initialize qemu spawn file actions\n");
+            close_temporary_spawn_fds();
+            return -1;
+        }
+        const int actionResult = posix_spawn_file_actions_addinherit_np(&fileActions, fd);
+        if (actionResult != 0) {
+            std::fprintf(stderr, "Failed to preserve qemu stdio fd %d: %s\n", fd,
+                         std::strerror(actionResult));
+            posix_spawn_file_actions_destroy(&fileActions);
+            close_temporary_spawn_fds();
+            return -1;
         }
     }
+#endif
 
-    if (inputFd >= 0) {
-        if (inputFd == macmu::kInputChildFd) {
-            if (!set_close_on_exec(inputFd, false)) {
-                std::fprintf(stderr, "Failed to prepare input fd %d: %s\n", inputFd,
-                             std::strerror(errno));
-                if (restoreFrameDoorbellCloexec) {
-                    set_close_on_exec(frameDoorbellFd, true);
-                }
-                if (fileActionsPtr) {
-                    posix_spawn_file_actions_destroy(&fileActions);
-                }
-                return -1;
-            }
-            restoreInputCloexec = true;
-        } else {
-            if (!ensure_file_actions()) {
-                std::fprintf(stderr, "Failed to initialize qemu spawn file actions\n");
-                if (restoreFrameDoorbellCloexec) {
-                    set_close_on_exec(frameDoorbellFd, true);
-                }
-                return -1;
-            }
-            if (!add_dup2(inputFd, macmu::kInputChildFd)) {
-                posix_spawn_file_actions_destroy(&fileActions);
-                return -1;
-            }
+    if (!add_inherited_fd(frameDoorbellFd, kChildFrameDoorbellFd, "frame doorbell")) {
+        if (fileActionsPtr) {
+            posix_spawn_file_actions_destroy(&fileActions);
         }
+        close_temporary_spawn_fds();
+        return -1;
     }
-
-    bool restoreControlCloexec = false;
-    if (controlFd >= 0) {
-        if (controlFd == macmu::kControlChildFd) {
-            if (!set_close_on_exec(controlFd, false)) {
-                std::fprintf(stderr, "Failed to prepare control fd %d: %s\n", controlFd,
-                             std::strerror(errno));
-                if (restoreFrameDoorbellCloexec) {
-                    set_close_on_exec(frameDoorbellFd, true);
-                }
-                if (restoreInputCloexec) {
-                    set_close_on_exec(inputFd, true);
-                }
-                if (fileActionsPtr) {
-                    posix_spawn_file_actions_destroy(&fileActions);
-                }
-                return -1;
-            }
-            restoreControlCloexec = true;
-        } else {
-            if (!ensure_file_actions()) {
-                std::fprintf(stderr, "Failed to initialize qemu spawn file actions\n");
-                if (restoreFrameDoorbellCloexec) {
-                    set_close_on_exec(frameDoorbellFd, true);
-                }
-                if (restoreInputCloexec) {
-                    set_close_on_exec(inputFd, true);
-                }
-                return -1;
-            }
-            if (!add_dup2(controlFd, macmu::kControlChildFd)) {
-                posix_spawn_file_actions_destroy(&fileActions);
-                return -1;
-            }
+    if (!add_inherited_fd(inputFd, macmu::kInputChildFd, "input")) {
+        if (fileActionsPtr) {
+            posix_spawn_file_actions_destroy(&fileActions);
         }
+        close_temporary_spawn_fds();
+        return -1;
+    }
+    if (!add_inherited_fd(controlFd, macmu::kControlChildFd, "control")) {
+        if (fileActionsPtr) {
+            posix_spawn_file_actions_destroy(&fileActions);
+        }
+        close_temporary_spawn_fds();
+        return -1;
     }
 
     posix_spawnattr_t attributes;
-    posix_spawnattr_init(&attributes);
-    posix_spawnattr_setflags(&attributes, POSIX_SPAWN_SETPGROUP);
-    posix_spawnattr_setpgroup(&attributes, 0);
+    int attributeResult = posix_spawnattr_init(&attributes);
+    const bool attributesInitialized = attributeResult == 0;
+    short spawnFlags = POSIX_SPAWN_SETPGROUP;
+#ifdef POSIX_SPAWN_CLOEXEC_DEFAULT
+    spawnFlags |= POSIX_SPAWN_CLOEXEC_DEFAULT;
+#endif
+    if (attributeResult == 0) {
+        attributeResult = posix_spawnattr_setflags(&attributes, spawnFlags);
+    }
+    if (attributeResult == 0) {
+        attributeResult = posix_spawnattr_setpgroup(&attributes, 0);
+    }
+    if (attributeResult != 0) {
+        std::fprintf(stderr, "Failed to initialize qemu spawn attributes: %s\n",
+                     std::strerror(attributeResult));
+        if (fileActionsPtr) {
+            posix_spawn_file_actions_destroy(&fileActions);
+        }
+        if (attributesInitialized) {
+            posix_spawnattr_destroy(&attributes);
+        }
+        close_temporary_spawn_fds();
+        return -1;
+    }
 
     pid_t pid = -1;
     const int result = posix_spawn(&pid, options.qemuPath.c_str(), fileActionsPtr, &attributes,
@@ -266,15 +268,7 @@ pid_t launch_qemu(const ShellOptions& options, int frameDoorbellFd, int inputFd,
     if (fileActionsPtr) {
         posix_spawn_file_actions_destroy(&fileActions);
     }
-    if (restoreFrameDoorbellCloexec) {
-        set_close_on_exec(frameDoorbellFd, true);
-    }
-    if (restoreInputCloexec) {
-        set_close_on_exec(inputFd, true);
-    }
-    if (restoreControlCloexec) {
-        set_close_on_exec(controlFd, true);
-    }
+    close_temporary_spawn_fds();
     if (result != 0) {
         std::fprintf(stderr, "Failed to launch qemu-system-aarch64-headless: %s\n",
                      std::strerror(result));
@@ -283,27 +277,23 @@ pid_t launch_qemu(const ShellOptions& options, int frameDoorbellFd, int inputFd,
     return pid;
 }
 
-void terminate_qemu(pid_t pid) {
+namespace {
+
+void signal_qemu_process_group(pid_t pid, int signal) {
     if (pid <= 0) {
         return;
     }
+    if (kill(-pid, signal) != 0) {
+        kill(pid, signal);
+    }
+}
 
-    if (waitpid(pid, nullptr, WNOHANG) == pid) {
-        return;
-    }
+}  // namespace
 
-    if (kill(-pid, SIGTERM) != 0) {
-        kill(pid, SIGTERM);
-    }
-    for (int i = 0; i < 50; ++i) {
-        if (waitpid(pid, nullptr, WNOHANG) == pid) {
-            return;
-        }
-        usleep(100000);
-    }
+void request_qemu_termination(pid_t pid) {
+    signal_qemu_process_group(pid, SIGTERM);
+}
 
-    if (kill(-pid, SIGKILL) != 0) {
-        kill(pid, SIGKILL);
-    }
-    waitpid(pid, nullptr, 0);
+void force_kill_qemu(pid_t pid) {
+    signal_qemu_process_group(pid, SIGKILL);
 }
