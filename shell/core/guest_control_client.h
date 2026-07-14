@@ -27,13 +27,17 @@ class GuestControlClient {
    public:
     // ok, payload (or error message when !ok). Fired on the reader thread.
     using ResponseCallback = std::function<void(bool, std::string)>;
+    // Connected state after the protocol handshake. Fired on the accept/reader
+    // thread; callers that touch UI state must bounce to their UI thread.
+    using ConnectionCallback = std::function<void(bool)>;
 
     GuestControlClient() = default;
     ~GuestControlClient();
     GuestControlClient(const GuestControlClient&) = delete;
     GuestControlClient& operator=(const GuestControlClient&) = delete;
 
-    bool start(const std::string& socket_path);
+    bool start(const std::string& socket_path,
+               ConnectionCallback on_connection_changed = {});
     void stop();
 
     bool ready() const { return clientFd_.load(std::memory_order_acquire) >= 0; }
@@ -56,6 +60,7 @@ class GuestControlClient {
     std::atomic<bool> stopRequested_{false};
     std::thread acceptThread_;
     std::mutex writeMutex_;
+    ConnectionCallback connectionCallback_;
     macmu::shell::PendingRequestTable<uint64_t, ResponseCallback> pending_;
     std::atomic<uint64_t> nextRequestId_{1};
 };

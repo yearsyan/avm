@@ -31,7 +31,8 @@ GuestControlClient::~GuestControlClient() {
     stop();
 }
 
-bool GuestControlClient::start(const std::string& socket_path) {
+bool GuestControlClient::start(const std::string& socket_path,
+                               ConnectionCallback on_connection_changed) {
     stop();
     const int fd = macmu::shell::create_unix_listener(socket_path, [](const std::string& message) {
         std::fprintf(stderr, "MacMu guest control: %s\n", message.c_str());
@@ -40,6 +41,7 @@ bool GuestControlClient::start(const std::string& socket_path) {
         return false;
     }
     socketPath_ = socket_path;
+    connectionCallback_ = std::move(on_connection_changed);
     stopRequested_.store(false, std::memory_order_release);
     listenFd_.store(fd, std::memory_order_release);
     acceptThread_ = std::thread([this] { accept_thread(); });
@@ -54,10 +56,15 @@ void GuestControlClient::stop() {
         close(listenFd);
     }
     macmu::shell::wake_unix_listener(socketPath_);
-    const int clientFd = clientFd_.exchange(-1, std::memory_order_acq_rel);
-    if (clientFd >= 0) {
-        shutdown(clientFd, SHUT_RDWR);
-        // serve_connection owns the close.
+    {
+        // The accept thread owns both publishing and clearing clientFd_. Leave
+        // the state published until it performs the connection cleanup so its
+        // true/false notifications remain ordered. shutdown() wakes its reader.
+        std::lock_guard<std::mutex> lock(writeMutex_);
+        const int clientFd = clientFd_.load(std::memory_order_acquire);
+        if (clientFd >= 0) {
+            shutdown(clientFd, SHUT_RDWR);
+        }
     }
     if (acceptThread_.joinable()) {
         acceptThread_.join();
@@ -67,6 +74,7 @@ void GuestControlClient::stop() {
         socketPath_.clear();
     }
     fail_all_pending("guest control client stopped");
+    connectionCallback_ = {};
 }
 
 void GuestControlClient::request(const std::string& command, uint64_t timeout_ms,
@@ -143,18 +151,41 @@ void GuestControlClient::accept_thread() {
             close(fd);
             continue;
         }
-        clientFd_.store(fd, std::memory_order_release);
+
+        bool connected = false;
+        {
+            // Synchronize publication with stop(): once stopRequested_ is set,
+            // a handshake that was already in flight must not make ready()
+            // become true again.
+            std::lock_guard<std::mutex> lock(writeMutex_);
+            if (!stopRequested_.load(std::memory_order_acquire)) {
+                clientFd_.store(fd, std::memory_order_release);
+                connected = true;
+            }
+        }
+        if (!connected) {
+            close(fd);
+            break;
+        }
         std::fprintf(stderr, "MacMu guest control agent connected.\n");
+        if (connectionCallback_) {
+            connectionCallback_(true);
+        }
         serve_connection(fd);
+        bool disconnected = false;
         {
             // Publish the disconnect and close under writeMutex_ so an
             // in-flight request() cannot send on the closed/reused fd.
             std::lock_guard<std::mutex> lock(writeMutex_);
             int expected = fd;
-            clientFd_.compare_exchange_strong(expected, -1, std::memory_order_acq_rel);
+            disconnected = clientFd_.compare_exchange_strong(
+                expected, -1, std::memory_order_acq_rel);
             close_fd(fd);
         }
         fail_all_pending("guest agent disconnected");
+        if (disconnected && connectionCallback_) {
+            connectionCallback_(false);
+        }
     }
 }
 

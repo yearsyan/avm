@@ -1,11 +1,11 @@
 // MacMu macOS shell for IOSurface display export.
 // SPDX-License-Identifier: MIT
 //
-// The app shell owns the AppKit lifecycle, the status window, the per-display
-// IOSurface windows, the apps window, the menu-bar status item, and the qemu
-// supervisor. One window == one guest display: display 0 is the built-in
-// panel; secondary displays are created over the MMCP control channel and
-// their frames arrive through the display-indexed frame channel slots.
+// The app shell owns the AppKit lifecycle, the Applications window, one
+// IOSurface window per launched Android app, the menu-bar status item, and the
+// qemu supervisor. Android's built-in display 0 remains an internal boot
+// surface and is never exposed by the product UI. Every visible app gets one
+// dedicated virtual display created over the MMCP control channel.
 
 #import <AppKit/AppKit.h>
 #import <Metal/Metal.h>
@@ -47,6 +47,17 @@ namespace {
 
 NSString* ns_string(const std::string& value) {
     return [NSString stringWithUTF8String:value.c_str()];
+}
+
+std::string package_from_component(const std::string& component) {
+    const size_t slash = component.find('/');
+    return slash == std::string::npos ? component : component.substr(0, slash);
+}
+
+uint32_t maximum_frames_per_second(NSScreen* screen) {
+    NSScreen* resolvedScreen = screen ?: [NSScreen mainScreen];
+    const NSInteger framesPerSecond = resolvedScreen.maximumFramesPerSecond;
+    return framesPerSecond > 0 ? static_cast<uint32_t>(framesPerSecond) : 60u;
 }
 
 NSTextField* make_label(NSString* text, NSRect frame) {
@@ -186,39 +197,118 @@ struct DisplayWindow {
     NSWindow* __strong window = nil;
     MTKView* __strong view = nil;
     MacMuSurfaceRendererRef __strong renderer = nil;
-    // Requested geometry captured at DISPLAY_ADD time, used for the
-    // "requested vs actual" window title suffix on secondary displays.
-    // Zero on display 0 and on auto-opened secondary displays.
-    uint32_t requestedWidth = 0;
-    uint32_t requestedHeight = 0;
-    uint32_t requestedDpi = 0;
-    bool reportedActual = false;  // true once the actual-size title suffix is set
 };
 
 }  // namespace
 
-@interface MacMuAppsTableView : NSTableView
+static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
+    @"MacMuApplicationItem";
+
+@interface MacMuApplicationItem : NSCollectionViewItem
+- (void)setApplicationRunning:(BOOL)running opening:(BOOL)opening closing:(BOOL)closing;
 @end
 
-@implementation MacMuAppsTableView
+@implementation MacMuApplicationItem {
+    NSTextField* _runningLabel;
+}
+
+- (void)loadView {
+    NSView* view = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 116, 120)];
+    view.wantsLayer = YES;
+    view.layer.cornerRadius = 12.0;
+
+    NSImageView* icon = [[NSImageView alloc] initWithFrame:NSMakeRect(26, 46, 64, 64)];
+    icon.imageAlignment = NSImageAlignCenter;
+    icon.imageScaling = NSImageScaleProportionallyDown;
+    icon.wantsLayer = YES;
+    icon.layer.cornerRadius = 14.0;
+    icon.layer.masksToBounds = YES;
+    [view addSubview:icon];
+
+    NSTextField* name = [[NSTextField alloc] initWithFrame:NSMakeRect(6, 23, 104, 18)];
+    name.bezeled = NO;
+    name.drawsBackground = NO;
+    name.editable = NO;
+    name.selectable = NO;
+    name.alignment = NSTextAlignmentCenter;
+    name.lineBreakMode = NSLineBreakByTruncatingTail;
+    name.font = [NSFont systemFontOfSize:12.0 weight:NSFontWeightMedium];
+    name.textColor = [NSColor labelColor];
+    [view addSubview:name];
+
+    _runningLabel = [[NSTextField alloc] initWithFrame:NSMakeRect(6, 6, 104, 14)];
+    _runningLabel.bezeled = NO;
+    _runningLabel.drawsBackground = NO;
+    _runningLabel.editable = NO;
+    _runningLabel.selectable = NO;
+    _runningLabel.alignment = NSTextAlignmentCenter;
+    _runningLabel.font = [NSFont systemFontOfSize:10.0 weight:NSFontWeightMedium];
+    _runningLabel.textColor = [NSColor systemGreenColor];
+    [view addSubview:_runningLabel];
+
+    self.view = view;
+    self.imageView = icon;
+    self.textField = name;
+}
+
+- (void)setSelected:(BOOL)selected {
+    [super setSelected:selected];
+    self.view.layer.backgroundColor =
+        (selected ? [[NSColor selectedContentBackgroundColor] colorWithAlphaComponent:0.18]
+                  : [NSColor clearColor])
+            .CGColor;
+}
+
+- (void)setApplicationRunning:(BOOL)running opening:(BOOL)opening closing:(BOOL)closing {
+    _runningLabel.stringValue = opening ? @"Opening…"
+                                        : (closing ? @"Closing…"
+                                                   : (running ? @"●  Running" : @""));
+    _runningLabel.textColor = (opening || closing) ? [NSColor secondaryLabelColor]
+                                                   : [NSColor systemGreenColor];
+}
+
+@end
+
+@interface MacMuApplicationsCollectionView : NSCollectionView
+@property(nonatomic, weak) id activationTarget;
+@property(nonatomic) SEL activationAction;
+@end
+
+@implementation MacMuApplicationsCollectionView
 - (NSMenu*)menuForEvent:(NSEvent*)event {
     NSPoint point = [self convertPoint:event.locationInWindow fromView:nil];
-    NSInteger row = [self rowAtPoint:point];
-    if (row >= 0) {
-        [self selectRowIndexes:[NSIndexSet indexSetWithIndex:row] byExtendingSelection:NO];
+    NSIndexPath* indexPath = [self indexPathForItemAtPoint:point];
+    if (indexPath) {
+        self.selectionIndexPaths = [NSSet setWithObject:indexPath];
         return self.menu;
     }
-    return [super menuForEvent:event];
+    // A blank-area context click must not operate on a stale selection.
+    self.selectionIndexPaths = [NSSet set];
+    return nil;
+}
+
+- (void)mouseDown:(NSEvent*)event {
+    [super mouseDown:event];
+    if (event.clickCount != 2 || !self.activationAction) {
+        return;
+    }
+    NSPoint point = [self convertPoint:event.locationInWindow fromView:nil];
+    NSIndexPath* indexPath = [self indexPathForItemAtPoint:point];
+    if (!indexPath) {
+        return;
+    }
+    self.selectionIndexPaths = [NSSet setWithObject:indexPath];
+    [NSApp sendAction:self.activationAction to:self.activationTarget from:self];
 }
 @end
 
 @interface MacMuAppDelegate
-    : NSObject <NSApplicationDelegate, NSWindowDelegate, NSTableViewDataSource,
-                NSTableViewDelegate>
+    : NSObject <NSApplicationDelegate, NSWindowDelegate, NSCollectionViewDataSource,
+                NSCollectionViewDelegate>
 - (instancetype)initWithOptions:(const ShellOptions&)options;
-// Opens (or focuses) the window bound to guest display |displayId|. The aspect
-// variant seeds a secondary display's initial geometry from the requested
-// dimensions; pass 0/0 to use the legacy default geometry.
+// Opens (or focuses) the application window bound to virtual display
+// |displayId|. Display 0 is deliberately rejected: it is an internal Android
+// boot surface, never a user-facing application window.
 - (void)openDisplayWindowForDisplay:(uint32_t)displayId
                         aspectWidth:(uint32_t)aspectWidth
                        aspectHeight:(uint32_t)aspectHeight
@@ -229,6 +319,9 @@ struct DisplayWindow {
 - (uint32_t)allocateUserDisplayId;
 - (void)releaseUserDisplayId:(uint32_t)displayId;
 - (void)resetSecondaryDisplayStateAfterQemuExit;
+- (void)cleanupFailedLaunchForDisplay:(uint32_t)displayId
+                            component:(NSString*)component
+                              message:(NSString*)message;
 - (void)restoreDisplaySubscriptions;
 - (void)enqueueFramePresentationForDisplay:(uint32_t)displayId;
 @end
@@ -243,35 +336,55 @@ struct DisplayWindow {
     id<MTLDevice> _metalDevice;
 
     NSWindow* _statusWindow;
-    NSTextField* _qemuStatusValue;
-    NSTextField* _appDataPathValue;
-    NSTextField* _avdPathValue;
-    NSTextField* _systemPathValue;
+    NSTextField* _bootTitleValue;
+    NSTextField* _bootDetailValue;
+    NSTextField* _bootStageValue;
+    NSProgressIndicator* _bootSpinner;
     NSButton* _createMachineButton;
-    NSButton* _startButton;
+    NSButton* _refreshAppsButton;
+    NSButton* _openApplicationButton;
 
     // displayId -> window/view/renderer. Main thread only.
     std::map<uint32_t, DisplayWindow> _displayWindows;
     // Display ids being closed because the guest/event said so; suppresses the
     // windowWillClose -> DISPLAY_REMOVE echo.
     std::map<uint32_t, bool> _suppressRemoveOnClose;
-    // Secondary displays created by "Launch in New Display" are bound to the
-    // launched app. Closing the host window stops that app before removing the
-    // guest display so Android does not reparent the task to display 0.
+    // Every visible display is bound to exactly one Android application.
+    // Closing the host window stops that app before removing the guest display
+    // so Android does not reparent the task to its internal display 0.
     std::map<uint32_t, std::string> _displayAppBindings;
-    // User display ids (1..kMaxUserDisplayId) we have an open window + binding
-    // for. The qemu control plane's auto-allocate (displayId == AUTO) does NOT
-    // reliably skip displays we still have open: a second "launch in new
-    // display" can be handed the same id as the first (the underlying
-    // multi_display agent's enabled-tracking is incomplete in this build),
-    // which makes the new app land on the existing display. We avoid that by
-    // allocating an explicit id here — the smallest id in 1..5 not in this set
-    // — and releasing it when the window closes / is removed.
+    // Reverse package -> display index enforces the product invariant that one
+    // application package owns at most one display/window. Bindings are
+    // reserved before DISPLAY_ADD so repeated clicks focus (or wait for) the
+    // same launch transaction instead of allocating another display.
+    std::map<std::string, uint32_t> _appDisplayBindings;
+    std::set<std::string> _pendingAppPackages;
+    // Subset of pending packages whose guest launch RPC has actually been
+    // sent. This distinguishes cancelling the 0.2s pre-launch handoff from
+    // closing an application while launch is already in flight.
+    std::set<std::string> _launchRequestsInFlight;
+    std::set<std::string> _closingAppPackages;
+    // When a launch RPC returns a definitive guest-side error during a close
+    // transaction, preserve it until the ordered close response arrives. If
+    // close also fails, the display is empty and should be removed rather than
+    // reopened and mislabeled as Running.
+    std::map<uint32_t, std::string> _closingLaunchFailures;
+    // Failed/ambiguous launches are stopped before their display is removed.
+    // If the agent disconnects, retain the transaction and retry on reconnect.
+    std::map<uint32_t, std::string> _deferredLaunchCleanup;
+    // Preserve the requested geometry from reservation through first frame;
+    // a producer frame can arrive before DISPLAY_ADD_OK reaches the main
+    // queue, and must still open the window with the chosen aspect ratio.
+    std::map<uint32_t, DisplayLaunchProfile> _displayLaunchProfiles;
+    // DISPLAY_REMOVE can complete via both an event and a request callback.
+    // Track host-initiated removals so each slot has one release owner.
+    std::set<uint32_t> _displayRemovalPending;
+    // User display ids (1..kMaxUserDisplayId) reserved by applications.
     std::set<uint32_t> _activeUserDisplayIds;
 
-    NSWindow* _appsWindow;
-    NSTableView* _appsTable;
+    MacMuApplicationsCollectionView* _appsCollection;
     NSTextField* _appsStatusValue;
+    NSTextField* _appsEmptyValue;
     NSMutableArray<NSDictionary*>* _apps;
     // pkg -> friendly label and decoded icon, populated in applyAppList:.
     // Used by the icon table cell; missing entries fall back to a placeholder.
@@ -295,6 +408,8 @@ struct DisplayWindow {
     std::mutex _guestInputMutex;
     std::atomic<pid_t> _qemuPid;
     bool _channelReady;
+    bool _agentConnected;
+    bool _appsLoaded;
 }
 
 - (instancetype)initWithOptions:(const ShellOptions&)options {
@@ -309,15 +424,16 @@ struct DisplayWindow {
     _guestControlClient = nullptr;
     _metalDevice = nil;
     _statusWindow = nil;
-    _qemuStatusValue = nil;
-    _appDataPathValue = nil;
-    _avdPathValue = nil;
-    _systemPathValue = nil;
+    _bootTitleValue = nil;
+    _bootDetailValue = nil;
+    _bootStageValue = nil;
+    _bootSpinner = nil;
     _createMachineButton = nil;
-    _startButton = nil;
-    _appsWindow = nil;
-    _appsTable = nil;
+    _refreshAppsButton = nil;
+    _openApplicationButton = nil;
+    _appsCollection = nil;
     _appsStatusValue = nil;
+    _appsEmptyValue = nil;
     _apps = [[NSMutableArray alloc] init];
     _appNames = [[NSMutableDictionary alloc] init];
     _appIcons = [[NSMutableDictionary alloc] init];
@@ -331,6 +447,8 @@ struct DisplayWindow {
     }
     _qemuPid.store(-1, std::memory_order_relaxed);
     _channelReady = false;
+    _agentConnected = false;
+    _appsLoaded = false;
     return self;
 }
 
@@ -347,11 +465,6 @@ struct DisplayWindow {
     [self updateMachineControls];
     [self showStatusWindow:nil];
     [self startQemuSupervisor];
-    if (_options.openDisplay) {
-        dispatch_async(dispatch_get_main_queue(), ^{
-            [self openDisplayWindowForDisplay:0];
-        });
-    }
     [NSApp activateIgnoringOtherApps:YES];
 }
 
@@ -391,9 +504,6 @@ struct DisplayWindow {
         return;  // hideWindowsForTermination already tore the entries down
     }
     NSWindow* window = [notification object];
-    if (window == _appsWindow) {
-        return;
-    }
     for (auto it = _displayWindows.begin(); it != _displayWindows.end(); ++it) {
         if (it->second.window != window) {
             continue;
@@ -412,20 +522,15 @@ struct DisplayWindow {
         if (suppressed) {
             _suppressRemoveOnClose.erase(suppress);
         }
-        // Closing a secondary display's window removes the guest display too
-        // (which also stops its export streaming). Display 0 is the built-in
-        // panel: its window closes, the display stays.
-        if (displayId != 0) {
-            if (!suppressed) {
-                [self closeBoundAppAndRemoveDisplay:displayId];
-            } else {
-                _displayAppBindings.erase(displayId);
-            }
-            // Release the id whether or not we issued DISPLAY_REMOVE, so the
-            // next "launch in new display" can reuse the slot. The guest-remove
-            // path calls releaseUserDisplayId: after the ack to avoid a race
-            // with a re-add at the same id while qemu is still tearing down.
-            if (suppressed) {
+        // Every user-visible window owns one app/display pair. A normal close
+        // stops the app and removes its display. A suppressed close came from a
+        // guest/display event; only release locally when no host remove request
+        // already owns completion for this id.
+        if (!suppressed) {
+            [self closeBoundAppAndRemoveDisplay:displayId];
+        } else {
+            [self unbindApplicationFromDisplay:displayId];
+            if (_displayRemovalPending.count(displayId) == 0) {
                 [self releaseUserDisplayId:displayId];
             }
         }
@@ -460,6 +565,15 @@ struct DisplayWindow {
     [self setDisplayStreamingForWindow:window enabled:visible];
 }
 
+- (void)windowDidChangeScreen:(NSNotification*)notification {
+    NSWindow* window = notification.object;
+    const BOOL visible = (window.occlusionState & NSWindowOcclusionStateVisible) != 0 &&
+                         !window.miniaturized;
+    // Re-send DISPLAY_STREAM whenever an application window crosses screens;
+    // each display is paced to its current NSScreen's maximum refresh rate.
+    [self setDisplayStreamingForWindow:window enabled:visible];
+}
+
 - (void)teardownDisplayWindowEntry:(DisplayWindow&)entry {
     if (entry.view) {
         entry.view.paused = YES;
@@ -477,22 +591,14 @@ struct DisplayWindow {
     [menu addItem:appItem];
 
     NSMenu* appMenu = [[NSMenu alloc] initWithTitle:@"MacMu"];
-    NSMenuItem* showItem = [appMenu addItemWithTitle:@"Show MacMu"
+    NSMenuItem* showItem = [appMenu addItemWithTitle:@"Show Applications"
                                               action:@selector(showStatusWindow:)
                                        keyEquivalent:@"0"];
     showItem.target = self;
-    NSMenuItem* displayItem = [appMenu addItemWithTitle:@"Open Display"
-                                                 action:@selector(openPrimaryDisplayWindow:)
-                                          keyEquivalent:@"1"];
-    displayItem.target = self;
-    NSMenuItem* newDisplayItem = [appMenu addItemWithTitle:@"New Display"
-                                                    action:@selector(newDisplay:)
-                                             keyEquivalent:@"n"];
-    newDisplayItem.target = self;
-    NSMenuItem* appsItem = [appMenu addItemWithTitle:@"Apps…"
-                                              action:@selector(showAppsWindow:)
-                                       keyEquivalent:@"l"];
-    appsItem.target = self;
+    NSMenuItem* refreshItem = [appMenu addItemWithTitle:@"Refresh Applications"
+                                                 action:@selector(refreshApps:)
+                                          keyEquivalent:@"r"];
+    refreshItem.target = self;
     [appMenu addItem:[NSMenuItem separatorItem]];
     NSMenuItem* quitItem = [appMenu addItemWithTitle:@"Quit MacMu"
                                               action:@selector(terminate:)
@@ -509,29 +615,17 @@ struct DisplayWindow {
     _statusItem.button.toolTip = @"MacMu";
 
     NSMenu* menu = [[NSMenu alloc] initWithTitle:@"MacMu"];
-    NSMenuItem* showItem = [[NSMenuItem alloc] initWithTitle:@"Show MacMu"
+    NSMenuItem* showItem = [[NSMenuItem alloc] initWithTitle:@"Show Applications"
                                                       action:@selector(showStatusWindow:)
                                                keyEquivalent:@""];
     showItem.target = self;
     [menu addItem:showItem];
 
-    NSMenuItem* displayItem = [[NSMenuItem alloc] initWithTitle:@"Open Display"
-                                                         action:@selector(openPrimaryDisplayWindow:)
+    NSMenuItem* refreshItem = [[NSMenuItem alloc] initWithTitle:@"Refresh Applications"
+                                                         action:@selector(refreshApps:)
                                                   keyEquivalent:@""];
-    displayItem.target = self;
-    [menu addItem:displayItem];
-
-    NSMenuItem* newDisplayItem = [[NSMenuItem alloc] initWithTitle:@"New Display"
-                                                            action:@selector(newDisplay:)
-                                                     keyEquivalent:@""];
-    newDisplayItem.target = self;
-    [menu addItem:newDisplayItem];
-
-    NSMenuItem* appsItem = [[NSMenuItem alloc] initWithTitle:@"Apps…"
-                                                      action:@selector(showAppsWindow:)
-                                               keyEquivalent:@""];
-    appsItem.target = self;
-    [menu addItem:appsItem];
+    refreshItem.target = self;
+    [menu addItem:refreshItem];
     [menu addItem:[NSMenuItem separatorItem]];
 
     NSMenuItem* quitItem = [[NSMenuItem alloc] initWithTitle:@"Quit MacMu"
@@ -568,7 +662,44 @@ struct DisplayWindow {
     }
 
     _guestControlClient = new GuestControlClient();
-    if (_guestControlClient->start(_options.guestCtrlSocketPath)) {
+    MacMuAppDelegate* delegate = self;
+    if (_guestControlClient->start(_options.guestCtrlSocketPath, [delegate](bool connected) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                if ([delegate isShuttingDown]) {
+                    return;
+                }
+                delegate->_agentConnected = connected;
+                delegate->_appsLoaded = false;
+                if (connected) {
+                    NSLog(@"MacMu Android boot completed; agent connected. Loading applications.");
+                    [delegate updateBootPresentation:@"Android started"
+                                               detail:@"MacMu Agent is ready. Loading applications…"
+                                                stage:@"LOADING"
+                                                 busy:YES
+                                                 ready:NO];
+                    [delegate setAppsStatus:@"Loading applications…"];
+                    for (const auto& cleanup : delegate->_deferredLaunchCleanup) {
+                        NSString* component = ns_string(cleanup.second);
+                        [delegate cleanupFailedLaunchForDisplay:cleanup.first
+                                                     component:component
+                                                       message:@"The previous application launch did not complete"];
+                    }
+                    [delegate refreshApps:nil];
+                } else {
+                    [delegate clearApplicationCatalog];
+                    NSString* title = [delegate currentQemuPid] > 0
+                                          ? @"Reconnecting to Android"
+                                          : @"Starting Android";
+                    [delegate updateBootPresentation:title
+                                               detail:@"Waiting for Android and MacMu Agent…"
+                                                stage:@"STARTING"
+                                                 busy:YES
+                                                 ready:NO];
+                    [delegate setAppsStatus:@"Waiting for Android…"];
+                }
+                [delegate updateApplicationActions];
+            });
+        })) {
         NSLog(@"MacMu guest control listener ready at %s.", _options.guestCtrlSocketPath.c_str());
     } else {
         NSLog(@"MacMu guest control listener unavailable; app management disabled.");
@@ -585,120 +716,128 @@ struct DisplayWindow {
         return;
     }
 
-    const NSRect frame = NSMakeRect(0, 0, 760, 640);
+    const NSRect frame = NSMakeRect(0, 0, 840, 700);
     _statusWindow = [[NSWindow alloc]
         initWithContentRect:frame
                   styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
                             NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskResizable
                     backing:NSBackingStoreBuffered
                       defer:NO];
-    _statusWindow.title = @"MacMu";
+    _statusWindow.title = @"Applications — MacMu";
     _statusWindow.releasedWhenClosed = NO;
     _statusWindow.delegate = self;
-    _statusWindow.minSize = NSMakeSize(700, 560);
+    _statusWindow.minSize = NSMakeSize(720, 600);
     _statusWindow.backgroundColor = [NSColor windowBackgroundColor];
 
     NSView* content = [[NSView alloc] initWithFrame:frame];
     _statusWindow.contentView = content;
 
     // --- Title region ----------------------------------------------------
-    NSTextField* title = make_label(@"MacMu", NSMakeRect(24, 596, 360, 30));
+    NSTextField* title = make_label(@"Applications", NSMakeRect(24, 654, 420, 30));
     title.font = [NSFont systemFontOfSize:26.0 weight:NSFontWeightBold];
     title.textColor = [NSColor labelColor];
+    title.autoresizingMask = NSViewMinYMargin;
     [content addSubview:title];
 
     NSTextField* subtitle =
-        make_label(@"Android emulator core", NSMakeRect(26, 572, 360, 18));
+        make_label(@"Android apps, each in its own Mac window", NSMakeRect(26, 630, 520, 18));
     subtitle.font = [NSFont systemFontOfSize:13.0 weight:NSFontWeightRegular];
     subtitle.textColor = [NSColor secondaryLabelColor];
+    subtitle.autoresizingMask = NSViewMinYMargin;
     [content addSubview:subtitle];
 
-    // --- System card -----------------------------------------------------
-    // Card spans the full content width minus side margins; its subviews are
-    // positioned in card-local coordinates (origin at card bottom-left).
+    // --- Boot card -------------------------------------------------------
     const CGFloat cardX = 20.0;
     const CGFloat cardW = frame.size.width - cardX * 2.0;
-    NSView* systemCard = make_card(NSMakeRect(cardX, 388, cardW, 168));
-    systemCard.autoresizingMask = NSViewWidthSizable | NSViewMaxYMargin;
-    [content addSubview:systemCard];
+    NSView* bootCard = make_card(NSMakeRect(cardX, 514, cardW, 104));
+    bootCard.autoresizingMask = NSViewWidthSizable | NSViewMinYMargin;
+    [content addSubview:bootCard];
 
-    NSTextField* systemHeader = make_label(@"SYSTEM", NSMakeRect(16, 140, 200, 16));
-    systemHeader.font = [NSFont systemFontOfSize:11.0 weight:NSFontWeightSemibold];
-    systemHeader.textColor = [NSColor tertiaryLabelColor];
-    [systemCard addSubview:systemHeader];
+    _bootSpinner = [[NSProgressIndicator alloc] initWithFrame:NSMakeRect(20, 35, 32, 32)];
+    _bootSpinner.style = NSProgressIndicatorStyleSpinning;
+    _bootSpinner.controlSize = NSControlSizeRegular;
+    _bootSpinner.displayedWhenStopped = YES;
+    [_bootSpinner startAnimation:nil];
+    [bootCard addSubview:_bootSpinner];
 
-    const CGFloat labelX = 16.0;
-    const CGFloat valueX = 130.0;
-    const CGFloat valueW = cardW - valueX - 16.0;
-    auto add_system_row = ^(NSString* label, NSString* value, CGFloat y) {
-        NSTextField* l = make_label(label, NSMakeRect(labelX, y, valueX - labelX - 8, 18));
-        l.font = [NSFont systemFontOfSize:12.0 weight:NSFontWeightMedium];
-        l.textColor = [NSColor tertiaryLabelColor];
-        [systemCard addSubview:l];
-        NSTextField* v = make_value(value, NSMakeRect(valueX, y, valueW, 18));
-        v.textColor = [NSColor labelColor];
-        [systemCard addSubview:v];
-        return v;
-    };
-    _qemuStatusValue = add_system_row(@"QEMU", @"Starting", 108);
-    _appDataPathValue = add_system_row(@"Storage", @"Managed by MacMu", 84);
-    _avdPathValue = add_system_row(@"Device", @"Checking", 60);
-    _systemPathValue = add_system_row(@"System Image", @"Checking", 36);
+    _bootTitleValue = make_label(@"Checking Android environment", NSMakeRect(68, 57, 560, 23));
+    _bootTitleValue.font = [NSFont systemFontOfSize:16.0 weight:NSFontWeightSemibold];
+    _bootTitleValue.textColor = [NSColor labelColor];
+    _bootTitleValue.autoresizingMask = NSViewWidthSizable;
+    [bootCard addSubview:_bootTitleValue];
 
-    // --- Apps card -------------------------------------------------------
-    // The card's scroll view grows with the window; the button row below it
-    // is pinned to the bottom.
-    const CGFloat appsCardY = 84.0;
-    const CGFloat appsCardH = 292.0;
+    _bootDetailValue = make_label(@"Preparing MacMu to start…", NSMakeRect(68, 31, 580, 20));
+    _bootDetailValue.font = [NSFont systemFontOfSize:12.0 weight:NSFontWeightRegular];
+    _bootDetailValue.textColor = [NSColor secondaryLabelColor];
+    _bootDetailValue.autoresizingMask = NSViewWidthSizable;
+    [bootCard addSubview:_bootDetailValue];
+
+    _bootStageValue = make_label(@"STARTING", NSMakeRect(cardW - 116, 62, 96, 16));
+    _bootStageValue.font = [NSFont systemFontOfSize:10.0 weight:NSFontWeightSemibold];
+    _bootStageValue.textColor = [NSColor tertiaryLabelColor];
+    _bootStageValue.alignment = NSTextAlignmentRight;
+    _bootStageValue.autoresizingMask = NSViewMinXMargin;
+    [bootCard addSubview:_bootStageValue];
+
+    // --- Applications grid -----------------------------------------------
+    // The collection view mirrors Finder's Applications icon view. The list
+    // remains the primary surface while the compact boot card above changes
+    // state from Android startup through agent/application discovery.
+    const CGFloat appsCardY = 76.0;
+    const CGFloat appsCardH = 426.0;
     NSView* appsCard = make_card(NSMakeRect(cardX, appsCardY, cardW, appsCardH));
     appsCard.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
     [content addSubview:appsCard];
 
-    NSTextField* appsHeader = make_label(@"APPS", NSMakeRect(16, appsCardH - 26, 120, 16));
+    NSTextField* appsHeader =
+        make_label(@"APPLICATIONS", NSMakeRect(16, appsCardH - 28, 160, 16));
     appsHeader.font = [NSFont systemFontOfSize:11.0 weight:NSFontWeightSemibold];
     appsHeader.textColor = [NSColor tertiaryLabelColor];
-    appsHeader.autoresizingMask = NSViewMaxYMargin;
+    appsHeader.autoresizingMask = NSViewMinYMargin;
     [appsCard addSubview:appsHeader];
 
-    _appsStatusValue = make_value(@"", NSMakeRect(cardW - 280, appsCardH - 26, 264, 16));
+    _appsStatusValue = make_value(@"Waiting for Android…",
+                                  NSMakeRect(cardW - 330, appsCardH - 28, 314, 16));
     _appsStatusValue.font = [NSFont systemFontOfSize:11.0 weight:NSFontWeightRegular];
     _appsStatusValue.textColor = [NSColor tertiaryLabelColor];
     _appsStatusValue.alignment = NSTextAlignmentRight;
-    _appsStatusValue.autoresizingMask = NSViewMinXMargin | NSViewMaxYMargin;
+    _appsStatusValue.autoresizingMask = NSViewMinXMargin | NSViewMinYMargin;
     [appsCard addSubview:_appsStatusValue];
 
     NSScrollView* scroll =
-        [[NSScrollView alloc] initWithFrame:NSMakeRect(8, 8, cardW - 16, appsCardH - 44)];
+        [[NSScrollView alloc] initWithFrame:NSMakeRect(8, 8, cardW - 16, appsCardH - 46)];
     scroll.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
     scroll.hasVerticalScroller = YES;
     scroll.drawsBackground = NO;
 
-    _appsTable = [[MacMuAppsTableView alloc] initWithFrame:scroll.bounds];
-    // Single column carrying the icon + name + package cell. The identifier is
-    // arbitrary but must match what tableView:viewForTableColumn: returns.
-    NSTableColumn* appColumn = [[NSTableColumn alloc] initWithIdentifier:@"app"];
-    appColumn.width = scroll.bounds.size.width;
-    appColumn.resizingMask = NSTableColumnAutoresizingMask;
-    [_appsTable addTableColumn:appColumn];
-    _appsTable.dataSource = self;
-    _appsTable.delegate = self;
-    _appsTable.usesAlternatingRowBackgroundColors = NO;
-    _appsTable.backgroundColor = [NSColor clearColor];
-    _appsTable.style = NSTableViewStylePlain;
-    _appsTable.rowSizeStyle = NSTableViewRowSizeStyleDefault;
-    _appsTable.intercellSpacing = NSMakeSize(0, 0);
-    _appsTable.doubleAction = @selector(launchAppOnNewDisplay:);
-    _appsTable.target = self;
-    NSMenu* appsMenu = [[NSMenu alloc] initWithTitle:@"Apps"];
-    NSMenuItem* launchPrimary = [appsMenu addItemWithTitle:@"Launch on Primary Display"
-                                                    action:@selector(launchAppOnPrimary:)
-                                             keyEquivalent:@""];
-    launchPrimary.target = self;
-    NSMenuItem* launchInDisplay =
-        [appsMenu addItemWithTitle:@"Launch in New Display"
-                             action:nil
-                      keyEquivalent:@""];
-    NSMenu* ratioMenu = [[NSMenu alloc] initWithTitle:@"Launch in New Display"];
+    NSCollectionViewFlowLayout* layout = [[NSCollectionViewFlowLayout alloc] init];
+    layout.itemSize = NSMakeSize(116, 120);
+    layout.sectionInset = NSEdgeInsetsMake(16, 16, 16, 16);
+    layout.minimumInteritemSpacing = 8.0;
+    layout.minimumLineSpacing = 10.0;
+
+    _appsCollection = [[MacMuApplicationsCollectionView alloc] initWithFrame:scroll.bounds];
+    _appsCollection.collectionViewLayout = layout;
+    _appsCollection.dataSource = self;
+    _appsCollection.delegate = self;
+    _appsCollection.selectable = YES;
+    _appsCollection.allowsEmptySelection = YES;
+    _appsCollection.allowsMultipleSelection = NO;
+    _appsCollection.backgroundColors = @[ [NSColor clearColor] ];
+    _appsCollection.activationTarget = self;
+    _appsCollection.activationAction = @selector(openSelectedApplication:);
+    [_appsCollection registerClass:[MacMuApplicationItem class]
+            forItemWithIdentifier:kApplicationItemIdentifier];
+
+    NSMenu* appsMenu = [[NSMenu alloc] initWithTitle:@"Applications"];
+    NSMenuItem* openItem = [appsMenu addItemWithTitle:@"Open"
+                                               action:@selector(openSelectedApplication:)
+                                        keyEquivalent:@""];
+    openItem.target = self;
+    NSMenuItem* openAsItem = [appsMenu addItemWithTitle:@"Open with Window Size"
+                                                 action:nil
+                                          keyEquivalent:@""];
+    NSMenu* ratioMenu = [[NSMenu alloc] initWithTitle:@"Open with Window Size"];
     for (size_t i = 0; i < kDisplayLaunchProfileCount; ++i) {
         NSMenuItem* item =
             [ratioMenu addItemWithTitle:[NSString stringWithUTF8String:kDisplayLaunchProfiles[i].title]
@@ -707,49 +846,43 @@ struct DisplayWindow {
         item.target = self;
         item.representedObject = @(i);
     }
-    [appsMenu setSubmenu:ratioMenu forItem:launchInDisplay];
-    _appsTable.menu = appsMenu;
-    scroll.documentView = _appsTable;
+    [appsMenu setSubmenu:ratioMenu forItem:openAsItem];
+    _appsCollection.menu = appsMenu;
+    scroll.documentView = _appsCollection;
     [appsCard addSubview:scroll];
 
+    _appsEmptyValue = make_label(@"Waiting for Android to finish starting…",
+                                 NSMakeRect(60, appsCardH / 2.0 - 12, cardW - 120, 24));
+    _appsEmptyValue.font = [NSFont systemFontOfSize:14.0 weight:NSFontWeightRegular];
+    _appsEmptyValue.textColor = [NSColor secondaryLabelColor];
+    _appsEmptyValue.alignment = NSTextAlignmentCenter;
+    _appsEmptyValue.autoresizingMask = NSViewWidthSizable | NSViewMinYMargin | NSViewMaxYMargin;
+    [appsCard addSubview:_appsEmptyValue];
+
     // --- Bottom button row ----------------------------------------------
-    // Two groups: Refresh / Import on the left, Display / Launch / New Display
-    // on the right, separated by a thin separator that spans the card width.
-    NSBox* separator = [[NSBox alloc] initWithFrame:NSMakeRect(cardX, 70, cardW, 1)];
+    NSBox* separator = [[NSBox alloc] initWithFrame:NSMakeRect(cardX, 66, cardW, 1)];
     separator.boxType = NSBoxSeparator;
     separator.autoresizingMask = NSViewWidthSizable | NSViewMaxYMargin;
     [content addSubview:separator];
 
-    NSButton* refresh = make_button(@"Refresh", @selector(refreshApps:), self,
-                                    NSMakeRect(cardX, 24, 110, 32));
-    refresh.autoresizingMask = NSViewMaxXMargin | NSViewMaxYMargin;
-    [content addSubview:refresh];
+    _refreshAppsButton = make_button(@"Refresh", @selector(refreshApps:), self,
+                                     NSMakeRect(cardX, 20, 110, 32));
+    _refreshAppsButton.autoresizingMask = NSViewMaxXMargin | NSViewMaxYMargin;
+    _refreshAppsButton.enabled = NO;
+    [content addSubview:_refreshAppsButton];
 
     _createMachineButton = make_button(@"Import Image…", @selector(prepareDevice:), self,
-                                       NSMakeRect(cardX + 120, 24, 140, 32));
+                                       NSMakeRect(cardX + 120, 20, 140, 32));
     _createMachineButton.autoresizingMask = NSViewMaxXMargin | NSViewMaxYMargin;
     [content addSubview:_createMachineButton];
 
-    // Right-anchored action group, laid out right-to-left.
-    const CGFloat btnH = 32.0;
-    const CGFloat btnY = 24.0;
-    NSButton* launchNew =
-        make_button(@"New Display", @selector(launchAppOnNewDisplay:), self,
-                    NSMakeRect(cardX + cardW - 130, btnY, 130, btnH));
-    launchNew.autoresizingMask = NSViewMinXMargin | NSViewMaxYMargin;
-    [content addSubview:launchNew];
-
-    NSButton* launchPrimaryBtn =
-        make_button(@"Launch", @selector(launchAppOnPrimary:), self,
-                    NSMakeRect(launchNew.frame.origin.x - 8 - 90, btnY, 90, btnH));
-    launchPrimaryBtn.autoresizingMask = NSViewMinXMargin | NSViewMaxYMargin;
-    [content addSubview:launchPrimaryBtn];
-
-    _startButton = make_button(@"Display", @selector(openPrimaryDisplayWindow:), self,
-                               NSMakeRect(launchPrimaryBtn.frame.origin.x - 8 - 96, btnY, 96, btnH));
-    _startButton.autoresizingMask = NSViewMinXMargin | NSViewMaxYMargin;
-    _startButton.enabled = _channelReady && _metalDevice != nil;
-    [content addSubview:_startButton];
+    _openApplicationButton =
+        make_button(@"Open", @selector(openSelectedApplication:), self,
+                    NSMakeRect(cardX + cardW - 110, 20, 110, 32));
+    _openApplicationButton.autoresizingMask = NSViewMinXMargin | NSViewMaxYMargin;
+    _openApplicationButton.keyEquivalent = @"\r";
+    _openApplicationButton.enabled = NO;
+    [content addSubview:_openApplicationButton];
 
     [_statusWindow center];
 }
@@ -760,13 +893,17 @@ struct DisplayWindow {
     [NSApp activateIgnoringOtherApps:YES];
 }
 
-- (void)openPrimaryDisplayWindow:(id)sender {
-    [self openDisplayWindowForDisplay:0];
-}
-
-// Idempotent: brings the display's window to front, creating it if needed.
-// Main thread only.
+// Idempotent: brings an application's virtual-display window to front,
+// creating it if needed. Main thread only.
 - (void)openDisplayWindowForDisplay:(uint32_t)displayId {
+    auto profile = _displayLaunchProfiles.find(displayId);
+    if (profile != _displayLaunchProfiles.end()) {
+        [self openDisplayWindowForDisplay:displayId
+                              aspectWidth:profile->second.width
+                             aspectHeight:profile->second.height
+                                     dpi:profile->second.dpi];
+        return;
+    }
     [self openDisplayWindowForDisplay:displayId aspectWidth:0 aspectHeight:0 dpi:0];
 }
 
@@ -778,7 +915,17 @@ struct DisplayWindow {
                         aspectWidth:(uint32_t)aspectWidth
                        aspectHeight:(uint32_t)aspectHeight
                                dpi:(uint32_t)dpi {
-    if ([self isShuttingDown]) {
+    (void)dpi;
+    if ([self isShuttingDown] || displayId == 0 || displayId > kMaxUserDisplayId ||
+        _displayAppBindings.find(displayId) == _displayAppBindings.end()) {
+        return;
+    }
+    const std::string packageName =
+        package_from_component(_displayAppBindings.find(displayId)->second);
+    if (_closingAppPackages.count(packageName) > 0 ||
+        _displayRemovalPending.count(displayId) > 0) {
+        // A queued frame or late DISPLAY_ADDED event must not resurrect a
+        // window after the user has closed it.
         return;
     }
     if (!_channelReady || !_frameConsumer || !_frameConsumer->valid() || !_metalDevice) {
@@ -787,6 +934,9 @@ struct DisplayWindow {
     }
     auto existing = _displayWindows.find(displayId);
     if (existing != _displayWindows.end()) {
+        if (aspectWidth > 0 && aspectHeight > 0) {
+            [existing->second.window setContentAspectRatio:NSMakeSize(aspectWidth, aspectHeight)];
+        }
         [existing->second.window makeKeyAndOrderFront:nil];
         [self setDisplayStreaming:displayId enabled:YES];
         [NSApp activateIgnoringOtherApps:YES];
@@ -794,9 +944,7 @@ struct DisplayWindow {
     }
 
     NSSize initialSize;
-    if (displayId == 0) {
-        initialSize = NSMakeSize(420, 720);
-    } else if (aspectWidth > 0 && aspectHeight > 0) {
+    if (aspectWidth > 0 && aspectHeight > 0) {
         // Reuse the renderer's fit-to-screen math so the window opens at the
         // same size the first frame will resize it to (no jump).
         initialSize = macmu_fitted_window_content_size(aspectWidth, aspectHeight);
@@ -810,15 +958,13 @@ struct DisplayWindow {
                             NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskResizable
                     backing:NSBackingStoreBuffered
                       defer:NO];
-    window.title = displayId == 0
-                       ? @"MacMu Display"
-                       : [NSString stringWithFormat:@"MacMu Display %u", displayId];
+    window.title = @"Opening Application…";
     window.releasedWhenClosed = NO;
     window.delegate = self;
     // Lock the window's content aspect ratio to the request immediately; the
     // renderer also reasserts this on the first frame, but setting it now
     // keeps the resize handle honest before pixels arrive.
-    if (displayId != 0 && aspectWidth > 0 && aspectHeight > 0) {
+    if (aspectWidth > 0 && aspectHeight > 0) {
         [window setContentAspectRatio:NSMakeSize(aspectWidth, aspectHeight)];
     }
     [window center];
@@ -827,7 +973,8 @@ struct DisplayWindow {
         macmu_input_view_create(frame, _metalDevice, _inputSender, _guestInputSender);
     view.colorPixelFormat = MTLPixelFormatBGRA8Unorm;
     view.clearColor = MTLClearColorMake(0.03, 0.03, 0.035, 1.0);
-    view.preferredFramesPerSecond = 60;
+    view.preferredFramesPerSecond =
+        static_cast<NSInteger>(maximum_frames_per_second(window.screen));
     view.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
 
     MacMuSurfaceRendererRef renderer =
@@ -846,18 +993,13 @@ struct DisplayWindow {
     entry.window = window;
     entry.view = view;
     entry.renderer = renderer;
-    if (displayId != 0 && aspectWidth > 0 && aspectHeight > 0) {
-        entry.requestedWidth = aspectWidth;
-        entry.requestedHeight = aspectHeight;
-        entry.requestedDpi = dpi;
-    }
     _displayWindows[displayId] = entry;
-    if (displayId > 0 && displayId <= kMaxUserDisplayId) {
+    if (displayId <= kMaxUserDisplayId) {
         _activeUserDisplayIds.insert(displayId);
     }
+    [self updateApplicationWindowTitleForDisplay:displayId];
 
-    // Export is demand-driven for every display. Secondary displays also use
-    // this subscription to enable their shell-paced fallback ticker.
+    // Export is demand-driven; only visible application displays subscribe.
     [self setDisplayStreaming:displayId enabled:YES];
 
     [self startDoorbellThreadIfNeeded];
@@ -869,17 +1011,31 @@ struct DisplayWindow {
     if (!channel || !channel->ready()) {
         return;
     }
-    macmu::ControlDisplayStream request = {displayId, enabled ? 1u : 0u};
+    uint32_t maximumFramesPerSecond = 60;
+    auto display = _displayWindows.find(displayId);
+    if (display != _displayWindows.end()) {
+        maximumFramesPerSecond = maximum_frames_per_second(display->second.window.screen);
+        display->second.view.preferredFramesPerSecond =
+            static_cast<NSInteger>(maximumFramesPerSecond);
+    }
+    macmu::ControlDisplayStream request = {
+        displayId,
+        enabled ? 1u : 0u,
+        maximumFramesPerSecond,
+    };
     channel->request(macmu::ControlMessageType::kDisplayStream, &request, sizeof(request), 5000,
-                     [displayId](ControlChannel::Response response) {
+                     [displayId, maximumFramesPerSecond, enabled](ControlChannel::Response response) {
                          if (!response.ok) {
                              NSLog(@"MacMu display %u streaming toggle failed: %s", displayId,
                                    response.errorMessage.c_str());
+                         } else if (enabled) {
+                             NSLog(@"MacMu display %u streaming at screen maximum %u Hz", displayId,
+                                   maximumFramesPerSecond);
                          }
                      });
 }
 
-// Main thread only. A secondary VirtualDisplay belongs to one QEMU process
+// Main thread only. A VirtualDisplay belongs to one QEMU process
 // generation; keeping its window/id across a backend restart would make the
 // shell send input and control requests to a display that no longer exists.
 - (void)resetSecondaryDisplayStateAfterQemuExit {
@@ -887,10 +1043,6 @@ struct DisplayWindow {
         macmu_input_view_reset_state(entry.second.view);
     }
     for (auto it = _displayWindows.begin(); it != _displayWindows.end();) {
-        if (it->first == 0) {
-            ++it;
-            continue;
-        }
         NSWindow* window = it->second.window;
         window.delegate = nil;
         [self teardownDisplayWindowEntry:it->second];
@@ -900,7 +1052,17 @@ struct DisplayWindow {
     }
     _suppressRemoveOnClose.clear();
     _displayAppBindings.clear();
+    _appDisplayBindings.clear();
+    _pendingAppPackages.clear();
+    _launchRequestsInFlight.clear();
+    _closingAppPackages.clear();
+    _closingLaunchFailures.clear();
+    _deferredLaunchCleanup.clear();
+    _displayLaunchProfiles.clear();
+    _displayRemovalPending.clear();
     _activeUserDisplayIds.clear();
+    [_appsCollection reloadData];
+    [self updateApplicationsSummary];
 }
 
 - (void)restoreDisplaySubscriptions {
@@ -920,7 +1082,8 @@ struct DisplayWindow {
 
 - (uint32_t)allocateUserDisplayId {
     for (uint32_t candidate = 1; candidate <= kMaxUserDisplayId; ++candidate) {
-        if (_activeUserDisplayIds.find(candidate) == _activeUserDisplayIds.end()) {
+        if (_activeUserDisplayIds.find(candidate) == _activeUserDisplayIds.end() &&
+            _displayRemovalPending.find(candidate) == _displayRemovalPending.end()) {
             _activeUserDisplayIds.insert(candidate);
             NSLog(@"MacMu [diag] allocateUserDisplayId -> %u (active now: {%s})", candidate,
                   [self describeActiveIds].UTF8String);
@@ -935,8 +1098,10 @@ struct DisplayWindow {
 - (void)releaseUserDisplayId:(uint32_t)displayId {
     if (displayId != 0) {
         const auto erased = _activeUserDisplayIds.erase(displayId);
-        NSLog(@"MacMu [diag] releaseUserDisplayId(%u) %s (active now: {%s})", displayId,
-              erased ? "released" : "was-not-active", [self describeActiveIds].UTF8String);
+        if (erased) {
+            NSLog(@"MacMu [diag] releaseUserDisplayId(%u) (active now: {%s})", displayId,
+                  [self describeActiveIds].UTF8String);
+        }
     }
 }
 
@@ -954,6 +1119,7 @@ struct DisplayWindow {
     const bool qemuRunning = [self currentQemuPid] > 0;
     if (_createMachineButton) {
         _createMachineButton.enabled = !qemuRunning && (!hasSystemImage || !hasMachine);
+        _createMachineButton.hidden = hasSystemImage && hasMachine;
         if (!hasSystemImage) {
             _createMachineButton.title = @"Import Image…";
         } else if (!hasMachine) {
@@ -962,17 +1128,27 @@ struct DisplayWindow {
             _createMachineButton.title = @"Device Ready";
         }
     }
-    if (_appDataPathValue) {
-        _appDataPathValue.stringValue = qemuRunning ? @"Managed by MacMu - running"
-                                                    : @"Managed by MacMu";
-    }
-    if (_avdPathValue) {
-        _avdPathValue.stringValue = hasMachine ? @"Ready"
-                                               : (hasSystemImage ? @"Needs preparation"
-                                                                 : @"Waiting for image");
-    }
-    if (_systemPathValue) {
-        _systemPathValue.stringValue = hasSystemImage ? @"Ready" : @"Import required";
+    if (!_agentConnected) {
+        if (!hasSystemImage) {
+            [self updateBootPresentation:@"System image required"
+                                   detail:@"Import a MacMu Android 16 image to continue."
+                                    stage:@"SETUP"
+                                     busy:NO
+                                     ready:NO];
+            [self setAppsStatus:@"Android image required"];
+        } else if (!hasMachine) {
+            [self updateBootPresentation:@"Preparing Android device"
+                                   detail:@"Creating the managed MacMu virtual device…"
+                                    stage:@"PREPARING"
+                                     busy:YES
+                                     ready:NO];
+        } else if (!qemuRunning) {
+            [self updateBootPresentation:@"Starting Android"
+                                   detail:@"Launching the emulator core…"
+                                    stage:@"STARTING"
+                                     busy:YES
+                                     ready:NO];
+        }
     }
 }
 
@@ -1078,7 +1254,11 @@ struct DisplayWindow {
 
             dispatch_async(dispatch_get_main_queue(), ^{
                 if (ok) {
-                    [delegate publishQemuStatus:@"System image imported"];
+                    [delegate publishBootPresentation:@"System image imported"
+                                                detail:@"The Android device is ready. Starting MacMu…"
+                                                 stage:@"STARTING"
+                                                  busy:YES
+                                                 ready:NO];
                 } else {
                     [delegate publishQemuStatus:ns_string("Import failed: " + error)];
                     NSLog(@"MacMu image import failed: %s", error.c_str());
@@ -1093,7 +1273,11 @@ struct DisplayWindow {
     std::string error;
     if (macmu_create_default_machine(_options, &error)) {
         [self updateMachineControls];
-        [self publishQemuStatus:@"Machine ready"];
+        [self publishBootPresentation:@"Android device prepared"
+                                detail:@"Starting the emulator core…"
+                                 stage:@"STARTING"
+                                  busy:YES
+                                 ready:NO];
         return;
     }
     [self publishQemuStatus:ns_string(error)];
@@ -1101,17 +1285,151 @@ struct DisplayWindow {
     [self updateMachineControls];
 }
 
-- (void)setQemuStatusText:(NSString*)text {
-    _qemuStatusValue.stringValue = text;
+- (void)updateBootPresentation:(NSString*)title
+                         detail:(NSString*)detail
+                          stage:(NSString*)stage
+                           busy:(BOOL)busy
+                          ready:(BOOL)ready {
+    if (_bootTitleValue) {
+        _bootTitleValue.stringValue = title ?: @"MacMu";
+    }
+    if (_bootDetailValue) {
+        _bootDetailValue.stringValue = detail ?: @"";
+    }
+    if (_bootStageValue) {
+        _bootStageValue.stringValue = stage ?: @"";
+        _bootStageValue.textColor = ready ? [NSColor systemGreenColor]
+                                          : [NSColor tertiaryLabelColor];
+    }
+    if (_bootSpinner) {
+        _bootSpinner.hidden = !busy;
+        if (busy) {
+            [_bootSpinner startAnimation:nil];
+        } else {
+            [_bootSpinner stopAnimation:nil];
+        }
+    }
     if (_statusItem.button) {
-        _statusItem.button.title = [text hasPrefix:@"Running"] ? @"MacMu: Running" : @"MacMu";
+        _statusItem.button.title = ready ? @"MacMu: Ready" : (busy ? @"MacMu: Starting" : @"MacMu");
     }
 }
 
-- (void)publishQemuStatus:(NSString*)text {
+- (void)publishBootPresentation:(NSString*)title
+                          detail:(NSString*)detail
+                           stage:(NSString*)stage
+                            busy:(BOOL)busy
+                           ready:(BOOL)ready {
     dispatch_async(dispatch_get_main_queue(), ^{
-        [self setQemuStatusText:text];
+        [self updateBootPresentation:title detail:detail stage:stage busy:busy ready:ready];
     });
+}
+
+// Compatibility helper for setup/import errors that only carry one message.
+- (void)publishQemuStatus:(NSString*)text {
+    const BOOL busy = [text hasPrefix:@"Importing"] || [text hasPrefix:@"Preparing"] ||
+                      [text hasPrefix:@"Starting"] || [text hasPrefix:@"Exited"];
+    [self publishBootPresentation:text
+                           detail:busy ? @"This may take a moment…" : @"Check the MacMu setup and try again."
+                            stage:busy ? @"WORKING" : @"ATTENTION"
+                             busy:busy
+                            ready:NO];
+}
+
+- (NSString*)applicationNameForPackage:(const std::string&)packageName {
+    NSString* package = ns_string(packageName);
+    NSString* name = _appNames[package];
+    return name.length > 0 ? name : package;
+}
+
+- (void)updateApplicationWindowTitleForDisplay:(uint32_t)displayId {
+    auto window = _displayWindows.find(displayId);
+    auto binding = _displayAppBindings.find(displayId);
+    if (window == _displayWindows.end() || binding == _displayAppBindings.end() ||
+        !window->second.window) {
+        return;
+    }
+    const std::string packageName = package_from_component(binding->second);
+    window->second.window.title = [self applicationNameForPackage:packageName];
+}
+
+- (void)updateApplicationsSummary {
+    if (!_appsLoaded) {
+        return;
+    }
+    const NSUInteger total = _apps.count;
+    const size_t opening = _pendingAppPackages.size();
+    const size_t closing = _closingAppPackages.size();
+    const size_t transitional = opening + closing;
+    const size_t running = _appDisplayBindings.size() >= transitional
+                               ? _appDisplayBindings.size() - transitional
+                               : 0;
+    NSString* status = nil;
+    if (opening > 0) {
+        status = [NSString stringWithFormat:@"%lu applications · %zu opening",
+                                            static_cast<unsigned long>(total), opening];
+    } else if (closing > 0) {
+        status = [NSString stringWithFormat:@"%lu applications · %zu closing",
+                                            static_cast<unsigned long>(total), closing];
+    } else if (running > 0) {
+        status = [NSString stringWithFormat:@"%lu applications · %zu running",
+                                            static_cast<unsigned long>(total), running];
+    } else {
+        status = [NSString stringWithFormat:@"%lu applications",
+                                            static_cast<unsigned long>(total)];
+    }
+    [self setAppsStatus:status];
+}
+
+- (void)updateApplicationActions {
+    const BOOL hasSelection = _appsCollection.selectionIndexPaths.count > 0;
+    if (_refreshAppsButton) {
+        _refreshAppsButton.enabled = _agentConnected;
+    }
+    if (_openApplicationButton) {
+        _openApplicationButton.enabled = _agentConnected && hasSelection;
+    }
+}
+
+- (void)clearApplicationCatalog {
+    [_apps removeAllObjects];
+    [_appNames removeAllObjects];
+    [_appIcons removeAllObjects];
+    [_appsCollection reloadData];
+    _appsEmptyValue.hidden = NO;
+    [self updateApplicationActions];
+}
+
+- (void)unbindApplicationFromDisplay:(uint32_t)displayId {
+    auto binding = _displayAppBindings.find(displayId);
+    if (binding == _displayAppBindings.end()) {
+        return;
+    }
+    const std::string packageName = package_from_component(binding->second);
+    auto reverse = _appDisplayBindings.find(packageName);
+    if (reverse != _appDisplayBindings.end() && reverse->second == displayId) {
+        _appDisplayBindings.erase(reverse);
+    }
+    _pendingAppPackages.erase(packageName);
+    _launchRequestsInFlight.erase(packageName);
+    _closingAppPackages.erase(packageName);
+    _closingLaunchFailures.erase(displayId);
+    _deferredLaunchCleanup.erase(displayId);
+    _displayLaunchProfiles.erase(displayId);
+    _displayAppBindings.erase(binding);
+    [_appsCollection reloadData];
+    [self updateApplicationsSummary];
+    [self updateApplicationActions];
+}
+
+- (void)rollbackApplicationDisplay:(uint32_t)displayId message:(NSString*)message {
+    [self unbindApplicationFromDisplay:displayId];
+    [self setAppsStatus:message];
+    [self requestDisplayRemove:displayId];
+    auto window = _displayWindows.find(displayId);
+    if (window != _displayWindows.end()) {
+        _suppressRemoveOnClose[displayId] = true;
+        [window->second.window close];
+    }
 }
 
 #pragma mark - Control channel
@@ -1131,49 +1449,77 @@ struct DisplayWindow {
     }
     macmu::ControlEventDisplay event;
     std::memcpy(&event, payload.data(), sizeof(event));
-    if (event.state == macmu::kControlDisplayAdded && event.displayId != 0) {
+    if (event.displayId == 0 || event.displayId > kMaxUserDisplayId) {
+        return;
+    }
+    if (event.state == macmu::kControlDisplayAdded) {
+        if (_displayAppBindings.find(event.displayId) == _displayAppBindings.end()) {
+            // MacMu never exposes blank displays. Tear down an unexpected
+            // guest-created surface instead of opening an unbound window.
+            NSLog(@"MacMu ignoring unbound display %u", event.displayId);
+            [self requestDisplayRemove:event.displayId];
+            return;
+        }
         [self openDisplayWindowForDisplay:event.displayId
                               aspectWidth:event.width
                              aspectHeight:event.height
                                      dpi:event.dpi];
         return;
     }
-    if (event.state == macmu::kControlDisplayRemoved && event.displayId != 0) {
-        _displayAppBindings.erase(event.displayId);
+    if (event.state == macmu::kControlDisplayRemoved) {
+        // The receiver writes DISPLAY_REMOVE_OK followed by this event on the
+        // same stream. Keep the id reserved through the ACK and let the event
+        // own release, preventing a stale remove event from hitting a newly
+        // reused application slot.
+        _displayRemovalPending.erase(event.displayId);
+        [self unbindApplicationFromDisplay:event.displayId];
         auto it = _displayWindows.find(event.displayId);
         if (it != _displayWindows.end()) {
             _suppressRemoveOnClose[event.displayId] = true;
             [it->second.window close];
         } else {
-            // Guest removed a display we never opened a window for; release
-            // the id here since no windowWillClose will do it.
+            // There is no window-close path to release the slot.
             [self releaseUserDisplayId:event.displayId];
         }
     }
 }
 
 - (void)requestDisplayRemove:(uint32_t)displayId {
+    if (displayId == 0 || displayId > kMaxUserDisplayId ||
+        _displayRemovalPending.count(displayId) > 0) {
+        return;
+    }
+    _displayRemovalPending.insert(displayId);
     auto channel = [self controlChannel];
     if (!channel || !channel->alive()) {
-        // No control channel (qemu exited or is restarting): the guest-side
-        // display is already gone, but the id must still be freed locally.
-        [self releaseUserDisplayId:displayId];
+        // Only a confirmed QEMU exit proves the guest-side display is gone.
+        // If QEMU is still alive, retain this id as a tombstone so it cannot be
+        // reused against an orphaned display; the generation reset will clear
+        // it when the backend exits.
+        if ([self currentQemuPid] <= 0) {
+            _displayRemovalPending.erase(displayId);
+            [self unbindApplicationFromDisplay:displayId];
+            [self releaseUserDisplayId:displayId];
+        } else {
+            NSLog(@"MacMu display %u removal deferred until control reconnect or QEMU reset",
+                  displayId);
+        }
         return;
     }
     macmu::ControlDisplayRemove request = {displayId};
-    MacMuAppDelegate* delegate = self;
     channel->request(macmu::ControlMessageType::kDisplayRemove, &request, sizeof(request), 5000,
-                     [delegate, displayId](ControlChannel::Response response) {
+                     [displayId](ControlChannel::Response response) {
                          if (!response.ok) {
                              NSLog(@"MacMu display %u remove failed: %s", displayId,
                                    response.errorMessage.c_str());
+                             // An error or timeout cannot prove that the guest
+                             // display is absent. Keep the tombstone reserved;
+                             // either a late DISPLAY_REMOVED event or the next
+                             // QEMU generation reset will release it safely.
                          }
-                         // Release the id now that qemu has torn the display
-                         // down (or we gave up); this lets a subsequent
-                         // "launch in new display" reuse the slot.
-                         dispatch_async(dispatch_get_main_queue(), ^{
-                             [delegate releaseUserDisplayId:displayId];
-                         });
+                         // On success the ordered DISPLAY_REMOVED event owns
+                         // cleanup and release. Do not make the id reusable at
+                         // the ACK boundary.
                      });
 }
 
@@ -1188,11 +1534,32 @@ struct DisplayWindow {
     }
 
     const std::string component = binding->second;
-    _displayAppBindings.erase(binding);
-    if (!_guestControlClient || !_guestControlClient->ready()) {
-        NSLog(@"MacMu display %u app close skipped; guest control is not connected.",
-              displayId);
+    const std::string packageName = package_from_component(component);
+    // Closing the window during the short DISPLAY_ADD -> launch handoff is a
+    // launch cancellation. Clear pending before the delayed block runs so it
+    // cannot start the task after close/remove has already begun.
+    const bool wasPending = _pendingAppPackages.erase(packageName) > 0;
+    const bool launchWasSent = _launchRequestsInFlight.erase(packageName) > 0;
+    _closingLaunchFailures.erase(displayId);
+    _closingAppPackages.insert(packageName);
+    [_appsCollection reloadData];
+    [self updateApplicationActions];
+    [self updateApplicationsSummary];
+    if (wasPending && !launchWasSent) {
+        // The task was never started, so there is nothing to stop in Android.
+        // Remove only the reserved display and let its completion event unbind.
         [self requestDisplayRemove:displayId];
+        return;
+    }
+    if (!_guestControlClient || !_guestControlClient->ready()) {
+        // Keep the application/display binding intact. Removing its display
+        // without stopping the task can reparent it onto hidden display 0.
+        NSLog(@"MacMu display %u app close deferred; guest control is not connected.", displayId);
+        _closingAppPackages.erase(packageName);
+        [self openDisplayWindowForDisplay:displayId];
+        [_appsCollection reloadData];
+        [self updateApplicationActions];
+        [self setAppsStatus:@"Android agent disconnected; the application is still open"];
         return;
     }
 
@@ -1201,78 +1568,48 @@ struct DisplayWindow {
     command += " " + std::to_string(displayId);
     MacMuAppDelegate* delegate = self;
     _guestControlClient->request(command, 5000,
-                                 [delegate, displayId](bool ok, std::string payload) {
+                                 [delegate, displayId, component, packageName](bool ok,
+                                                                               std::string payload) {
                                      if (!ok) {
                                          NSLog(@"MacMu display %u bound app close failed: %s",
                                                displayId, payload.c_str());
                                      }
                                      dispatch_async(dispatch_get_main_queue(), ^{
+                                         auto binding = delegate->_displayAppBindings.find(displayId);
+                                         if (binding == delegate->_displayAppBindings.end() ||
+                                             binding->second != component) {
+                                             return;
+                                         }
+                                         if (!ok) {
+                                             auto launchFailure =
+                                                 delegate->_closingLaunchFailures.find(displayId);
+                                             if (launchFailure !=
+                                                 delegate->_closingLaunchFailures.end()) {
+                                                 // The launch itself definitively failed, so
+                                                 // this is an empty display even though close
+                                                 // also failed. Remove it instead of reopening
+                                                 // a blank window as a running application.
+                                                 const std::string message = launchFailure->second;
+                                                 [delegate setAppsStatus:ns_string(
+                                                                             "Could not open application: " +
+                                                                             message)];
+                                                 [delegate requestDisplayRemove:displayId];
+                                                 return;
+                                             }
+                                             // Preserve and re-show the display rather than
+                                             // orphaning a task on Android's hidden display 0.
+                                             delegate->_closingAppPackages.erase(packageName);
+                                             [delegate openDisplayWindowForDisplay:displayId];
+                                             [delegate->_appsCollection reloadData];
+                                             [delegate updateApplicationActions];
+                                             [delegate setAppsStatus:ns_string(
+                                                                         "Could not close application: " +
+                                                                         payload)];
+                                             return;
+                                         }
                                          [delegate requestDisplayRemove:displayId];
                                      });
                                  });
-}
-
-- (void)newDisplay:(id)sender {
-    if ([self isShuttingDown]) {
-        return;
-    }
-    auto channel = [self controlChannel];
-    if (!channel || !channel->alive()) {
-        [self publishQemuStatus:@"Control channel not connected"];
-        NSBeep();
-        return;
-    }
-    // Allocate an explicit id up front (not AUTO): the qemu control plane's
-    // auto-allocate does not reliably skip displays we still have open, so a
-    // second new-display request could be handed the same id as the first.
-    const uint32_t displayId = [self allocateUserDisplayId];
-    if (displayId == 0) {
-        [self publishQemuStatus:@"No free display id (1..5 in use)"];
-        NSBeep();
-        return;
-    }
-    const DisplayLaunchProfile& profile = kDisplayLaunchProfiles[kDefaultDisplayLaunchProfile];
-    macmu::ControlDisplayAdd request = {};
-    request.displayId = displayId;
-    request.width = profile.width;
-    request.height = profile.height;
-    request.dpi = profile.dpi;
-    request.flags = kNewDisplayFlags;
-    const uint32_t aspectWidth = profile.width;
-    const uint32_t aspectHeight = profile.height;
-    const uint32_t aspectDpi = profile.dpi;
-    MacMuAppDelegate* delegate = self;
-    channel->request(
-        macmu::ControlMessageType::kDisplayAdd, &request, sizeof(request), 10000,
-        [delegate, displayId, aspectWidth, aspectHeight, aspectDpi](
-            ControlChannel::Response response) {
-            dispatch_async(dispatch_get_main_queue(), ^{
-                if (!response.ok ||
-                    response.payload.size() < sizeof(macmu::ControlDisplayAddOk)) {
-                    NSString* message =
-                        [NSString stringWithFormat:@"New display failed: %s",
-                                                   response.errorMessage.empty()
-                                                       ? "malformed response"
-                                                       : response.errorMessage.c_str()];
-                    [delegate publishQemuStatus:message];
-                    NSLog(@"%@", message);
-                    [delegate releaseUserDisplayId:displayId];
-                    return;
-                }
-                macmu::ControlDisplayAddOk ok;
-                std::memcpy(&ok, response.payload.data(), sizeof(ok));
-                [delegate openDisplayWindowForDisplay:ok.displayId
-                                          aspectWidth:aspectWidth
-                                         aspectHeight:aspectHeight
-                                                 dpi:aspectDpi];
-                if (![delegate hasDisplayWindow:ok.displayId]) {
-                    // The window could not be opened (no Metal device /
-                    // frame channel, or shutdown started). Tear the guest
-                    // display back down; the remove ack releases the id.
-                    [delegate requestDisplayRemove:ok.displayId];
-                }
-            });
-        });
 }
 
 // Main thread only.
@@ -1280,21 +1617,23 @@ struct DisplayWindow {
     return _displayWindows.find(displayId) != _displayWindows.end();
 }
 
-#pragma mark - Apps window
-
-- (void)showAppsWindow:(id)sender {
-    [self showStatusWindow:sender];
-    if (_apps.count == 0) {
-        [self refreshApps:nil];
-    }
-}
+#pragma mark - Applications
 
 - (void)setAppsStatus:(NSString*)status {
-    dispatch_async(dispatch_get_main_queue(), ^{
+    void (^update)(void) = ^{
         if (self->_appsStatusValue) {
             self->_appsStatusValue.stringValue = status;
         }
-    });
+        if (self->_appsEmptyValue && self->_apps.count == 0) {
+            self->_appsEmptyValue.stringValue = status;
+            self->_appsEmptyValue.hidden = NO;
+        }
+    };
+    if ([NSThread isMainThread]) {
+        update();
+    } else {
+        dispatch_async(dispatch_get_main_queue(), update);
+    }
 }
 
 - (void)refreshApps:(id)sender {
@@ -1302,21 +1641,36 @@ struct DisplayWindow {
         return;
     }
     if (!_guestControlClient || !_guestControlClient->ready()) {
-        [self setAppsStatus:@"Agent not connected"];
+        [self setAppsStatus:@"Waiting for Android…"];
         return;
     }
-    [self setAppsStatus:@"Loading…"];
+    [self setAppsStatus:@"Loading applications…"];
+    [self updateBootPresentation:@"Android started"
+                           detail:@"Discovering installed applications…"
+                            stage:@"LOADING"
+                             busy:YES
+                             ready:NO];
     MacMuAppDelegate* delegate = self;
     _guestControlClient->request("apps", 15000, [delegate](bool ok, std::string payload) {
         if (!ok) {
-            [delegate setAppsStatus:ns_string("Failed: " + payload)];
+            [delegate setAppsStatus:ns_string("Could not load applications: " + payload)];
+            [delegate publishBootPresentation:@"Android started"
+                                        detail:@"Application discovery failed. Use Refresh to retry."
+                                         stage:@"ATTENTION"
+                                          busy:NO
+                                         ready:NO];
             return;
         }
         NSData* data = [NSData dataWithBytes:payload.data() length:payload.size()];
         NSError* error = nil;
         id parsed = [NSJSONSerialization JSONObjectWithData:data options:0 error:&error];
         if (![parsed isKindOfClass:[NSArray class]]) {
-            [delegate setAppsStatus:@"Malformed app list"];
+            [delegate setAppsStatus:@"Could not read the application list"];
+            [delegate publishBootPresentation:@"Android started"
+                                        detail:@"The application list was malformed. Use Refresh to retry."
+                                         stage:@"ATTENTION"
+                                          busy:NO
+                                         ready:NO];
             return;
         }
         NSArray* entries = (NSArray*)parsed;
@@ -1330,6 +1684,7 @@ struct DisplayWindow {
     [_apps removeAllObjects];
     [_appNames removeAllObjects];
     [_appIcons removeAllObjects];
+    NSMutableSet<NSString*>* seenPackages = [NSMutableSet set];
     for (id entry in entries) {
         if (![entry isKindOfClass:[NSDictionary class]]) {
             continue;
@@ -1340,6 +1695,12 @@ struct DisplayWindow {
             continue;
         }
         NSString* pkg = dict[@"pkg"];
+        // Applications are package-scoped. A package can expose more than one
+        // launcher activity, but it still receives one tile and one display.
+        if ([seenPackages containsObject:pkg]) {
+            continue;
+        }
+        [seenPackages addObject:pkg];
         [_apps addObject:dict];
         // Cache friendly name (falls back to package name in the cell).
         NSString* name = dict[@"name"];
@@ -1366,32 +1727,34 @@ struct DisplayWindow {
         NSString* nameB = _appNames[b[@"pkg"]] ?: b[@"pkg"];
         return [nameA localizedCaseInsensitiveCompare:nameB];
     }];
-    [_appsTable reloadData];
-    [self setAppsStatus:[NSString stringWithFormat:@"%lu apps",
-                                                   static_cast<unsigned long>(_apps.count)]];
+    _appsLoaded = true;
+    [_appsCollection reloadData];
+    for (const auto& binding : _displayAppBindings) {
+        [self updateApplicationWindowTitleForDisplay:binding.first];
+    }
+    _appsEmptyValue.hidden = _apps.count > 0;
+    [self updateApplicationsSummary];
+    [self updateApplicationActions];
+    NSString* detail = _apps.count == 0
+                           ? @"Android is ready, but no launcher applications were found."
+                           : [NSString stringWithFormat:@"%lu applications are ready to open.",
+                                                        static_cast<unsigned long>(_apps.count)];
+    [self updateBootPresentation:@"Ready" detail:detail stage:@"READY" busy:NO ready:YES];
+    NSLog(@"MacMu application catalog ready (%lu packages).",
+          static_cast<unsigned long>(_apps.count));
 }
 
 - (NSString*)selectedAppComponent {
-    const NSInteger row = _appsTable.selectedRow;
-    if (row < 0 || row >= static_cast<NSInteger>(_apps.count)) {
+    NSIndexPath* indexPath = _appsCollection.selectionIndexPaths.anyObject;
+    if (!indexPath || indexPath.item >= _apps.count) {
         return nil;
     }
-    NSDictionary* app = _apps[static_cast<NSUInteger>(row)];
+    NSDictionary* app = _apps[indexPath.item];
     return [NSString stringWithFormat:@"%@/%@", app[@"pkg"], app[@"activity"]];
 }
 
-- (void)launchAppOnPrimary:(id)sender {
-    NSString* component = [self selectedAppComponent];
-    if (!component) {
-        NSBeep();
-        return;
-    }
-    [self launchComponent:component onDisplay:0];
-    [self openDisplayWindowForDisplay:0];
-}
-
-- (void)launchAppOnNewDisplay:(id)sender {
-    [self launchSelectedAppInNewDisplayWithProfile:
+- (void)openSelectedApplication:(id)sender {
+    [self launchSelectedApplicationWithProfile:
               kDisplayLaunchProfiles[kDefaultDisplayLaunchProfile]];
 }
 
@@ -1410,10 +1773,10 @@ struct DisplayWindow {
         NSBeep();
         return;
     }
-    [self launchSelectedAppInNewDisplayWithProfile:kDisplayLaunchProfiles[index]];
+    [self launchSelectedApplicationWithProfile:kDisplayLaunchProfiles[index]];
 }
 
-- (void)launchSelectedAppInNewDisplayWithProfile:(DisplayLaunchProfile)profile {
+- (void)launchSelectedApplicationWithProfile:(DisplayLaunchProfile)profile {
     if ([self isShuttingDown]) {
         return;
     }
@@ -1422,20 +1785,54 @@ struct DisplayWindow {
         NSBeep();
         return;
     }
+    const std::string componentValue = [component UTF8String];
+    const std::string packageName = package_from_component(componentValue);
+    auto existingApp = _appDisplayBindings.find(packageName);
+    if (existingApp != _appDisplayBindings.end()) {
+        const uint32_t existingDisplayId = existingApp->second;
+        NSString* name = [self applicationNameForPackage:packageName];
+        if (_closingAppPackages.count(packageName) > 0 ||
+            _displayRemovalPending.count(existingDisplayId) > 0) {
+            [self setAppsStatus:[NSString stringWithFormat:@"Closing %@…", name]];
+            return;
+        }
+        auto window = _displayWindows.find(existingDisplayId);
+        if (window != _displayWindows.end()) {
+            [window->second.window makeKeyAndOrderFront:nil];
+            [self setDisplayStreaming:existingDisplayId enabled:YES];
+            [NSApp activateIgnoringOtherApps:YES];
+        }
+        [self setAppsStatus:_pendingAppPackages.count(packageName) > 0
+                                ? [NSString stringWithFormat:@"Opening %@…", name]
+                                : [NSString stringWithFormat:@"%@ is already open", name]];
+        return;
+    }
+    if (!_agentConnected) {
+        [self setAppsStatus:@"Waiting for Android…"];
+        return;
+    }
     auto channel = [self controlChannel];
     if (!channel || !channel->alive()) {
         [self setAppsStatus:@"Control channel not connected"];
         return;
     }
-    // Allocate an explicit id up front (not AUTO). The qemu control plane's
-    // auto-allocate can hand back the same id as an already-open display, which
-    // makes the new app land on the existing display with the old aspect ratio.
+    // Reserve both sides of the package/display bijection before DISPLAY_ADD.
+    // This closes the double-click race and lets display-added events know the
+    // new surface belongs to an application rather than a blank display.
     const uint32_t displayId = [self allocateUserDisplayId];
     if (displayId == 0) {
-        [self setAppsStatus:@"No free display id (1..5 in use)"];
+        [self setAppsStatus:@"Up to 5 applications can run at the same time"];
         NSBeep();
         return;
     }
+    _displayAppBindings[displayId] = componentValue;
+    _appDisplayBindings[packageName] = displayId;
+    _pendingAppPackages.insert(packageName);
+    _displayLaunchProfiles[displayId] = profile;
+    [_appsCollection reloadData];
+    [self updateApplicationActions];
+    [self setAppsStatus:[NSString stringWithFormat:@"Opening %@…",
+                                                   [self applicationNameForPackage:packageName]]];
     macmu::ControlDisplayAdd request = {};
     request.displayId = displayId;
     request.width = profile.width;
@@ -1448,33 +1845,61 @@ struct DisplayWindow {
     MacMuAppDelegate* delegate = self;
     channel->request(
         macmu::ControlMessageType::kDisplayAdd, &request, sizeof(request), 10000,
-        [delegate, component, displayId, aspectWidth, aspectHeight, aspectDpi](
+        [delegate, component, packageName, displayId, aspectWidth, aspectHeight, aspectDpi](
             ControlChannel::Response response) {
             dispatch_async(dispatch_get_main_queue(), ^{
-                if (!response.ok ||
-                    response.payload.size() < sizeof(macmu::ControlDisplayAddOk)) {
-                    [delegate setAppsStatus:ns_string("Display add failed: " +
-                                                      response.errorMessage)];
-                    [delegate releaseUserDisplayId:displayId];
+                if (!response.ok) {
+                    NSString* message = ns_string("Could not open application: " +
+                                                  response.errorMessage);
+                    if (response.type ==
+                        static_cast<uint16_t>(macmu::ControlMessageType::kError)) {
+                        // A direct QEMU error is authoritative: DISPLAY_ADD did
+                        // not apply, so this reservation can be released without
+                        // waiting for a remove event.
+                        [delegate unbindApplicationFromDisplay:displayId];
+                        [delegate releaseUserDisplayId:displayId];
+                        [delegate setAppsStatus:message];
+                    } else {
+                        // Timeout/channel failure is ambiguous; issue a remove
+                        // and retain the id until its completion event.
+                        [delegate rollbackApplicationDisplay:displayId message:message];
+                    }
+                    return;
+                }
+                if (response.payload.size() < sizeof(macmu::ControlDisplayAddOk)) {
+                    [delegate rollbackApplicationDisplay:displayId
+                                                  message:@"Could not read the application window response"];
                     return;
                 }
                 macmu::ControlDisplayAddOk ok;
                 std::memcpy(&ok, response.payload.data(), sizeof(ok));
-                NSLog(@"MacMu: launched %@ on new display %u (%ux%u)", component, ok.displayId,
+                auto reserved = delegate->_appDisplayBindings.find(packageName);
+                if (reserved == delegate->_appDisplayBindings.end() ||
+                    reserved->second != displayId) {
+                    // The user closed this launch while DISPLAY_ADD was in
+                    // flight. Remove the accepted surface without surfacing an
+                    // error for an intentional close.
+                    [delegate requestDisplayRemove:ok.displayId];
+                    return;
+                }
+                if (ok.displayId != displayId) {
+                    [delegate rollbackApplicationDisplay:displayId
+                                                  message:@"Could not reserve an application window"];
+                    [delegate requestDisplayRemove:ok.displayId];
+                    return;
+                }
+                NSLog(@"MacMu: opening %@ on virtual display %u (%ux%u)", component, ok.displayId,
                       aspectWidth, aspectHeight);
                 [delegate openDisplayWindowForDisplay:ok.displayId
                                           aspectWidth:aspectWidth
                                          aspectHeight:aspectHeight
                                                  dpi:aspectDpi];
                 if (![delegate hasDisplayWindow:ok.displayId]) {
-                    // Window open failed (no Metal device / frame channel, or
-                    // shutdown started): don't bind or launch the app, and
-                    // tear the guest display back down so the id is released.
-                    [delegate setAppsStatus:@"Display window unavailable"];
-                    [delegate requestDisplayRemove:ok.displayId];
+                    [delegate rollbackApplicationDisplay:ok.displayId
+                                                  message:@"Application window is unavailable"];
                     return;
                 }
-                delegate->_displayAppBindings[ok.displayId] = [component UTF8String];
+                [delegate updateApplicationWindowTitleForDisplay:ok.displayId];
                 // Give the guest a brief moment to register the new
                 // VirtualDisplay, then launch. The agent also waits on the
                 // display internally, so a short delay here is enough; the
@@ -1482,8 +1907,73 @@ struct DisplayWindow {
                 dispatch_after(
                     dispatch_time(DISPATCH_TIME_NOW, static_cast<int64_t>(0.2 * NSEC_PER_SEC)),
                     dispatch_get_main_queue(), ^{
-                        [delegate launchComponent:component onDisplay:ok.displayId];
+                        auto binding = delegate->_displayAppBindings.find(ok.displayId);
+                        if (binding != delegate->_displayAppBindings.end() &&
+                            binding->second == [component UTF8String] &&
+                            delegate->_pendingAppPackages.count(packageName) > 0 &&
+                            delegate->_closingAppPackages.count(packageName) == 0) {
+                            delegate->_launchRequestsInFlight.insert(packageName);
+                            [delegate launchComponent:component onDisplay:ok.displayId];
+                        }
                     });
+            });
+        });
+}
+
+- (void)cleanupFailedLaunchForDisplay:(uint32_t)displayId
+                            component:(NSString*)component
+                              message:(NSString*)message {
+    if ([self isShuttingDown] || !component) {
+        return;
+    }
+    const std::string componentValue = component.UTF8String;
+    auto binding = _displayAppBindings.find(displayId);
+    if (binding == _displayAppBindings.end() || binding->second != componentValue) {
+        return;
+    }
+
+    const std::string packageName = package_from_component(componentValue);
+    _pendingAppPackages.erase(packageName);
+    _launchRequestsInFlight.erase(packageName);
+    _closingAppPackages.insert(packageName);
+    _deferredLaunchCleanup[displayId] = componentValue;
+    [_appsCollection reloadData];
+    [self updateApplicationActions];
+    [self updateApplicationsSummary];
+
+    if (!_guestControlClient || !_guestControlClient->ready()) {
+        [self setAppsStatus:[NSString stringWithFormat:@"%@; cleanup will resume after Android reconnects",
+                                                       message]];
+        return;
+    }
+
+    std::string command = "close ";
+    command += componentValue;
+    command += " " + std::to_string(displayId);
+    const std::string messageValue = message.UTF8String;
+    MacMuAppDelegate* delegate = self;
+    _guestControlClient->request(
+        command, 5000,
+        [delegate, displayId, componentValue, packageName, messageValue](bool ok,
+                                                                         std::string payload) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                auto cleanup = delegate->_deferredLaunchCleanup.find(displayId);
+                auto binding = delegate->_displayAppBindings.find(displayId);
+                if (cleanup == delegate->_deferredLaunchCleanup.end() ||
+                    cleanup->second != componentValue ||
+                    binding == delegate->_displayAppBindings.end() ||
+                    binding->second != componentValue) {
+                    return;
+                }
+                if (!ok) {
+                    NSLog(@"MacMu display %u failed-launch cleanup failed: %s", displayId,
+                          payload.c_str());
+                    [delegate setAppsStatus:ns_string(messageValue +
+                                                      "; close the application window to retry cleanup")];
+                    return;
+                }
+                delegate->_deferredLaunchCleanup.erase(cleanup);
+                [delegate rollbackApplicationDisplay:displayId message:ns_string(messageValue)];
             });
         });
 }
@@ -1493,7 +1983,9 @@ struct DisplayWindow {
         return;
     }
     if (!_guestControlClient || !_guestControlClient->ready()) {
-        [self setAppsStatus:@"Agent not connected"];
+        [self cleanupFailedLaunchForDisplay:displayId
+                                  component:component
+                                    message:@"Android agent disconnected during launch"];
         return;
     }
     std::string command = "launch ";
@@ -1502,100 +1994,85 @@ struct DisplayWindow {
     MacMuAppDelegate* delegate = self;
     _guestControlClient->request(command, 15000, [delegate, displayId, component](
                                                      bool ok, std::string payload) {
-        if (!ok) {
-            [delegate setAppsStatus:ns_string("Launch failed: " + payload)];
-        } else {
-            [delegate setAppsStatus:[NSString
-                                        stringWithFormat:@"Launched %@ on display %u",
-                                                         component.lastPathComponent, displayId]];
-        }
+        dispatch_async(dispatch_get_main_queue(), ^{
+            const std::string componentValue = [component UTF8String];
+            const std::string packageName = package_from_component(componentValue);
+            delegate->_launchRequestsInFlight.erase(packageName);
+            auto binding = delegate->_displayAppBindings.find(displayId);
+            if (binding == delegate->_displayAppBindings.end() ||
+                binding->second != componentValue) {
+                return;  // the user closed the window while the request ran
+            }
+            if (delegate->_closingAppPackages.count(packageName) > 0) {
+                const bool ambiguousTransportFailure =
+                    payload == "guest request timed out" ||
+                    payload == "guest agent disconnected" ||
+                    payload == "guest control client stopped" ||
+                    payload == "guest control write failed" ||
+                    payload == "guest agent not connected";
+                if (!ok && !ambiguousTransportFailure) {
+                    delegate->_closingLaunchFailures[displayId] = payload;
+                }
+                return;  // the ordered close transaction owns final cleanup
+            }
+            if (!ok) {
+                [delegate cleanupFailedLaunchForDisplay:displayId
+                                              component:component
+                                                message:ns_string("Could not open application: " +
+                                                                  payload)];
+                return;
+            }
+            delegate->_pendingAppPackages.erase(packageName);
+            [delegate->_appsCollection reloadData];
+            [delegate updateApplicationActions];
+            [delegate updateApplicationsSummary];
+            [delegate updateApplicationWindowTitleForDisplay:displayId];
+        });
     });
 }
 
-#pragma mark - Apps table data source
+#pragma mark - Applications collection data source
 
-- (NSInteger)numberOfRowsInTableView:(NSTableView*)tableView {
+- (NSInteger)collectionView:(NSCollectionView*)collectionView
+      numberOfItemsInSection:(NSInteger)section {
     return static_cast<NSInteger>(_apps.count);
 }
 
-- (CGFloat)tableView:(NSTableView*)tableView heightOfRow:(NSInteger)row {
-    return 56.0;
+- (NSCollectionViewItem*)collectionView:(NSCollectionView*)collectionView
+    itemForRepresentedObjectAtIndexPath:(NSIndexPath*)indexPath {
+    MacMuApplicationItem* item = (MacMuApplicationItem*)[collectionView
+        makeItemWithIdentifier:kApplicationItemIdentifier
+                  forIndexPath:indexPath];
+    if (indexPath.item >= _apps.count) {
+        return item;
+    }
+    NSDictionary* app = _apps[indexPath.item];
+    NSString* package = app[@"pkg"];
+    NSString* activity = app[@"activity"];
+    NSString* name = _appNames[package] ?: package;
+    NSImage* icon = _appIcons[package];
+    item.imageView.image = icon ?: placeholder_icon(name, NSMakeSize(64, 64));
+    item.textField.stringValue = name;
+    item.view.toolTip = [NSString stringWithFormat:@"%@\n%@", package, activity];
+
+    const std::string packageName = package.UTF8String;
+    const BOOL bound = _appDisplayBindings.find(packageName) != _appDisplayBindings.end();
+    const BOOL opening = _pendingAppPackages.find(packageName) != _pendingAppPackages.end();
+    const BOOL closing = _closingAppPackages.find(packageName) != _closingAppPackages.end();
+    [item setApplicationRunning:bound && !opening && !closing
+                         opening:opening
+                         closing:closing];
+    return item;
 }
 
-- (NSView*)tableView:(NSTableView*)tableView
-    viewForTableColumn:(NSTableColumn*)tableColumn
-                   row:(NSInteger)row {
-    if (row < 0 || row >= static_cast<NSInteger>(_apps.count)) {
-        return nil;
-    }
-    NSDictionary* app = _apps[static_cast<NSUInteger>(row)];
-    NSString* pkg = app[@"pkg"];
-    NSString* activity = app[@"activity"];
-    NSString* name = _appNames[pkg] ?: pkg;
+- (void)collectionView:(NSCollectionView*)collectionView
+    didSelectItemsAtIndexPaths:(NSSet<NSIndexPath*>*)indexPaths {
+    [self updateApplicationActions];
+}
 
-    static NSString* const kCellIdentifier = @"MacMuAppCell";
-    NSView* cell = [tableView makeViewWithIdentifier:kCellIdentifier owner:self];
-    if (!cell) {
-        const CGFloat cellH = 56.0;
-        cell = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, tableColumn.width, cellH)];
-        cell.identifier = kCellIdentifier;
-
-        NSImageView* iconView = [[NSImageView alloc] initWithFrame:NSMakeRect(14, 8, 40, 40)];
-        iconView.identifier = @"icon";
-        iconView.imageScaling = NSImageScaleProportionallyDown;
-        iconView.imageAlignment = NSImageAlignCenter;
-        iconView.wantsLayer = YES;
-        iconView.layer.cornerRadius = 8.0;
-        iconView.layer.masksToBounds = YES;
-        [cell addSubview:iconView];
-
-        NSTextField* nameField =
-            [[NSTextField alloc] initWithFrame:NSMakeRect(64, 30, tableColumn.width - 78, 18)];
-        nameField.identifier = @"name";
-        nameField.bezeled = NO;
-        nameField.drawsBackground = NO;
-        nameField.editable = NO;
-        nameField.selectable = NO;
-        nameField.lineBreakMode = NSLineBreakByTruncatingTail;
-        nameField.font = [NSFont systemFontOfSize:13.0 weight:NSFontWeightSemibold];
-        nameField.textColor = [NSColor labelColor];
-        nameField.autoresizingMask = NSViewWidthSizable;
-        [cell addSubview:nameField];
-
-        NSTextField* subField =
-            [[NSTextField alloc] initWithFrame:NSMakeRect(64, 11, tableColumn.width - 78, 14)];
-        subField.identifier = @"sub";
-        subField.bezeled = NO;
-        subField.drawsBackground = NO;
-        subField.editable = NO;
-        subField.selectable = NO;
-        subField.lineBreakMode = NSLineBreakByTruncatingMiddle;
-        subField.font = [NSFont systemFontOfSize:11.0 weight:NSFontWeightRegular];
-        subField.textColor = [NSColor tertiaryLabelColor];
-        subField.autoresizingMask = NSViewWidthSizable;
-        [cell addSubview:subField];
-    }
-
-    NSImageView* iconView = nil;
-    NSTextField* nameField = nil;
-    NSTextField* subField = nil;
-    for (NSView* sub in cell.subviews) {
-        if ([sub.identifier isEqualToString:@"icon"]) {
-            iconView = (NSImageView*)sub;
-        } else if ([sub.identifier isEqualToString:@"name"]) {
-            nameField = (NSTextField*)sub;
-        } else if ([sub.identifier isEqualToString:@"sub"]) {
-            subField = (NSTextField*)sub;
-        }
-    }
-    NSImage* icon = _appIcons[pkg];
-    iconView.image = icon ?: placeholder_icon(name, NSMakeSize(40, 40));
-    nameField.stringValue = name;
-    // Sub line shows the package (and the launcher activity class when short
-    // enough), so the row stays useful even when the icon/name are missing.
-    NSString* activityClass = activity.lastPathComponent;
-    subField.stringValue = [NSString stringWithFormat:@"%@ · %@", pkg, activityClass];
-    return cell;
+- (void)collectionView:(NSCollectionView*)collectionView
+    didDeselectItemsAtIndexPaths:(NSSet<NSIndexPath*>*)indexPaths {
+    [self updateApplicationActions];
 }
 
 #pragma mark - qemu supervisor
@@ -1608,15 +2085,27 @@ struct DisplayWindow {
 - (void)qemuMonitorLoop {
     while (!_shuttingDown.load(std::memory_order_acquire)) {
         if (!macmu_system_image_exists(_options)) {
-            [self publishQemuStatus:@"System image missing"];
+            [self publishBootPresentation:@"System image required"
+                                    detail:@"Import a MacMu Android 16 image to continue."
+                                     stage:@"SETUP"
+                                      busy:NO
+                                     ready:NO];
             std::this_thread::sleep_for(std::chrono::seconds(2));
             continue;
         }
         if (!macmu_machine_exists(_options)) {
-            [self publishQemuStatus:@"Preparing device"];
+            [self publishBootPresentation:@"Preparing Android device"
+                                    detail:@"Creating the managed virtual device…"
+                                     stage:@"PREPARING"
+                                      busy:YES
+                                     ready:NO];
             std::string error;
             if (!macmu_create_default_machine(_options, &error)) {
-                [self publishQemuStatus:ns_string("Device preparation failed: " + error)];
+                [self publishBootPresentation:@"Device preparation failed"
+                                        detail:ns_string(error)
+                                         stage:@"ATTENTION"
+                                          busy:NO
+                                         ready:NO];
                 std::this_thread::sleep_for(std::chrono::seconds(2));
                 continue;
             }
@@ -1625,7 +2114,11 @@ struct DisplayWindow {
                 [delegate updateMachineControls];
             });
         }
-        [self publishQemuStatus:@"Starting"];
+        [self publishBootPresentation:@"Starting Android"
+                                detail:@"Launching the emulator core…"
+                                 stage:@"STARTING"
+                                  busy:YES
+                                 ready:NO];
         if (_channelReady && _frameConsumer) {
             _frameConsumer->reset_slots();
         }
@@ -1639,7 +2132,11 @@ struct DisplayWindow {
         const pid_t pid = launch_qemu(_options, doorbellFd, inputFd, controlFd);
         controlChannel->close_remote_fd();
         if (pid <= 0) {
-            [self publishQemuStatus:@"Launch failed; retrying"];
+            [self publishBootPresentation:@"Could not start Android"
+                                    detail:@"MacMu will retry automatically."
+                                     stage:@"RETRYING"
+                                      busy:YES
+                                     ready:NO];
             std::this_thread::sleep_for(std::chrono::seconds(2));
             continue;
         }
@@ -1664,6 +2161,13 @@ struct DisplayWindow {
             [delegate] {
                 dispatch_async(dispatch_get_main_queue(), ^{
                     [delegate restoreDisplaySubscriptions];
+                    if (!delegate->_agentConnected) {
+                        [delegate updateBootPresentation:@"Android is booting"
+                                                   detail:@"Waiting for Android to finish startup and launch MacMu Agent…"
+                                                    stage:@"BOOTING"
+                                                     busy:YES
+                                                     ready:NO];
+                    }
                 });
             });
 
@@ -1672,7 +2176,11 @@ struct DisplayWindow {
         if (_shuttingDown.load(std::memory_order_acquire)) {
             request_qemu_termination(pid);
         } else {
-            [self publishQemuStatus:[NSString stringWithFormat:@"Running (pid %d)", pid]];
+            [self publishBootPresentation:@"Android is booting"
+                                    detail:@"Waiting for boot completion and MacMu Agent…"
+                                     stage:@"BOOTING"
+                                      busy:YES
+                                     ready:NO];
             dispatch_async(dispatch_get_main_queue(), ^{
                 [delegate updateMachineControls];
             });
@@ -1704,10 +2212,18 @@ struct DisplayWindow {
             break;
         }
         dispatch_sync(dispatch_get_main_queue(), ^{
+            delegate->_agentConnected = false;
+            delegate->_appsLoaded = false;
             [delegate resetSecondaryDisplayStateAfterQemuExit];
+            [delegate clearApplicationCatalog];
+            [delegate setAppsStatus:@"Restarting Android…"];
             [delegate updateMachineControls];
         });
-        [self publishQemuStatus:@"Exited; restarting"];
+        [self publishBootPresentation:@"Restarting Android"
+                                detail:@"The emulator core exited; MacMu is starting it again."
+                                 stage:@"RESTARTING"
+                                  busy:YES
+                                 ready:NO];
         std::this_thread::sleep_for(std::chrono::seconds(1));
     }
 }
@@ -1754,6 +2270,9 @@ struct DisplayWindow {
             continue;
         }
         lastFrames[readyDisplayId] = meta.frame;
+        if (readyDisplayId == 0) {
+            continue;  // Android's boot surface is intentionally never shown.
+        }
 
         const uint32_t displayId = readyDisplayId;
         [self enqueueFramePresentationForDisplay:displayId];
@@ -1761,7 +2280,7 @@ struct DisplayWindow {
 }
 
 - (void)enqueueFramePresentationForDisplay:(uint32_t)displayId {
-    if (displayId >= kMacmuFrameSlotCount ||
+    if (displayId == 0 || displayId >= kMacmuFrameSlotCount ||
         _framePresentationPending[displayId].exchange(true, std::memory_order_acq_rel)) {
         return;
     }
@@ -1792,22 +2311,19 @@ struct DisplayWindow {
     });
 }
 
-// Main thread. Marks the display's view dirty; auto-opens a window when a
-// secondary display starts producing frames without one (shell restart,
-// guest-initiated display, or add-before-window races). On the first real
-// frame for a secondary display, updates the window title with the
-// requested-vs-actual resolution so mismatched guest-side sizing is visible.
+// Main thread. Marks a bound application's view dirty. Unknown displays and
+// Android's internal display 0 never create a product window.
 - (void)presentFrameForDisplay:(uint32_t)displayId
                    actualWidth:(uint32_t)actualWidth
                   actualHeight:(uint32_t)actualHeight {
-    if (_shuttingDown.load(std::memory_order_acquire)) {
+    (void)actualWidth;
+    (void)actualHeight;
+    if (_shuttingDown.load(std::memory_order_acquire) || displayId == 0 ||
+        _displayAppBindings.find(displayId) == _displayAppBindings.end()) {
         return;
     }
     auto it = _displayWindows.find(displayId);
     if (it == _displayWindows.end()) {
-        if (displayId == 0) {
-            return;  // primary window is opened explicitly
-        }
         [self openDisplayWindowForDisplay:displayId];
         it = _displayWindows.find(displayId);
         if (it == _displayWindows.end()) {
@@ -1815,34 +2331,6 @@ struct DisplayWindow {
         }
     }
     [it->second.view setNeedsDisplay:YES];
-    if (displayId != 0 && !it->second.reportedActual && actualWidth > 0 && actualHeight > 0) {
-        it->second.reportedActual = true;
-        [self updateDisplayWindowTitle:it->first entry:it->second
-                            actualWidth:actualWidth actualHeight:actualHeight];
-    }
-}
-
-// Main thread. Renders the secondary display title as
-// "MacMu Display N · req WxH · actual WxH" so a guest that allocated a
-// different resolution than requested is obvious. Primary display keeps its
-// plain title.
-- (void)updateDisplayWindowTitle:(uint32_t)displayId
-                            entry:(DisplayWindow&)entry
-                     actualWidth:(uint32_t)actualWidth
-                    actualHeight:(uint32_t)actualHeight {
-    if (displayId == 0 || !entry.window) {
-        return;
-    }
-    NSString* prefix = [NSString stringWithFormat:@"MacMu Display %u", displayId];
-    if (entry.requestedWidth > 0 && entry.requestedHeight > 0) {
-        entry.window.title =
-            [NSString stringWithFormat:@"%@ · req %ux%u · actual %ux%u", prefix,
-                                       entry.requestedWidth, entry.requestedHeight, actualWidth,
-                                       actualHeight];
-    } else {
-        entry.window.title = [NSString
-            stringWithFormat:@"%@ · actual %ux%u", prefix, actualWidth, actualHeight];
-    }
 }
 
 - (void)stopDoorbellThread {
@@ -1862,7 +2350,6 @@ struct DisplayWindow {
         [window orderOut:nil];
     }
     _displayWindows.clear();
-    [_appsWindow orderOut:nil];
     [_statusWindow orderOut:nil];
 }
 

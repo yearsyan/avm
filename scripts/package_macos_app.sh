@@ -32,6 +32,7 @@ bundle_id="dev.macmu.MacMu"
 package_basename="macmu-macos-arm64"
 version="0.1.0"
 build_version="${GITHUB_RUN_NUMBER:-1}"
+codesign_identity="${MACMU_CODESIGN_IDENTITY:--}"
 create_dmg=1
 create_zip=1
 qemu_headless_rel="qemu/darwin-aarch64/qemu-system-aarch64-headless"
@@ -96,6 +97,7 @@ done
 [[ -f "$dist_dir/LICENSE.shell-MIT" ]] || die "missing shell license: $dist_dir/LICENSE.shell-MIT"
 
 command -v ditto >/dev/null 2>&1 || die "missing required command: ditto"
+command -v codesign >/dev/null 2>&1 || die "missing required command: codesign"
 if [[ "$create_dmg" == "1" ]]; then
   command -v hdiutil >/dev/null 2>&1 || die "missing required command: hdiutil"
 fi
@@ -166,6 +168,12 @@ test -f "$bundled_dist_dir/LICENSE.shell-MIT"
 test ! -e "$bundled_dist_dir/$binary_name"
 test ! -e "$bundled_dist_dir/aemu-iosurface-shell"
 test ! -e "$bundled_dist_dir/emulator"
+
+# Seal Info.plist and bundled resources before creating distributable archives.
+# MACMU_CODESIGN_IDENTITY can select a Developer ID; local builds use an ad-hoc
+# identity by default so the .app still has a complete, verifiable bundle seal.
+codesign --force --sign "$codesign_identity" "$app_dir"
+codesign --verify --deep --strict "$app_dir"
 
 if [[ "$create_zip" == "1" ]]; then
   ditto -c -k --sequesterRsrc --keepParent "$app_dir" "$app_zip"

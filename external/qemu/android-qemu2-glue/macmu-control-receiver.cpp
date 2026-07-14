@@ -18,12 +18,12 @@
 #include <fcntl.h>
 #include <functional>
 #include <limits>
+#include <map>
 #include <mutex>
 #ifdef __APPLE__
 #include <pthread.h>
 #endif
 #include <condition_variable>
-#include <set>
 #include <string>
 #include <sys/socket.h>
 #include <thread>
@@ -39,6 +39,20 @@ using macmu::ControlMessageType;
 // emulator-internal range used for guest-initiated displays.
 constexpr uint32_t kMaxUserDisplayId = 5;
 constexpr uint32_t kFrameSlotCount = 16;
+constexpr uint32_t kDefaultDisplayStreamFps = 60;
+// Defensive protocol limit only; current macOS displays are far below this.
+constexpr uint32_t kMaximumDisplayStreamFps = 1000;
+
+uint32_t normalize_stream_fps(uint32_t requestedFps) {
+    if (requestedFps == 0) {
+        return kDefaultDisplayStreamFps;
+    }
+    return requestedFps > kMaximumDisplayStreamFps ? kMaximumDisplayStreamFps : requestedFps;
+}
+
+std::chrono::nanoseconds stream_interval(uint32_t framesPerSecond) {
+    return std::chrono::nanoseconds(1000000000ull / normalize_stream_fps(framesPerSecond));
+}
 
 uint64_t steady_now_ns() {
     return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -242,19 +256,26 @@ private:
                 });
                 return;
             case ControlMessageType::kDisplayStream: {
-                if (payload.size() < sizeof(macmu::ControlDisplayStream)) {
+                // maximumFramesPerSecond was appended to the original 8-byte
+                // request. Accept both layouts so mixed shell/backend builds
+                // fall back to 60 Hz instead of breaking the control channel.
+                constexpr size_t kLegacyDisplayStreamSize = sizeof(uint32_t) * 2;
+                if (payload.size() < kLegacyDisplayStreamSize) {
                     send_error(header.requestId, macmu::kControlErrInvalidArgument,
                                "short DISPLAY_STREAM payload");
                     return;
                 }
-                macmu::ControlDisplayStream request;
-                std::memcpy(&request, payload.data(), sizeof(request));
+                macmu::ControlDisplayStream request = {};
+                const size_t copySize = payload.size() < sizeof(request) ? payload.size()
+                                                                         : sizeof(request);
+                std::memcpy(&request, payload.data(), copySize);
                 if (request.displayId >= kFrameSlotCount) {
                     send_error(header.requestId, macmu::kControlErrInvalidArgument,
                                "display id exceeds frame slot table");
                     return;
                 }
-                set_display_streaming(request.displayId, request.enabled != 0);
+                set_display_streaming(request.displayId, request.enabled != 0,
+                                      request.maximumFramesPerSecond);
                 send_frame(static_cast<uint16_t>(ControlMessageType::kDisplayStreamOk),
                            header.requestId, nullptr, 0);
                 return;
@@ -413,27 +434,54 @@ private:
 
     // ------------------------------------------------------------------
     // Shell-paced display streaming: VirtualDisplay-backed secondary displays
-    // update their bound ColorBuffer in place with no per-frame host signal,
-    // so while the shell has a window on a display it asks us to pump exports
-    // as a low-rate liveness fallback. Normal frames are event-driven by
-    // ColorBuffer BIND/flush notifications; the fallback must not turn a
-    // static display into continuous GPU work. The set is tiny (1..5).
+    // update their bound ColorBuffer in place with no reliable per-frame host
+    // signal. The shell reports the maximum refresh rate of the NSScreen that
+    // owns each application window, and this loop independently paces that
+    // display to the same ceiling. The map is tiny (user displays 1..5).
     // ------------------------------------------------------------------
 
-    void set_display_streaming(uint32_t displayId, bool enabled) {
+    struct DisplayStreamState {
+        uint32_t maximumFramesPerSecond = kDefaultDisplayStreamFps;
+        std::chrono::steady_clock::time_point nextExport;
+    };
+
+    void set_display_streaming(uint32_t displayId, bool enabled,
+                               uint32_t requestedFramesPerSecond = 0) {
         android_setDisplayExportEnabled(displayId, enabled);
         if (displayId == 0) {
             return;
         }
-        std::lock_guard<std::mutex> lock(mStreamMutex);
-        if (enabled) {
-            mStreamingDisplays.insert(displayId);
-            android_exportDisplayFrame(displayId);
-            if (!mStreamThread.joinable()) {
-                mStreamThread = std::thread([this] { stream_loop(); });
+        const uint32_t maximumFramesPerSecond = normalize_stream_fps(requestedFramesPerSecond);
+        bool exportImmediately = false;
+        bool rateChanged = false;
+        {
+            std::lock_guard<std::mutex> lock(mStreamMutex);
+            if (enabled) {
+                const auto nextExport =
+                    std::chrono::steady_clock::now() + stream_interval(maximumFramesPerSecond);
+                auto stream = mStreamingDisplays.find(displayId);
+                if (stream == mStreamingDisplays.end()) {
+                    mStreamingDisplays[displayId] = {maximumFramesPerSecond, nextExport};
+                    exportImmediately = true;
+                    rateChanged = true;
+                } else if (stream->second.maximumFramesPerSecond != maximumFramesPerSecond) {
+                    stream->second.maximumFramesPerSecond = maximumFramesPerSecond;
+                    stream->second.nextExport = nextExport;
+                    rateChanged = true;
+                }
+                if (!mStreamThread.joinable()) {
+                    mStreamThread = std::thread([this] { stream_loop(); });
+                }
+            } else {
+                mStreamingDisplays.erase(displayId);
             }
-        } else {
-            mStreamingDisplays.erase(displayId);
+        }
+        if (exportImmediately) {
+            android_exportDisplayFrame(displayId);
+        }
+        if (enabled && rateChanged) {
+            dinfo("MacMu display %u export pacing set to %u Hz", displayId,
+                  maximumFramesPerSecond);
         }
         mStreamCondition.notify_all();
     }
@@ -445,18 +493,39 @@ private:
         std::unique_lock<std::mutex> lock(mStreamMutex);
         while (mRunning.load(std::memory_order_relaxed)) {
             if (mStreamingDisplays.empty()) {
-                mStreamCondition.wait_for(lock, std::chrono::milliseconds(250));
+                mStreamCondition.wait(lock, [this] {
+                    return !mRunning.load(std::memory_order_relaxed) ||
+                           !mStreamingDisplays.empty();
+                });
                 continue;
             }
-            const std::set<uint32_t> displays = mStreamingDisplays;
+
+            const auto now = std::chrono::steady_clock::now();
+            auto nextWake = std::chrono::steady_clock::time_point::max();
+            std::vector<uint32_t> displaysToExport;
+            for (auto& [displayId, state] : mStreamingDisplays) {
+                if (state.nextExport <= now) {
+                    displaysToExport.push_back(displayId);
+                    // Skip missed deadlines instead of bursting several stale
+                    // exports; this is a maximum cadence, not a frame queue.
+                    state.nextExport = now + stream_interval(state.maximumFramesPerSecond);
+                }
+                if (state.nextExport < nextWake) {
+                    nextWake = state.nextExport;
+                }
+            }
+            if (displaysToExport.empty()) {
+                // No predicate: a rate update or display removal must wake us
+                // immediately so the next deadline can be recalculated.
+                mStreamCondition.wait_until(lock, nextWake);
+                continue;
+            }
+
             lock.unlock();
-            for (const uint32_t displayId : displays) {
+            for (const uint32_t displayId : displaysToExport) {
                 android_exportDisplayFrame(displayId);
             }
             lock.lock();
-            mStreamCondition.wait_for(lock, std::chrono::seconds(1), [this] {
-                return !mRunning.load(std::memory_order_relaxed) || mStreamingDisplays.empty();
-            });
         }
     }
 
@@ -480,7 +549,7 @@ private:
     std::thread mThread;
     std::mutex mStreamMutex;
     std::condition_variable mStreamCondition;
-    std::set<uint32_t> mStreamingDisplays;
+    std::map<uint32_t, DisplayStreamState> mStreamingDisplays;
     std::thread mStreamThread;
 };
 

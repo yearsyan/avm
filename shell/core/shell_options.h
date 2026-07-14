@@ -46,7 +46,6 @@ struct ShellOptions {
     std::string guestRamdiskPath;
     std::string avdName = macmu::kDefaultAvdName;
     bool wipeData = false;
-    bool openDisplay = false;
 };
 
 // Resolves command-line flags layered on top of MACMU_*/AEMU_SHELL_*/legacy

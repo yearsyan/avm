@@ -125,6 +125,10 @@ struct ControlDisplayRemove {
 struct ControlDisplayStream {
     uint32_t displayId;
     uint32_t enabled;  // 0 or 1
+    // Maximum export cadence requested by the shell for the NSScreen that
+    // currently contains this application window. Zero keeps compatibility
+    // with the original 8-byte payload and falls back to 60 Hz.
+    uint32_t maximumFramesPerSecond;
 };
 
 struct ControlDisplayInfo {

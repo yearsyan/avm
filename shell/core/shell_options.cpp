@@ -329,8 +329,6 @@ ShellOptions parse_options(int argc, char** argv) {
             }
         } else if (arg == "--wipe-data") {
             options.wipeData = true;
-        } else if (arg == "--open-display") {
-            options.openDisplay = true;
         }
     }
     return options;

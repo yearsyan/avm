@@ -189,12 +189,15 @@ on any other display's post cadence:
 2. Window-surface flushes: `rcFlushWindowColorBuffer` →
    `FrameBuffer::notifyColorBufferFlushed` → CB→display reverse lookup
    (covers guests that swap through goldfish EGL window surfaces).
-3. Shell-paced streaming (the universal fallback): the shell sends
-   `DISPLAY_STREAM {displayId, enabled}` while it has a window sampling the
-   display; the qemu control receiver runs a ~60 Hz ticker calling
-   `android_exportDisplayFrame(displayId)` for enabled displays. Streaming
-   stops on window close, DISPLAY_REMOVE, or channel teardown, so an
-   unwatched display costs nothing.
+3. Shell-paced streaming (the universal fallback): while it has a window
+   sampling a display, the shell sends
+   `DISPLAY_STREAM {displayId, enabled, maximumFramesPerSecond}` using the
+   maximum refresh rate of that window's current `NSScreen`. The qemu control
+   receiver independently paces each enabled display to that ceiling and calls
+   `android_exportDisplayFrame(displayId)` at each deadline. Moving a window
+   between screens updates its rate. Streaming stops on window close,
+   DISPLAY_REMOVE, or channel teardown, so an unwatched display costs nothing.
+   A missing/zero rate from an older 8-byte request falls back to 60 Hz.
 
 `exportComposedDisplay()` additionally covers hwc-composed secondary displays
 (e.g. automotive images), where a compose for `displayId != 0` lands
