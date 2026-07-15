@@ -7,13 +7,17 @@ import android.content.pm.ApplicationInfo;
 import android.content.pm.PackageManager;
 import android.graphics.Bitmap;
 import android.graphics.Canvas;
+import android.graphics.Point;
 import android.graphics.drawable.Drawable;
+import android.hardware.display.DisplayManager;
 import android.os.IBinder;
+import android.os.Looper;
 import android.os.SystemClock;
 import android.system.Os;
 import android.system.OsConstants;
 import android.system.VmSocketAddress;
 import android.util.Base64;
+import android.view.Display;
 import android.view.InputDevice;
 import android.view.InputEvent;
 import android.view.MotionEvent;
@@ -268,6 +272,12 @@ public final class MacMuAgent {
                 writer.flush();
                 return;
             }
+            if (fields.length == 2 && "display-state".equals(fields[0])) {
+                int displayId = Integer.parseInt(fields[1]);
+                writer.write(id + " ok " + displayState(displayId) + "\n");
+                writer.flush();
+                return;
+            }
             if (fields.length == 3 && "launch".equals(fields[0])) {
                 String component = fields[1];
                 int displayId = Integer.parseInt(fields[2]);
@@ -460,15 +470,20 @@ public final class MacMuAgent {
         }
     }
 
-    // Lazily resolve a system Context + PackageManager via reflection on
-    // ActivityThread. Returns true on success, false if the platform blocks
-    // the hidden-API call (in which case pm stays null and the host renders
-    // pkg/activity only).
-    private synchronized boolean ensurePackageManager() {
-        if (pm != null) {
+    // Lazily resolve the system Context via reflection on ActivityThread. The
+    // bare app_process entry point has no Application or Context of its own.
+    private synchronized boolean ensureSystemContext() {
+        if (systemContext != null) {
             return true;
         }
         try {
+            // MacMu runs as a bare app_process entry point, and application
+            // discovery is handled on the macmu-ctrl thread. Unlike an Android
+            // application thread, that thread has no Looper by default, while
+            // ActivityThread.systemMain() creates Handlers as it initializes.
+            if (Looper.myLooper() == null) {
+                Looper.prepare();
+            }
             Class<?> at = Class.forName("android.app.ActivityThread");
             Object thread = at.getDeclaredMethod("systemMain").invoke(null);
             Method getSystemContext = at.getDeclaredMethod("getSystemContext");
@@ -476,14 +491,59 @@ public final class MacMuAgent {
             if (systemContext == null) {
                 return false;
             }
+            return true;
+        } catch (Exception e) {
+            e.printStackTrace(System.err);
+            systemContext = null;
+            return false;
+        }
+    }
+
+    // Lazily resolve PackageManager for launcher labels and icons. A failure
+    // only removes that enrichment; launcher discovery still returns entries.
+    private synchronized boolean ensurePackageManager() {
+        if (pm != null) {
+            return true;
+        }
+        if (!ensureSystemContext()) {
+            return false;
+        }
+        try {
             pm = systemContext.getPackageManager();
             return pm != null;
         } catch (Exception e) {
             e.printStackTrace(System.err);
-            systemContext = null;
             pm = null;
             return false;
         }
+    }
+
+    // Returns the Android logical size and rotation of one emulator-managed
+    // VirtualDisplay. An application with a fixed/sensor landscape request can
+    // rotate this logical display while the host surface is still portrait;
+    // the shell uses this state to resize the physical virtual display and its
+    // macOS window to match.
+    private String displayState(int emulatorDisplayId) throws Exception {
+        int androidDisplayId = resolveAndroidDisplayId(emulatorDisplayId);
+        if (androidDisplayId < 0) {
+            throw new IllegalStateException("display " + emulatorDisplayId + " not found");
+        }
+        if (!ensureSystemContext()) {
+            throw new IllegalStateException("system context unavailable");
+        }
+        DisplayManager manager =
+                (DisplayManager) systemContext.getSystemService(Context.DISPLAY_SERVICE);
+        Display display = manager != null ? manager.getDisplay(androidDisplayId) : null;
+        if (display == null) {
+            invalidateDisplayId(emulatorDisplayId);
+            throw new IllegalStateException("Android display " + androidDisplayId + " unavailable");
+        }
+        Point size = new Point();
+        display.getRealSize(size);
+        if (size.x <= 0 || size.y <= 0) {
+            throw new IllegalStateException("display has invalid dimensions");
+        }
+        return size.x + " " + size.y + " " + display.getRotation();
     }
 
     // Returns null on success, an error message otherwise.

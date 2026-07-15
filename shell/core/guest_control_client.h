@@ -10,6 +10,8 @@
 //   agent -> host:  "ok\n" handshake reply, then "<id> ok [payload]\n"
 //                   or "<id> err [message]\n"
 // Payloads are single-line (the agent uses JSON for structured data).
+// Commands include app discovery/lifecycle plus "display-state <id>", which
+// returns the Android logical width, height, and rotation for orientation sync.
 
 #ifndef MACMU_SHELL_GUEST_CONTROL_CLIENT_H
 #define MACMU_SHELL_GUEST_CONTROL_CLIENT_H

@@ -12,10 +12,12 @@
 #import <MetalKit/MetalKit.h>
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 
+#include <algorithm>
 #include <atomic>
 #include <array>
 #include <cerrno>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
@@ -143,14 +145,81 @@ struct DisplayLaunchProfile {
 };
 
 constexpr uint32_t kNewDisplayDpi = 240;
+constexpr char kAndroidSettingsPackage[] = "com.android.settings";
+constexpr char kScreenMatchedProfileTitle[] = "Match Current Screen";
+constexpr NSInteger kScreenMatchedProfileTag = -1;
+constexpr NSInteger kCustomFixedProfileTag = -2;
+
+struct DefaultDisplaySettings {
+    bool matchCurrentScreen;
+    uint32_t width;
+    uint32_t height;
+    uint32_t dpi;
+};
+
+DefaultDisplaySettings initial_default_display_settings() {
+    return {true, 720, 1600, kNewDisplayDpi};
+}
+
+NSScreen* resolved_screen(NSScreen* screen) {
+    return screen ?: [NSScreen mainScreen];
+}
+
+DisplayLaunchProfile screen_matched_display_profile(NSScreen* screen) {
+    NSScreen* resolved = resolved_screen(screen);
+    const CGFloat backingScale = resolved ? std::max<CGFloat>(1.0, resolved.backingScaleFactor) : 1.0;
+    const NSSize pointSize = resolved ? resolved.frame.size : NSMakeSize(720, 1600);
+    const uint32_t pixelWidth =
+        std::max<uint32_t>(1, static_cast<uint32_t>(std::llround(pointSize.width * backingScale)));
+    const uint32_t pixelHeight =
+        std::max<uint32_t>(1, static_cast<uint32_t>(std::llround(pointSize.height * backingScale)));
+    const uint32_t dpi = std::clamp<uint32_t>(
+        static_cast<uint32_t>(std::llround(kNewDisplayDpi * backingScale)), 120, 640);
+    return {kScreenMatchedProfileTitle, std::min(pixelWidth, pixelHeight),
+            std::max(pixelWidth, pixelHeight), dpi};
+}
+
+uint32_t screen_number(NSScreen* screen) {
+    NSNumber* number = resolved_screen(screen).deviceDescription[@"NSScreenNumber"];
+    return [number isKindOfClass:[NSNumber class]] ? number.unsignedIntValue : 0;
+}
+
+NSScreen* screen_with_number(uint32_t number) {
+    if (number != 0) {
+        for (NSScreen* screen in [NSScreen screens]) {
+            if (screen_number(screen) == number) {
+                return screen;
+            }
+        }
+    }
+    return [NSScreen mainScreen];
+}
+
+void center_window_on_screen(NSWindow* window, NSScreen* screen) {
+    if (!window) {
+        return;
+    }
+    NSScreen* resolved = resolved_screen(screen);
+    if (!resolved) {
+        [window center];
+        return;
+    }
+    const NSRect available = resolved.visibleFrame;
+    const NSRect frame = window.frame;
+    [window setFrameOrigin:NSMakePoint(NSMidX(available) - frame.size.width * 0.5,
+                                       NSMidY(available) - frame.size.height * 0.5)];
+}
 
 // User-creatable display ids on the qemu side are 1..kMaxUserDisplayId; ids
 // above that are the emulator-internal range. Must match
 // kMaxUserDisplayId in macmu-control-receiver.cpp.
 constexpr uint32_t kMaxUserDisplayId = 5;
 
-// Common app-window aspect ratios. 16:9 remains the default button path.
+// Common fixed app-window aspect ratios offered by the launch and settings
+// menus. Keep 9:20 first as a useful phone preset; the product default is the
+// dynamic current-screen profile.
 constexpr DisplayLaunchProfile kDisplayLaunchProfiles[] = {
+    {"9:20  720 x 1600", 720, 1600, kNewDisplayDpi},
     {"16:9  1280 x 720", 1280, 720, kNewDisplayDpi},
     {"9:16  720 x 1280", 720, 1280, kNewDisplayDpi},
     {"16:10 1280 x 800", 1280, 800, kNewDisplayDpi},
@@ -164,7 +233,6 @@ constexpr DisplayLaunchProfile kDisplayLaunchProfiles[] = {
     {"19.5:9 1560 x 720", 1560, 720, kNewDisplayDpi},
     {"9:19.5 720 x 1560", 720, 1560, kNewDisplayDpi},
     {"20:9  1600 x 720", 1600, 720, kNewDisplayDpi},
-    {"9:20  720 x 1600", 720, 1600, kNewDisplayDpi},
     {"21:9  1680 x 720", 1680, 720, kNewDisplayDpi},
     {"32:9  1920 x 540", 1920, 540, kNewDisplayDpi},
     {"4:3   1024 x 768", 1024, 768, kNewDisplayDpi},
@@ -177,7 +245,14 @@ constexpr DisplayLaunchProfile kDisplayLaunchProfiles[] = {
 };
 constexpr size_t kDisplayLaunchProfileCount =
     sizeof(kDisplayLaunchProfiles) / sizeof(kDisplayLaunchProfiles[0]);
-constexpr size_t kDefaultDisplayLaunchProfile = 0;
+
+bool valid_display_profile(uint32_t width, uint32_t height, uint32_t dpi) {
+    if (dpi < 120 || dpi > 640 || width > 16384 || height > 16384) {
+        return false;
+    }
+    const uint32_t minimumPixels = 320 * dpi / 160;
+    return width >= minimumPixels && height >= minimumPixels;
+}
 
 // DisplayManager virtual-display flags, copied here so MacMu can request
 // scrcpy-like secondary displays without depending on Android framework
@@ -192,6 +267,8 @@ constexpr uint32_t kNewDisplayFlags =
     kVirtualDisplayFlagPublic | kVirtualDisplayFlagPresentation |
     kVirtualDisplayFlagOwnContentOnly | kVirtualDisplayFlagSupportsTouch |
     kVirtualDisplayFlagRotatesWithContent | kVirtualDisplayFlagTrusted;
+constexpr double kOrientationPollIntervalSeconds = 0.5;
+constexpr std::chrono::milliseconds kOrientationResizeSettleTime(2000);
 
 struct DisplayWindow {
     NSWindow* __strong window = nil;
@@ -289,7 +366,11 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
 
 - (void)mouseDown:(NSEvent*)event {
     [super mouseDown:event];
-    if (event.clickCount != 2 || !self.activationAction) {
+    // Finder-style single-click launch. Context clicks are handled by
+    // menuForEvent: and must only select the item for the right-click menu.
+    if (event.clickCount != 1 ||
+        (event.modifierFlags & NSEventModifierFlagControl) != 0 ||
+        !self.activationAction) {
         return;
     }
     NSPoint point = [self convertPoint:event.locationInWindow fromView:nil];
@@ -313,6 +394,9 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
                         aspectWidth:(uint32_t)aspectWidth
                        aspectHeight:(uint32_t)aspectHeight
                                dpi:(uint32_t)dpi;
+- (void)launchApplicationComponent:(NSString*)component
+                        withProfile:(DisplayLaunchProfile)profile
+               matchesCurrentScreen:(BOOL)matchesCurrentScreen;
 // Picks the smallest user display id (1..kMaxUserDisplayId) not currently in
 // _activeUserDisplayIds, marks it active, and returns it. Returns 0 if all are
 // in use. Pair with releaseUserDisplayId: when the window closes / is removed.
@@ -342,7 +426,18 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
     NSProgressIndicator* _bootSpinner;
     NSButton* _createMachineButton;
     NSButton* _refreshAppsButton;
-    NSButton* _openApplicationButton;
+    NSButton* _startupRetryButton;
+    NSView* _startupOverlay;
+    BOOL _bootPresentationReady;
+    NSMenuItem* _displayMenuItem;
+    NSMenuItem* _rotateDisplayMenuItem;
+    NSTimer* _orientationTimer;
+    NSWindow* _displaySettingsWindow;
+    NSPopUpButton* _defaultDisplayProfilePopup;
+    NSTextField* _defaultDisplayProfileDetailValue;
+    NSTextField* _displaySettingsPathValue;
+    NSString* _displaySettingsPath;
+    DefaultDisplaySettings _defaultDisplaySettings;
 
     // displayId -> window/view/renderer. Main thread only.
     std::map<uint32_t, DisplayWindow> _displayWindows;
@@ -376,6 +471,19 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
     // a producer frame can arrive before DISPLAY_ADD_OK reaches the main
     // queue, and must still open the window with the chosen aspect ratio.
     std::map<uint32_t, DisplayLaunchProfile> _displayLaunchProfiles;
+    // Displays launched with the dynamic default continue matching the backing
+    // pixel dimensions of whichever NSScreen contains their window.
+    std::set<uint32_t> _screenMatchedDisplayIds;
+    // Display id -> NSScreenNumber chosen when the launch was requested. This
+    // keeps initial geometry and placement on the same monitor as Applications.
+    std::map<uint32_t, uint32_t> _displayTargetScreenNumbers;
+    // Only the focused application is queried. A resize is issued by sending
+    // DISPLAY_ADD again for the same id; QEMU and MultiDisplayService treat it
+    // as an in-place resize rather than allocating a second display.
+    std::set<uint32_t> _displayResizePending;
+    std::set<uint32_t> _orientationPollInFlight;
+    std::map<uint32_t, std::chrono::steady_clock::time_point>
+        _orientationSyncSuppressedUntil;
     // DISPLAY_REMOVE can complete via both an event and a request callback.
     // Track host-initiated removals so each slot has one release owner.
     std::set<uint32_t> _displayRemovalPending;
@@ -386,12 +494,18 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
     NSTextField* _appsStatusValue;
     NSTextField* _appsEmptyValue;
     NSMutableArray<NSDictionary*>* _apps;
+    // Android Settings is a system entry exposed from the status-item menu,
+    // not a tile in the Applications grid.
+    NSDictionary* _androidSettingsEntry;
     // pkg -> friendly label and decoded icon, populated in applyAppList:.
     // Used by the icon table cell; missing entries fall back to a placeholder.
     NSMutableDictionary<NSString*, NSString*>* _appNames;
     NSMutableDictionary<NSString*, NSImage*>* _appIcons;
 
     NSStatusItem* _statusItem;
+    NSMenuItem* _machineStatusMenuItem;
+    NSMenuItem* _machineStatusDetailMenuItem;
+    NSMenuItem* _androidSettingsMenuItem;
 
     std::shared_ptr<ControlChannel> _controlChannel;  // guarded by _controlMutex
     std::mutex _controlMutex;
@@ -430,14 +544,29 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
     _bootSpinner = nil;
     _createMachineButton = nil;
     _refreshAppsButton = nil;
-    _openApplicationButton = nil;
+    _startupRetryButton = nil;
+    _startupOverlay = nil;
+    _bootPresentationReady = NO;
+    _displayMenuItem = nil;
+    _rotateDisplayMenuItem = nil;
+    _orientationTimer = nil;
+    _displaySettingsWindow = nil;
+    _defaultDisplayProfilePopup = nil;
+    _defaultDisplayProfileDetailValue = nil;
+    _displaySettingsPathValue = nil;
+    _displaySettingsPath = ns_string(_options.appDataDir + "/display-settings.json");
+    _defaultDisplaySettings = initial_default_display_settings();
     _appsCollection = nil;
     _appsStatusValue = nil;
     _appsEmptyValue = nil;
     _apps = [[NSMutableArray alloc] init];
+    _androidSettingsEntry = nil;
     _appNames = [[NSMutableDictionary alloc] init];
     _appIcons = [[NSMutableDictionary alloc] init];
     _statusItem = nil;
+    _machineStatusMenuItem = nil;
+    _machineStatusDetailMenuItem = nil;
+    _androidSettingsMenuItem = nil;
     _shuttingDown.store(false, std::memory_order_relaxed);
     _runtimeShutdownComplete.store(false, std::memory_order_relaxed);
     _doorbellShutdown.store(true, std::memory_order_relaxed);
@@ -460,8 +589,16 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
     if (!macmu_ensure_runtime_directories(_options, &directoryError)) {
         NSLog(@"MacMu data directory setup failed: %s", directoryError.c_str());
     }
+    [self loadDefaultDisplaySettings];
     [self createRuntimeChannels];
     [self createStatusWindow];
+    _orientationTimer =
+        [NSTimer scheduledTimerWithTimeInterval:kOrientationPollIntervalSeconds
+                                         target:self
+                                       selector:@selector(pollFocusedApplicationOrientation:)
+                                       userInfo:nil
+                                        repeats:YES];
+    _orientationTimer.tolerance = 0.1;
     [self updateMachineControls];
     [self showStatusWindow:nil];
     [self startQemuSupervisor];
@@ -536,6 +673,20 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
         }
         break;
     }
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [self updateDisplayMenu];
+    });
+}
+
+- (void)windowDidBecomeKey:(NSNotification*)notification {
+    [self updateDisplayMenu];
+}
+
+- (void)windowDidResignKey:(NSNotification*)notification {
+    // AppKit assigns the next key window after sending the resign callback.
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [self updateDisplayMenu];
+    });
 }
 
 - (void)setDisplayStreamingForWindow:(NSWindow*)window enabled:(BOOL)enabled {
@@ -569,6 +720,33 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
     NSWindow* window = notification.object;
     const BOOL visible = (window.occlusionState & NSWindowOcclusionStateVisible) != 0 &&
                          !window.miniaturized;
+    for (const auto& entry : _displayWindows) {
+        if (entry.second.window != window) {
+            continue;
+        }
+        const uint32_t displayId = entry.first;
+        _displayTargetScreenNumbers[displayId] = screen_number(window.screen);
+        if (_screenMatchedDisplayIds.count(displayId) > 0) {
+            auto current = _displayLaunchProfiles.find(displayId);
+            if (current != _displayLaunchProfiles.end()) {
+                DisplayLaunchProfile target = screen_matched_display_profile(window.screen);
+                if (current->second.width > current->second.height) {
+                    std::swap(target.width, target.height);
+                }
+                if (target.width != current->second.width ||
+                    target.height != current->second.height || target.dpi != current->second.dpi) {
+                    NSLog(@"MacMu display %u follows NSScreen %@: %ux%u dpi=%u", displayId,
+                          window.screen.localizedName, target.width, target.height, target.dpi);
+                    [self resizeDisplay:displayId
+                                  width:target.width
+                                 height:target.height
+                                    dpi:target.dpi
+                          userInitiated:NO];
+                }
+            }
+        }
+        break;
+    }
     // Re-send DISPLAY_STREAM whenever an application window crosses screens;
     // each display is paced to its current NSScreen's maximum refresh rate.
     [self setDisplayStreamingForWindow:window enabled:visible];
@@ -585,6 +763,285 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
     entry.window = nil;
 }
 
+#pragma mark - Default display settings
+
+- (NSScreen*)defaultDisplayTargetScreen {
+    if (_statusWindow.screen) {
+        return _statusWindow.screen;
+    }
+    if (NSApp.keyWindow.screen) {
+        return NSApp.keyWindow.screen;
+    }
+    return [NSScreen mainScreen];
+}
+
+- (DisplayLaunchProfile)defaultDisplayLaunchProfile {
+    if (_defaultDisplaySettings.matchCurrentScreen) {
+        return screen_matched_display_profile([self defaultDisplayTargetScreen]);
+    }
+    return {"Saved Default", _defaultDisplaySettings.width, _defaultDisplaySettings.height,
+            _defaultDisplaySettings.dpi};
+}
+
+- (BOOL)saveDefaultDisplaySettingsReportingErrors:(BOOL)reportErrors {
+    NSDictionary* display = nil;
+    if (_defaultDisplaySettings.matchCurrentScreen) {
+        display = @{ @"mode" : @"match-current-screen" };
+    } else {
+        display = @{
+            @"mode" : @"fixed",
+            @"width" : @(_defaultDisplaySettings.width),
+            @"height" : @(_defaultDisplaySettings.height),
+            @"dpi" : @(_defaultDisplaySettings.dpi),
+        };
+    }
+    NSDictionary* root = @{ @"version" : @1, @"defaultDisplay" : display };
+    NSError* error = nil;
+    NSData* data = [NSJSONSerialization dataWithJSONObject:root
+                                                   options:NSJSONWritingPrettyPrinted |
+                                                           NSJSONWritingSortedKeys
+                                                     error:&error];
+    if (data && ![data writeToFile:_displaySettingsPath
+                           options:NSDataWritingAtomic
+                             error:&error]) {
+        data = nil;
+    }
+    if (!data) {
+        NSLog(@"MacMu could not save display settings to %@: %@", _displaySettingsPath, error);
+        if (reportErrors) {
+            NSAlert* alert = [[NSAlert alloc] init];
+            alert.messageText = @"Could not save display settings";
+            alert.informativeText = error.localizedDescription ?: @"The JSON file could not be written.";
+            if (_displaySettingsWindow.visible) {
+                [alert beginSheetModalForWindow:_displaySettingsWindow completionHandler:nil];
+            } else {
+                [alert runModal];
+            }
+        }
+        return NO;
+    }
+    NSLog(@"MacMu display settings saved to %@ (%@)", _displaySettingsPath,
+          _defaultDisplaySettings.matchCurrentScreen ? @"match-current-screen" : @"fixed");
+    return YES;
+}
+
+- (void)loadDefaultDisplaySettings {
+    _defaultDisplaySettings = initial_default_display_settings();
+    if (![[NSFileManager defaultManager] fileExistsAtPath:_displaySettingsPath]) {
+        [self saveDefaultDisplaySettingsReportingErrors:NO];
+        return;
+    }
+
+    NSError* error = nil;
+    NSData* data = [NSData dataWithContentsOfFile:_displaySettingsPath options:0 error:&error];
+    id json = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:&error] : nil;
+    if (![json isKindOfClass:[NSDictionary class]]) {
+        NSLog(@"MacMu ignored invalid display settings at %@: %@", _displaySettingsPath, error);
+        return;
+    }
+    NSDictionary* root = (NSDictionary*)json;
+    NSNumber* version = root[@"version"];
+    NSDictionary* display = [root[@"defaultDisplay"] isKindOfClass:[NSDictionary class]]
+                                ? root[@"defaultDisplay"]
+                                : nil;
+    NSString* mode = [display[@"mode"] isKindOfClass:[NSString class]] ? display[@"mode"] : nil;
+    if (![version isKindOfClass:[NSNumber class]] || version.integerValue != 1 || !mode) {
+        NSLog(@"MacMu ignored display settings with an unsupported schema at %@",
+              _displaySettingsPath);
+        return;
+    }
+    if ([mode isEqualToString:@"match-current-screen"]) {
+        NSLog(@"MacMu display settings loaded: match current screen");
+        return;
+    }
+    if (![mode isEqualToString:@"fixed"] ||
+        ![display[@"width"] isKindOfClass:[NSNumber class]] ||
+        ![display[@"height"] isKindOfClass:[NSNumber class]] ||
+        ![display[@"dpi"] isKindOfClass:[NSNumber class]]) {
+        NSLog(@"MacMu ignored invalid default display mode at %@", _displaySettingsPath);
+        return;
+    }
+    const uint32_t width = [display[@"width"] unsignedIntValue];
+    const uint32_t height = [display[@"height"] unsignedIntValue];
+    const uint32_t dpi = [display[@"dpi"] unsignedIntValue];
+    if (!valid_display_profile(width, height, dpi)) {
+        NSLog(@"MacMu ignored invalid fixed display geometry %ux%u dpi=%u", width, height, dpi);
+        return;
+    }
+    _defaultDisplaySettings = {false, width, height, dpi};
+    NSLog(@"MacMu display settings loaded: fixed %ux%u dpi=%u", width, height, dpi);
+}
+
+- (void)createDisplaySettingsWindow {
+    if (_displaySettingsWindow) {
+        return;
+    }
+
+    const NSRect frame = NSMakeRect(0, 0, 560, 330);
+    _displaySettingsWindow = [[NSWindow alloc]
+        initWithContentRect:frame
+                  styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable
+                    backing:NSBackingStoreBuffered
+                      defer:NO];
+    _displaySettingsWindow.title = @"Default Display — MacMu";
+    _displaySettingsWindow.releasedWhenClosed = NO;
+    _displaySettingsWindow.delegate = self;
+
+    NSView* content = [[NSView alloc] initWithFrame:frame];
+    _displaySettingsWindow.contentView = content;
+
+    NSTextField* title = make_label(@"Default application display", NSMakeRect(28, 280, 500, 28));
+    title.font = [NSFont systemFontOfSize:22.0 weight:NSFontWeightBold];
+    title.textColor = [NSColor labelColor];
+    [content addSubview:title];
+
+    NSTextField* subtitle =
+        make_label(@"Used when a new Android application window is opened.",
+                   NSMakeRect(29, 255, 500, 18));
+    subtitle.font = [NSFont systemFontOfSize:13.0 weight:NSFontWeightRegular];
+    [content addSubview:subtitle];
+
+    NSTextField* profileLabel = make_label(@"Resolution and aspect ratio",
+                                           NSMakeRect(29, 218, 240, 18));
+    profileLabel.textColor = [NSColor labelColor];
+    [content addSubview:profileLabel];
+
+    _defaultDisplayProfilePopup =
+        [[NSPopUpButton alloc] initWithFrame:NSMakeRect(28, 184, 504, 30) pullsDown:NO];
+    _defaultDisplayProfilePopup.target = self;
+    _defaultDisplayProfilePopup.action = @selector(defaultDisplayProfileChanged:);
+    [content addSubview:_defaultDisplayProfilePopup];
+
+    NSView* detailCard = make_card(NSMakeRect(28, 87, 504, 82));
+    [content addSubview:detailCard];
+    _defaultDisplayProfileDetailValue = make_label(@"", NSMakeRect(16, 12, 472, 58));
+    _defaultDisplayProfileDetailValue.font =
+        [NSFont systemFontOfSize:12.0 weight:NSFontWeightRegular];
+    _defaultDisplayProfileDetailValue.textColor = [NSColor secondaryLabelColor];
+    _defaultDisplayProfileDetailValue.lineBreakMode = NSLineBreakByWordWrapping;
+    _defaultDisplayProfileDetailValue.maximumNumberOfLines = 0;
+    _defaultDisplayProfileDetailValue.usesSingleLineMode = NO;
+    [detailCard addSubview:_defaultDisplayProfileDetailValue];
+
+    _displaySettingsPathValue = make_value(@"", NSMakeRect(29, 59, 500, 16));
+    _displaySettingsPathValue.font = [NSFont monospacedSystemFontOfSize:10.0
+                                                               weight:NSFontWeightRegular];
+    _displaySettingsPathValue.textColor = [NSColor tertiaryLabelColor];
+    _displaySettingsPathValue.stringValue =
+        [NSString stringWithFormat:@"JSON: %@", _displaySettingsPath];
+    [content addSubview:_displaySettingsPathValue];
+
+    NSButton* cancel = make_button(@"Cancel", @selector(cancelDisplaySettings:), self,
+                                   NSMakeRect(324, 16, 100, 32));
+    [content addSubview:cancel];
+    NSButton* save = make_button(@"Save", @selector(saveDisplaySettings:), self,
+                                 NSMakeRect(432, 16, 100, 32));
+    save.keyEquivalent = @"\r";
+    [content addSubview:save];
+}
+
+- (void)reloadDefaultDisplayProfilePopup {
+    [_defaultDisplayProfilePopup removeAllItems];
+    const DisplayLaunchProfile matched =
+        screen_matched_display_profile([self defaultDisplayTargetScreen]);
+    NSString* matchTitle =
+        [NSString stringWithFormat:@"Match Current Screen — %u × %u", matched.width,
+                                   matched.height];
+    [_defaultDisplayProfilePopup addItemWithTitle:matchTitle];
+    _defaultDisplayProfilePopup.lastItem.tag = kScreenMatchedProfileTag;
+    [_defaultDisplayProfilePopup.menu addItem:[NSMenuItem separatorItem]];
+
+    NSInteger selectedTag = kScreenMatchedProfileTag;
+    bool foundFixedProfile = false;
+    for (size_t i = 0; i < kDisplayLaunchProfileCount; ++i) {
+        const DisplayLaunchProfile& profile = kDisplayLaunchProfiles[i];
+        [_defaultDisplayProfilePopup
+            addItemWithTitle:[NSString stringWithUTF8String:profile.title]];
+        _defaultDisplayProfilePopup.lastItem.tag = static_cast<NSInteger>(i);
+        if (!_defaultDisplaySettings.matchCurrentScreen &&
+            profile.width == _defaultDisplaySettings.width &&
+            profile.height == _defaultDisplaySettings.height &&
+            profile.dpi == _defaultDisplaySettings.dpi) {
+            selectedTag = static_cast<NSInteger>(i);
+            foundFixedProfile = true;
+        }
+    }
+    if (!_defaultDisplaySettings.matchCurrentScreen && !foundFixedProfile) {
+        NSString* title =
+            [NSString stringWithFormat:@"Custom  %u × %u", _defaultDisplaySettings.width,
+                                       _defaultDisplaySettings.height];
+        [_defaultDisplayProfilePopup addItemWithTitle:title];
+        _defaultDisplayProfilePopup.lastItem.tag = kCustomFixedProfileTag;
+        selectedTag = kCustomFixedProfileTag;
+    }
+    NSMenuItem* selectedItem = [_defaultDisplayProfilePopup.menu itemWithTag:selectedTag];
+    if (selectedItem) {
+        [_defaultDisplayProfilePopup selectItem:selectedItem];
+    }
+    [self updateDefaultDisplayProfileDetail];
+}
+
+- (void)updateDefaultDisplayProfileDetail {
+    const NSInteger tag = _defaultDisplayProfilePopup.selectedItem.tag;
+    if (tag == kScreenMatchedProfileTag) {
+        NSScreen* screen = resolved_screen([self defaultDisplayTargetScreen]);
+        const DisplayLaunchProfile profile = screen_matched_display_profile(screen);
+        NSString* screenName = screen.localizedName ?: @"Current Screen";
+        _defaultDisplayProfileDetailValue.stringValue = [NSString
+            stringWithFormat:@"%@ backing pixels at %u dpi. Portrait uses %u × %u; landscape "
+                             @"uses %u × %u, so a full-screen Metal drawable is pixel-aligned.",
+                             screenName, profile.dpi, profile.width, profile.height,
+                             profile.height, profile.width];
+        return;
+    }
+
+    uint32_t width = _defaultDisplaySettings.width;
+    uint32_t height = _defaultDisplaySettings.height;
+    uint32_t dpi = _defaultDisplaySettings.dpi;
+    if (tag >= 0 && static_cast<size_t>(tag) < kDisplayLaunchProfileCount) {
+        const DisplayLaunchProfile& profile = kDisplayLaunchProfiles[tag];
+        width = profile.width;
+        height = profile.height;
+        dpi = profile.dpi;
+    }
+    _defaultDisplayProfileDetailValue.stringValue =
+        [NSString stringWithFormat:@"New applications use a fixed %u × %u Android surface at "
+                                   @"%u dpi. Existing application windows are not changed.",
+                                   width, height, dpi];
+}
+
+- (void)defaultDisplayProfileChanged:(id)sender {
+    [self updateDefaultDisplayProfileDetail];
+}
+
+- (void)showDisplaySettings:(id)sender {
+    [self createDisplaySettingsWindow];
+    [self reloadDefaultDisplayProfilePopup];
+    center_window_on_screen(_displaySettingsWindow, [self defaultDisplayTargetScreen]);
+    [_displaySettingsWindow makeKeyAndOrderFront:nil];
+    [NSApp activateIgnoringOtherApps:YES];
+}
+
+- (void)cancelDisplaySettings:(id)sender {
+    [_displaySettingsWindow orderOut:nil];
+}
+
+- (void)saveDisplaySettings:(id)sender {
+    const NSInteger tag = _defaultDisplayProfilePopup.selectedItem.tag;
+    if (tag == kScreenMatchedProfileTag) {
+        _defaultDisplaySettings.matchCurrentScreen = true;
+    } else if (tag >= 0 && static_cast<size_t>(tag) < kDisplayLaunchProfileCount) {
+        const DisplayLaunchProfile& profile = kDisplayLaunchProfiles[tag];
+        _defaultDisplaySettings = {false, profile.width, profile.height, profile.dpi};
+    } else if (tag != kCustomFixedProfileTag) {
+        NSBeep();
+        return;
+    }
+    if ([self saveDefaultDisplaySettingsReportingErrors:YES]) {
+        [_displaySettingsWindow orderOut:nil];
+    }
+}
+
 - (void)installMainMenu {
     NSMenu* menu = [[NSMenu alloc] initWithTitle:@"MacMu"];
     NSMenuItem* appItem = [[NSMenuItem alloc] init];
@@ -599,6 +1056,10 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
                                                  action:@selector(refreshApps:)
                                           keyEquivalent:@"r"];
     refreshItem.target = self;
+    NSMenuItem* settingsItem = [appMenu addItemWithTitle:@"Display Settings…"
+                                                  action:@selector(showDisplaySettings:)
+                                           keyEquivalent:@","];
+    settingsItem.target = self;
     [appMenu addItem:[NSMenuItem separatorItem]];
     NSMenuItem* quitItem = [appMenu addItemWithTitle:@"Quit MacMu"
                                               action:@selector(terminate:)
@@ -606,20 +1067,114 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
     quitItem.target = NSApp;
     [appItem setSubmenu:appMenu];
 
+    _displayMenuItem = [[NSMenuItem alloc] initWithTitle:@"Display"
+                                                  action:nil
+                                           keyEquivalent:@""];
+    NSMenu* displayMenu = [[NSMenu alloc] initWithTitle:@"Display"];
+    _rotateDisplayMenuItem =
+        [displayMenu addItemWithTitle:@"Rotate to Landscape"
+                                action:@selector(rotateFocusedApplication:)
+                         keyEquivalent:@"r"];
+    _rotateDisplayMenuItem.target = self;
+    _rotateDisplayMenuItem.keyEquivalentModifierMask =
+        NSEventModifierFlagCommand | NSEventModifierFlagShift;
+    [_displayMenuItem setSubmenu:displayMenu];
+    _displayMenuItem.hidden = YES;
+    [menu addItem:_displayMenuItem];
+
     [NSApp setMainMenu:menu];
+}
+
+// Returns the emulator display id belonging to the current key application
+// window. The Applications window and unrelated windows intentionally return
+// zero so the contextual Display menu disappears with app focus.
+- (uint32_t)focusedApplicationDisplayId {
+    NSWindow* keyWindow = NSApp.keyWindow;
+    if (!keyWindow) {
+        return 0;
+    }
+    for (const auto& entry : _displayWindows) {
+        if (entry.second.window == keyWindow) {
+            return entry.first;
+        }
+    }
+    return 0;
+}
+
+- (void)updateDisplayMenu {
+    if (!_displayMenuItem || !_rotateDisplayMenuItem) {
+        return;
+    }
+    const uint32_t displayId = [self focusedApplicationDisplayId];
+    _displayMenuItem.hidden = displayId == 0;
+    if (displayId == 0) {
+        _rotateDisplayMenuItem.enabled = NO;
+        return;
+    }
+    auto profile = _displayLaunchProfiles.find(displayId);
+    const bool landscape =
+        profile != _displayLaunchProfiles.end() && profile->second.width > profile->second.height;
+    _rotateDisplayMenuItem.title =
+        landscape ? @"Rotate to Portrait" : @"Rotate to Landscape";
+    auto channel = [self controlChannel];
+    _rotateDisplayMenuItem.enabled =
+        profile != _displayLaunchProfiles.end() && ![self isShuttingDown] &&
+        _displayResizePending.count(displayId) == 0 && channel && channel->alive();
+}
+
+- (void)rotateFocusedApplication:(id)sender {
+    const uint32_t displayId = [self focusedApplicationDisplayId];
+    auto profile = _displayLaunchProfiles.find(displayId);
+    if (displayId == 0 || profile == _displayLaunchProfiles.end()) {
+        NSBeep();
+        return;
+    }
+    [self resizeDisplay:displayId
+                  width:profile->second.height
+                 height:profile->second.width
+                    dpi:profile->second.dpi
+          userInitiated:YES];
 }
 
 - (void)installStatusItem {
     _statusItem = [[NSStatusBar systemStatusBar] statusItemWithLength:NSVariableStatusItemLength];
-    _statusItem.button.title = @"MacMu";
-    _statusItem.button.toolTip = @"MacMu";
+    _statusItem.button.title = @"MacMu: Starting";
+    _statusItem.button.toolTip = @"Starting Android";
 
     NSMenu* menu = [[NSMenu alloc] initWithTitle:@"MacMu"];
+    _machineStatusMenuItem = [[NSMenuItem alloc] initWithTitle:@"Status — Starting Android"
+                                                        action:nil
+                                                 keyEquivalent:@""];
+    _machineStatusMenuItem.enabled = NO;
+    [menu addItem:_machineStatusMenuItem];
+    _machineStatusDetailMenuItem =
+        [[NSMenuItem alloc] initWithTitle:@"Preparing the emulator core…"
+                                  action:nil
+                           keyEquivalent:@""];
+    _machineStatusDetailMenuItem.enabled = NO;
+    [menu addItem:_machineStatusDetailMenuItem];
+    [menu addItem:[NSMenuItem separatorItem]];
+
     NSMenuItem* showItem = [[NSMenuItem alloc] initWithTitle:@"Show Applications"
                                                       action:@selector(showStatusWindow:)
                                                keyEquivalent:@""];
     showItem.target = self;
     [menu addItem:showItem];
+
+    _androidSettingsMenuItem =
+        [[NSMenuItem alloc] initWithTitle:@"Android Settings…"
+                                  action:@selector(openAndroidSettings:)
+                           keyEquivalent:@""];
+    _androidSettingsMenuItem.target = self;
+    _androidSettingsMenuItem.enabled = NO;
+    [menu addItem:_androidSettingsMenuItem];
+
+    NSMenuItem* settingsItem = [[NSMenuItem alloc] initWithTitle:@"Display Settings…"
+                                                          action:@selector(showDisplaySettings:)
+                                                   keyEquivalent:@""];
+    settingsItem.target = self;
+    [menu addItem:settingsItem];
+    [menu addItem:[NSMenuItem separatorItem]];
 
     NSMenuItem* refreshItem = [[NSMenuItem alloc] initWithTitle:@"Refresh Applications"
                                                          action:@selector(refreshApps:)
@@ -746,45 +1301,14 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
     subtitle.autoresizingMask = NSViewMinYMargin;
     [content addSubview:subtitle];
 
-    // --- Boot card -------------------------------------------------------
     const CGFloat cardX = 20.0;
     const CGFloat cardW = frame.size.width - cardX * 2.0;
-    NSView* bootCard = make_card(NSMakeRect(cardX, 514, cardW, 104));
-    bootCard.autoresizingMask = NSViewWidthSizable | NSViewMinYMargin;
-    [content addSubview:bootCard];
-
-    _bootSpinner = [[NSProgressIndicator alloc] initWithFrame:NSMakeRect(20, 35, 32, 32)];
-    _bootSpinner.style = NSProgressIndicatorStyleSpinning;
-    _bootSpinner.controlSize = NSControlSizeRegular;
-    _bootSpinner.displayedWhenStopped = YES;
-    [_bootSpinner startAnimation:nil];
-    [bootCard addSubview:_bootSpinner];
-
-    _bootTitleValue = make_label(@"Checking Android environment", NSMakeRect(68, 57, 560, 23));
-    _bootTitleValue.font = [NSFont systemFontOfSize:16.0 weight:NSFontWeightSemibold];
-    _bootTitleValue.textColor = [NSColor labelColor];
-    _bootTitleValue.autoresizingMask = NSViewWidthSizable;
-    [bootCard addSubview:_bootTitleValue];
-
-    _bootDetailValue = make_label(@"Preparing MacMu to start…", NSMakeRect(68, 31, 580, 20));
-    _bootDetailValue.font = [NSFont systemFontOfSize:12.0 weight:NSFontWeightRegular];
-    _bootDetailValue.textColor = [NSColor secondaryLabelColor];
-    _bootDetailValue.autoresizingMask = NSViewWidthSizable;
-    [bootCard addSubview:_bootDetailValue];
-
-    _bootStageValue = make_label(@"STARTING", NSMakeRect(cardW - 116, 62, 96, 16));
-    _bootStageValue.font = [NSFont systemFontOfSize:10.0 weight:NSFontWeightSemibold];
-    _bootStageValue.textColor = [NSColor tertiaryLabelColor];
-    _bootStageValue.alignment = NSTextAlignmentRight;
-    _bootStageValue.autoresizingMask = NSViewMinXMargin;
-    [bootCard addSubview:_bootStageValue];
-
     // --- Applications grid -----------------------------------------------
-    // The collection view mirrors Finder's Applications icon view. The list
-    // remains the primary surface while the compact boot card above changes
-    // state from Android startup through agent/application discovery.
+    // The collection view mirrors Finder's Applications icon view. Machine
+    // state lives in the status-item menu; startup temporarily covers this
+    // entire window with the overlay created below.
     const CGFloat appsCardY = 76.0;
-    const CGFloat appsCardH = 426.0;
+    const CGFloat appsCardH = 536.0;
     NSView* appsCard = make_card(NSMakeRect(cardX, appsCardY, cardW, appsCardH));
     appsCard.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
     [content addSubview:appsCard];
@@ -871,18 +1395,72 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
     _refreshAppsButton.enabled = NO;
     [content addSubview:_refreshAppsButton];
 
-    _createMachineButton = make_button(@"Import Image…", @selector(prepareDevice:), self,
-                                       NSMakeRect(cardX + 120, 20, 140, 32));
-    _createMachineButton.autoresizingMask = NSViewMaxXMargin | NSViewMaxYMargin;
-    [content addSubview:_createMachineButton];
+    // --- Full-window startup overlay ------------------------------------
+    // Keep setup/loading out of the normal Applications layout. The overlay
+    // owns the entire content area until Android and the app catalog are ready.
+    NSVisualEffectView* startupOverlay =
+        [[NSVisualEffectView alloc] initWithFrame:content.bounds];
+    startupOverlay.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+    startupOverlay.material = NSVisualEffectMaterialWindowBackground;
+    startupOverlay.blendingMode = NSVisualEffectBlendingModeWithinWindow;
+    startupOverlay.state = NSVisualEffectStateActive;
+    startupOverlay.wantsLayer = YES;
+    startupOverlay.layer.backgroundColor =
+        [[NSColor windowBackgroundColor] colorWithAlphaComponent:0.82].CGColor;
+    _startupOverlay = startupOverlay;
 
-    _openApplicationButton =
-        make_button(@"Open", @selector(openSelectedApplication:), self,
-                    NSMakeRect(cardX + cardW - 110, 20, 110, 32));
-    _openApplicationButton.autoresizingMask = NSViewMinXMargin | NSViewMaxYMargin;
-    _openApplicationButton.keyEquivalent = @"\r";
-    _openApplicationButton.enabled = NO;
-    [content addSubview:_openApplicationButton];
+    NSView* startupCard = make_card(NSMakeRect(170, 215, 500, 270));
+    startupCard.autoresizingMask = NSViewMinXMargin | NSViewMaxXMargin |
+                                   NSViewMinYMargin | NSViewMaxYMargin;
+    [startupOverlay addSubview:startupCard];
+
+    _bootStageValue = make_label(@"STARTING", NSMakeRect(24, 230, 452, 16));
+    _bootStageValue.font = [NSFont systemFontOfSize:10.0 weight:NSFontWeightSemibold];
+    _bootStageValue.textColor = [NSColor tertiaryLabelColor];
+    _bootStageValue.alignment = NSTextAlignmentCenter;
+    [startupCard addSubview:_bootStageValue];
+
+    _bootSpinner = [[NSProgressIndicator alloc] initWithFrame:NSMakeRect(232, 178, 36, 36)];
+    _bootSpinner.style = NSProgressIndicatorStyleSpinning;
+    _bootSpinner.controlSize = NSControlSizeRegular;
+    _bootSpinner.displayedWhenStopped = NO;
+    [_bootSpinner startAnimation:nil];
+    [startupCard addSubview:_bootSpinner];
+
+    _bootTitleValue = make_label(@"Starting Android", NSMakeRect(32, 138, 436, 30));
+    _bootTitleValue.font = [NSFont systemFontOfSize:22.0 weight:NSFontWeightSemibold];
+    _bootTitleValue.textColor = [NSColor labelColor];
+    _bootTitleValue.alignment = NSTextAlignmentCenter;
+    [startupCard addSubview:_bootTitleValue];
+
+    _bootDetailValue = make_label(@"Preparing MacMu to start…", NSMakeRect(44, 86, 412, 42));
+    _bootDetailValue.font = [NSFont systemFontOfSize:13.0 weight:NSFontWeightRegular];
+    _bootDetailValue.textColor = [NSColor secondaryLabelColor];
+    _bootDetailValue.alignment = NSTextAlignmentCenter;
+    _bootDetailValue.lineBreakMode = NSLineBreakByWordWrapping;
+    _bootDetailValue.maximumNumberOfLines = 2;
+    _bootDetailValue.usesSingleLineMode = NO;
+    [startupCard addSubview:_bootDetailValue];
+
+    NSTextField* startupHint =
+        make_label(@"Applications appear automatically when Android is ready.",
+                   NSMakeRect(44, 58, 412, 18));
+    startupHint.font = [NSFont systemFontOfSize:11.0 weight:NSFontWeightRegular];
+    startupHint.textColor = [NSColor tertiaryLabelColor];
+    startupHint.alignment = NSTextAlignmentCenter;
+    [startupCard addSubview:startupHint];
+
+    _createMachineButton = make_button(@"Import Image…", @selector(prepareDevice:), self,
+                                       NSMakeRect(175, 18, 150, 32));
+    _createMachineButton.hidden = YES;
+    [startupCard addSubview:_createMachineButton];
+
+    _startupRetryButton = make_button(@"Try Again", @selector(refreshApps:), self,
+                                      NSMakeRect(175, 18, 150, 32));
+    _startupRetryButton.hidden = YES;
+    [startupCard addSubview:_startupRetryButton];
+
+    [content addSubview:startupOverlay];
 
     [_statusWindow center];
 }
@@ -940,6 +1518,7 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
         [existing->second.window makeKeyAndOrderFront:nil];
         [self setDisplayStreaming:displayId enabled:YES];
         [NSApp activateIgnoringOtherApps:YES];
+        [self updateDisplayMenu];
         return;
     }
 
@@ -967,7 +1546,11 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
     if (aspectWidth > 0 && aspectHeight > 0) {
         [window setContentAspectRatio:NSMakeSize(aspectWidth, aspectHeight)];
     }
-    [window center];
+    auto targetScreen = _displayTargetScreenNumbers.find(displayId);
+    center_window_on_screen(window,
+                            targetScreen != _displayTargetScreenNumbers.end()
+                                ? screen_with_number(targetScreen->second)
+                                : [self defaultDisplayTargetScreen]);
 
     MTKView* view =
         macmu_input_view_create(frame, _metalDevice, _inputSender, _guestInputSender);
@@ -998,6 +1581,7 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
         _activeUserDisplayIds.insert(displayId);
     }
     [self updateApplicationWindowTitleForDisplay:displayId];
+    [self updateDisplayMenu];
 
     // Export is demand-driven; only visible application displays subscribe.
     [self setDisplayStreaming:displayId enabled:YES];
@@ -1035,6 +1619,167 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
                      });
 }
 
+// Resize an existing application display in place. Reusing DISPLAY_ADD with
+// the same id updates QEMU's display pose and makes Android's
+// MultiDisplayService call VirtualDisplay.resize(), which in turn produces a
+// new IOSurface at the requested orientation.
+- (void)resizeDisplay:(uint32_t)displayId
+                width:(uint32_t)width
+               height:(uint32_t)height
+                  dpi:(uint32_t)dpi
+        userInitiated:(BOOL)userInitiated {
+    if ([self isShuttingDown] || displayId == 0 || displayId > kMaxUserDisplayId || width == 0 ||
+        height == 0 || dpi == 0 || _displayResizePending.count(displayId) > 0 ||
+        _displayRemovalPending.count(displayId) > 0 ||
+        _displayAppBindings.find(displayId) == _displayAppBindings.end()) {
+        return;
+    }
+    auto profile = _displayLaunchProfiles.find(displayId);
+    if (profile == _displayLaunchProfiles.end() ||
+        (profile->second.width == width && profile->second.height == height &&
+         profile->second.dpi == dpi)) {
+        return;
+    }
+    auto channel = [self controlChannel];
+    if (!channel || !channel->alive()) {
+        if (userInitiated) {
+            NSBeep();
+        }
+        return;
+    }
+
+    const DisplayLaunchProfile previous = profile->second;
+    profile->second = {previous.title, width, height, dpi};
+    _displayResizePending.insert(displayId);
+    _orientationSyncSuppressedUntil[displayId] =
+        std::chrono::steady_clock::now() + kOrientationResizeSettleTime;
+    auto window = _displayWindows.find(displayId);
+    if (window != _displayWindows.end()) {
+        [window->second.window setContentAspectRatio:NSMakeSize(width, height)];
+    }
+    [self updateDisplayMenu];
+
+    macmu::ControlDisplayAdd request = {};
+    request.displayId = displayId;
+    request.width = width;
+    request.height = height;
+    request.dpi = dpi;
+    request.flags = kNewDisplayFlags;
+    const bool notifyUser = userInitiated == YES;
+    MacMuAppDelegate* delegate = self;
+    channel->request(
+        macmu::ControlMessageType::kDisplayAdd, &request, sizeof(request), 10000,
+        [delegate, displayId, width, height, previous, notifyUser](
+            ControlChannel::Response response) {
+            bool accepted = response.ok &&
+                            response.payload.size() >= sizeof(macmu::ControlDisplayAddOk);
+            uint32_t responseDisplayId = 0;
+            if (accepted) {
+                macmu::ControlDisplayAddOk ok = {};
+                std::memcpy(&ok, response.payload.data(), sizeof(ok));
+                responseDisplayId = ok.displayId;
+                accepted = responseDisplayId == displayId;
+            }
+            std::string error = response.errorMessage;
+            if (!accepted && error.empty()) {
+                error = "invalid display resize response";
+            }
+            dispatch_async(dispatch_get_main_queue(), ^{
+                delegate->_displayResizePending.erase(displayId);
+                if (delegate->_displayAppBindings.find(displayId) ==
+                    delegate->_displayAppBindings.end()) {
+                    delegate->_orientationSyncSuppressedUntil.erase(displayId);
+                    [delegate updateDisplayMenu];
+                    return;
+                }
+                if (!accepted) {
+                    delegate->_displayLaunchProfiles[displayId] = previous;
+                    delegate->_orientationSyncSuppressedUntil.erase(displayId);
+                    auto displayWindow = delegate->_displayWindows.find(displayId);
+                    if (displayWindow != delegate->_displayWindows.end()) {
+                        [displayWindow->second.window
+                            setContentAspectRatio:NSMakeSize(previous.width, previous.height)];
+                    }
+                    NSLog(@"MacMu display %u resize failed: %s", displayId, error.c_str());
+                    if (notifyUser) {
+                        [delegate setAppsStatus:ns_string("Could not rotate application: " + error)];
+                        NSBeep();
+                    }
+                } else {
+                    NSLog(@"MacMu display %u resized to %ux%u", displayId, width, height);
+                }
+                [delegate updateDisplayMenu];
+            });
+        });
+}
+
+// The Android framework can rotate a VirtualDisplay logically without
+// changing its physical surface dimensions. Poll the focused app's logical
+// size and make the host surface orientation follow it. Restricting this to the
+// key app keeps background tasks from changing or focusing unrelated windows.
+- (void)pollFocusedApplicationOrientation:(NSTimer*)timer {
+    (void)timer;
+    if ([self isShuttingDown] || !_guestControlClient || !_guestControlClient->ready()) {
+        return;
+    }
+    const uint32_t displayId = [self focusedApplicationDisplayId];
+    if (displayId == 0 || _displayResizePending.count(displayId) > 0 ||
+        _orientationPollInFlight.count(displayId) > 0 ||
+        _displayRemovalPending.count(displayId) > 0) {
+        return;
+    }
+    auto suppressed = _orientationSyncSuppressedUntil.find(displayId);
+    if (suppressed != _orientationSyncSuppressedUntil.end()) {
+        if (std::chrono::steady_clock::now() < suppressed->second) {
+            return;
+        }
+        _orientationSyncSuppressedUntil.erase(suppressed);
+    }
+
+    _orientationPollInFlight.insert(displayId);
+    MacMuAppDelegate* delegate = self;
+    _guestControlClient->request(
+        "display-state " + std::to_string(displayId), 1500,
+        [delegate, displayId](bool ok, std::string payload) {
+            uint32_t logicalWidth = 0;
+            uint32_t logicalHeight = 0;
+            uint32_t rotation = 0;
+            const bool parsed =
+                ok && std::sscanf(payload.c_str(), "%u %u %u", &logicalWidth, &logicalHeight,
+                                  &rotation) == 3 &&
+                logicalWidth > 0 && logicalHeight > 0;
+            dispatch_async(dispatch_get_main_queue(), ^{
+                delegate->_orientationPollInFlight.erase(displayId);
+                if (!parsed || [delegate isShuttingDown] ||
+                    [delegate focusedApplicationDisplayId] != displayId ||
+                    delegate->_displayResizePending.count(displayId) > 0 ||
+                    delegate->_displayRemovalPending.count(displayId) > 0) {
+                    return;
+                }
+                auto profile = delegate->_displayLaunchProfiles.find(displayId);
+                if (profile == delegate->_displayLaunchProfiles.end() ||
+                    logicalWidth == logicalHeight ||
+                    profile->second.width == profile->second.height) {
+                    return;
+                }
+                const bool logicalLandscape = logicalWidth > logicalHeight;
+                const bool physicalLandscape = profile->second.width > profile->second.height;
+                if (logicalLandscape == physicalLandscape) {
+                    return;
+                }
+                NSLog(@"MacMu display %u follows app orientation: logical=%ux%u rotation=%u, "
+                       "physical=%ux%u",
+                      displayId, logicalWidth, logicalHeight, rotation, profile->second.width,
+                      profile->second.height);
+                [delegate resizeDisplay:displayId
+                                  width:profile->second.height
+                                 height:profile->second.width
+                                    dpi:profile->second.dpi
+                          userInitiated:NO];
+            });
+        });
+}
+
 // Main thread only. A VirtualDisplay belongs to one QEMU process
 // generation; keeping its window/id across a backend restart would make the
 // shell send input and control requests to a display that no longer exists.
@@ -1059,10 +1804,16 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
     _closingLaunchFailures.clear();
     _deferredLaunchCleanup.clear();
     _displayLaunchProfiles.clear();
+    _screenMatchedDisplayIds.clear();
+    _displayTargetScreenNumbers.clear();
+    _displayResizePending.clear();
+    _orientationPollInFlight.clear();
+    _orientationSyncSuppressedUntil.clear();
     _displayRemovalPending.clear();
     _activeUserDisplayIds.clear();
     [_appsCollection reloadData];
     [self updateApplicationsSummary];
+    [self updateDisplayMenu];
 }
 
 - (void)restoreDisplaySubscriptions {
@@ -1290,14 +2041,18 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
                           stage:(NSString*)stage
                            busy:(BOOL)busy
                           ready:(BOOL)ready {
+    NSString* resolvedTitle = title ?: @"MacMu";
+    NSString* resolvedDetail = detail ?: @"";
+    NSString* resolvedStage = stage ?: @"";
+    _bootPresentationReady = ready;
     if (_bootTitleValue) {
-        _bootTitleValue.stringValue = title ?: @"MacMu";
+        _bootTitleValue.stringValue = resolvedTitle;
     }
     if (_bootDetailValue) {
-        _bootDetailValue.stringValue = detail ?: @"";
+        _bootDetailValue.stringValue = resolvedDetail;
     }
     if (_bootStageValue) {
-        _bootStageValue.stringValue = stage ?: @"";
+        _bootStageValue.stringValue = resolvedStage;
         _bootStageValue.textColor = ready ? [NSColor systemGreenColor]
                                           : [NSColor tertiaryLabelColor];
     }
@@ -1309,8 +2064,43 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
             [_bootSpinner stopAnimation:nil];
         }
     }
+    if (_startupRetryButton) {
+        _startupRetryButton.hidden = ready || busy || !_agentConnected;
+    }
+    if (_startupOverlay) {
+        if (ready) {
+            if (!_startupOverlay.hidden) {
+                [NSAnimationContext
+                    runAnimationGroup:^(NSAnimationContext* context) {
+                        context.duration = 0.18;
+                        self->_startupOverlay.animator.alphaValue = 0.0;
+                    }
+                    completionHandler:^{
+                        if (self->_bootPresentationReady) {
+                            self->_startupOverlay.hidden = YES;
+                        }
+                        self->_startupOverlay.alphaValue = 1.0;
+                    }];
+            }
+        } else {
+            _startupOverlay.hidden = NO;
+            _startupOverlay.alphaValue = 1.0;
+        }
+    }
+    if (_machineStatusMenuItem) {
+        _machineStatusMenuItem.title =
+            [NSString stringWithFormat:@"Status — %@", resolvedTitle];
+    }
+    if (_machineStatusDetailMenuItem) {
+        _machineStatusDetailMenuItem.title = resolvedDetail;
+    }
     if (_statusItem.button) {
-        _statusItem.button.title = ready ? @"MacMu: Ready" : (busy ? @"MacMu: Starting" : @"MacMu");
+        _statusItem.button.title = ready ? @"MacMu: Ready"
+                                         : (busy ? @"MacMu: Starting" : @"MacMu: Attention");
+        _statusItem.button.toolTip = resolvedDetail.length > 0
+                                         ? [NSString stringWithFormat:@"%@ — %@", resolvedTitle,
+                                                                      resolvedDetail]
+                                         : resolvedTitle;
     }
 }
 
@@ -1357,12 +2147,22 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
         return;
     }
     const NSUInteger total = _apps.count;
-    const size_t opening = _pendingAppPackages.size();
-    const size_t closing = _closingAppPackages.size();
+    const auto isCatalogApplication = [](const std::string& packageName) {
+        return packageName != kAndroidSettingsPackage;
+    };
+    const size_t opening = static_cast<size_t>(
+        std::count_if(_pendingAppPackages.begin(), _pendingAppPackages.end(),
+                      isCatalogApplication));
+    const size_t closing = static_cast<size_t>(
+        std::count_if(_closingAppPackages.begin(), _closingAppPackages.end(),
+                      isCatalogApplication));
+    const size_t bound = static_cast<size_t>(std::count_if(
+        _appDisplayBindings.begin(), _appDisplayBindings.end(),
+        [&isCatalogApplication](const auto& binding) {
+            return isCatalogApplication(binding.first);
+        }));
     const size_t transitional = opening + closing;
-    const size_t running = _appDisplayBindings.size() >= transitional
-                               ? _appDisplayBindings.size() - transitional
-                               : 0;
+    const size_t running = bound >= transitional ? bound - transitional : 0;
     NSString* status = nil;
     if (opening > 0) {
         status = [NSString stringWithFormat:@"%lu applications · %zu opening",
@@ -1381,17 +2181,21 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
 }
 
 - (void)updateApplicationActions {
-    const BOOL hasSelection = _appsCollection.selectionIndexPaths.count > 0;
     if (_refreshAppsButton) {
         _refreshAppsButton.enabled = _agentConnected;
     }
-    if (_openApplicationButton) {
-        _openApplicationButton.enabled = _agentConnected && hasSelection;
+    if (_androidSettingsMenuItem) {
+        _androidSettingsMenuItem.enabled = _agentConnected && _androidSettingsEntry != nil;
+        _androidSettingsMenuItem.state =
+            _appDisplayBindings.find(kAndroidSettingsPackage) != _appDisplayBindings.end()
+                ? NSControlStateValueOn
+                : NSControlStateValueOff;
     }
 }
 
 - (void)clearApplicationCatalog {
     [_apps removeAllObjects];
+    _androidSettingsEntry = nil;
     [_appNames removeAllObjects];
     [_appIcons removeAllObjects];
     [_appsCollection reloadData];
@@ -1415,10 +2219,16 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
     _closingLaunchFailures.erase(displayId);
     _deferredLaunchCleanup.erase(displayId);
     _displayLaunchProfiles.erase(displayId);
+    _screenMatchedDisplayIds.erase(displayId);
+    _displayTargetScreenNumbers.erase(displayId);
+    _displayResizePending.erase(displayId);
+    _orientationPollInFlight.erase(displayId);
+    _orientationSyncSuppressedUntil.erase(displayId);
     _displayAppBindings.erase(binding);
     [_appsCollection reloadData];
     [self updateApplicationsSummary];
     [self updateApplicationActions];
+    [self updateDisplayMenu];
 }
 
 - (void)rollbackApplicationDisplay:(uint32_t)displayId message:(NSString*)message {
@@ -1460,10 +2270,16 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
             [self requestDisplayRemove:event.displayId];
             return;
         }
+        auto profile = _displayLaunchProfiles.find(event.displayId);
+        if (profile != _displayLaunchProfiles.end() && event.width > 0 && event.height > 0 &&
+            event.dpi > 0) {
+            profile->second = {profile->second.title, event.width, event.height, event.dpi};
+        }
         [self openDisplayWindowForDisplay:event.displayId
                               aspectWidth:event.width
                              aspectHeight:event.height
                                      dpi:event.dpi];
+        [self updateDisplayMenu];
         return;
     }
     if (event.state == macmu::kControlDisplayRemoved) {
@@ -1684,6 +2500,7 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
     [_apps removeAllObjects];
     [_appNames removeAllObjects];
     [_appIcons removeAllObjects];
+    _androidSettingsEntry = nil;
     NSMutableSet<NSString*>* seenPackages = [NSMutableSet set];
     for (id entry in entries) {
         if (![entry isKindOfClass:[NSDictionary class]]) {
@@ -1701,7 +2518,6 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
             continue;
         }
         [seenPackages addObject:pkg];
-        [_apps addObject:dict];
         // Cache friendly name (falls back to package name in the cell).
         NSString* name = dict[@"name"];
         if ([name isKindOfClass:[NSString class]] && name.length > 0) {
@@ -1719,6 +2535,11 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
                 _appIcons[pkg] = icon;
             }
         }
+        if ([pkg isEqualToString:@"com.android.settings"]) {
+            _androidSettingsEntry = dict;
+            continue;
+        }
+        [_apps addObject:dict];
     }
     // Sort by friendly name when available, else by package — names make the
     // list more scannable than raw package ids.
@@ -1740,8 +2561,10 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
                            : [NSString stringWithFormat:@"%lu applications are ready to open.",
                                                         static_cast<unsigned long>(_apps.count)];
     [self updateBootPresentation:@"Ready" detail:detail stage:@"READY" busy:NO ready:YES];
-    NSLog(@"MacMu application catalog ready (%lu packages).",
-          static_cast<unsigned long>(_apps.count));
+    NSLog(@"MacMu application catalog ready (%lu applications; Android Settings %@).",
+          static_cast<unsigned long>(_apps.count),
+          _androidSettingsEntry ? @"available in status menu" : @"not found");
+
 }
 
 - (NSString*)selectedAppComponent {
@@ -1754,8 +2577,23 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
 }
 
 - (void)openSelectedApplication:(id)sender {
-    [self launchSelectedApplicationWithProfile:
-              kDisplayLaunchProfiles[kDefaultDisplayLaunchProfile]];
+    [self launchSelectedApplicationWithProfile:[self defaultDisplayLaunchProfile]
+                          matchesCurrentScreen:_defaultDisplaySettings.matchCurrentScreen];
+}
+
+- (void)openAndroidSettings:(id)sender {
+    if (!_androidSettingsEntry ||
+        ![_androidSettingsEntry[@"pkg"] isKindOfClass:[NSString class]] ||
+        ![_androidSettingsEntry[@"activity"] isKindOfClass:[NSString class]]) {
+        NSBeep();
+        return;
+    }
+    NSString* component =
+        [NSString stringWithFormat:@"%@/%@", _androidSettingsEntry[@"pkg"],
+                                   _androidSettingsEntry[@"activity"]];
+    [self launchApplicationComponent:component
+                         withProfile:[self defaultDisplayLaunchProfile]
+                matchesCurrentScreen:_defaultDisplaySettings.matchCurrentScreen];
 }
 
 - (void)launchAppWithProfile:(id)sender {
@@ -1773,16 +2611,29 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
         NSBeep();
         return;
     }
-    [self launchSelectedApplicationWithProfile:kDisplayLaunchProfiles[index]];
+    [self launchSelectedApplicationWithProfile:kDisplayLaunchProfiles[index]
+                          matchesCurrentScreen:NO];
 }
 
-- (void)launchSelectedApplicationWithProfile:(DisplayLaunchProfile)profile {
+- (void)launchSelectedApplicationWithProfile:(DisplayLaunchProfile)profile
+                         matchesCurrentScreen:(BOOL)matchesCurrentScreen {
     if ([self isShuttingDown]) {
         return;
     }
     NSString* component = [self selectedAppComponent];
     if (!component) {
         NSBeep();
+        return;
+    }
+    [self launchApplicationComponent:component
+                         withProfile:profile
+                matchesCurrentScreen:matchesCurrentScreen];
+}
+
+- (void)launchApplicationComponent:(NSString*)component
+                        withProfile:(DisplayLaunchProfile)profile
+               matchesCurrentScreen:(BOOL)matchesCurrentScreen {
+    if ([self isShuttingDown] || component.length == 0) {
         return;
     }
     const std::string componentValue = [component UTF8String];
@@ -1829,6 +2680,10 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
     _appDisplayBindings[packageName] = displayId;
     _pendingAppPackages.insert(packageName);
     _displayLaunchProfiles[displayId] = profile;
+    _displayTargetScreenNumbers[displayId] = screen_number([self defaultDisplayTargetScreen]);
+    if (matchesCurrentScreen) {
+        _screenMatchedDisplayIds.insert(displayId);
+    }
     [_appsCollection reloadData];
     [self updateApplicationActions];
     [self setAppsStatus:[NSString stringWithFormat:@"Opening %@…",
@@ -2351,9 +3206,12 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
     }
     _displayWindows.clear();
     [_statusWindow orderOut:nil];
+    [_displaySettingsWindow orderOut:nil];
 }
 
 - (void)beginAsyncTermination {
+    [_orientationTimer invalidate];
+    _orientationTimer = nil;
     if (_shuttingDown.exchange(true, std::memory_order_acq_rel)) {
         [self hideWindowsForTermination];
         return;
@@ -2372,6 +3230,8 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
 }
 
 - (void)shutdownRuntime {
+    [_orientationTimer invalidate];
+    _orientationTimer = nil;
     if (_shuttingDown.exchange(true, std::memory_order_acq_rel)) {
         return;
     }
