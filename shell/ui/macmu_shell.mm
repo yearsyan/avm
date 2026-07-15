@@ -51,6 +51,13 @@ NSString* ns_string(const std::string& value) {
     return [NSString stringWithUTF8String:value.c_str()];
 }
 
+// Use the English source text as the localization key. This keeps standalone
+// development builds readable when they are launched outside MacMu.app, while
+// packaged builds resolve the key from Contents/Resources/<language>.lproj.
+NSString* tr(NSString* key) {
+    return [[NSBundle mainBundle] localizedStringForKey:key value:key table:nil];
+}
+
 std::string package_from_component(const std::string& component) {
     const size_t slash = component.find('/');
     return slash == std::string::npos ? component : component.substr(0, slash);
@@ -290,30 +297,32 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
 }
 
 - (void)loadView {
-    NSView* view = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 116, 120)];
+    NSView* view = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 120, 148)];
     view.wantsLayer = YES;
-    view.layer.cornerRadius = 12.0;
+    view.layer.cornerRadius = 14.0;
 
-    NSImageView* icon = [[NSImageView alloc] initWithFrame:NSMakeRect(26, 46, 64, 64)];
+    NSImageView* icon = [[NSImageView alloc] initWithFrame:NSMakeRect(19, 64, 82, 82)];
     icon.imageAlignment = NSImageAlignCenter;
     icon.imageScaling = NSImageScaleProportionallyDown;
     icon.wantsLayer = YES;
-    icon.layer.cornerRadius = 14.0;
+    icon.layer.cornerRadius = 18.0;
     icon.layer.masksToBounds = YES;
     [view addSubview:icon];
 
-    NSTextField* name = [[NSTextField alloc] initWithFrame:NSMakeRect(6, 23, 104, 18)];
+    NSTextField* name = [[NSTextField alloc] initWithFrame:NSMakeRect(4, 23, 112, 36)];
     name.bezeled = NO;
     name.drawsBackground = NO;
     name.editable = NO;
     name.selectable = NO;
     name.alignment = NSTextAlignmentCenter;
-    name.lineBreakMode = NSLineBreakByTruncatingTail;
-    name.font = [NSFont systemFontOfSize:12.0 weight:NSFontWeightMedium];
+    name.lineBreakMode = NSLineBreakByWordWrapping;
+    name.maximumNumberOfLines = 2;
+    name.usesSingleLineMode = NO;
+    name.font = [NSFont systemFontOfSize:13.0 weight:NSFontWeightMedium];
     name.textColor = [NSColor labelColor];
     [view addSubview:name];
 
-    _runningLabel = [[NSTextField alloc] initWithFrame:NSMakeRect(6, 6, 104, 14)];
+    _runningLabel = [[NSTextField alloc] initWithFrame:NSMakeRect(4, 5, 112, 14)];
     _runningLabel.bezeled = NO;
     _runningLabel.drawsBackground = NO;
     _runningLabel.editable = NO;
@@ -337,9 +346,9 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
 }
 
 - (void)setApplicationRunning:(BOOL)running opening:(BOOL)opening closing:(BOOL)closing {
-    _runningLabel.stringValue = opening ? @"Opening…"
-                                        : (closing ? @"Closing…"
-                                                   : (running ? @"●  Running" : @""));
+    _runningLabel.stringValue = opening ? tr(@"Opening…")
+                                        : (closing ? tr(@"Closing…")
+                                                   : (running ? tr(@"●  Running") : @""));
     _runningLabel.textColor = (opening || closing) ? [NSColor secondaryLabelColor]
                                                    : [NSColor systemGreenColor];
 }
@@ -810,8 +819,9 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
         NSLog(@"MacMu could not save display settings to %@: %@", _displaySettingsPath, error);
         if (reportErrors) {
             NSAlert* alert = [[NSAlert alloc] init];
-            alert.messageText = @"Could not save display settings";
-            alert.informativeText = error.localizedDescription ?: @"The JSON file could not be written.";
+            alert.messageText = tr(@"Could not save display settings");
+            alert.informativeText =
+                error.localizedDescription ?: tr(@"The JSON file could not be written.");
             if (_displaySettingsWindow.visible) {
                 [alert beginSheetModalForWindow:_displaySettingsWindow completionHandler:nil];
             } else {
@@ -883,25 +893,26 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
                   styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable
                     backing:NSBackingStoreBuffered
                       defer:NO];
-    _displaySettingsWindow.title = @"Default Display — MacMu";
+    _displaySettingsWindow.title = tr(@"Default Display — MacMu");
     _displaySettingsWindow.releasedWhenClosed = NO;
     _displaySettingsWindow.delegate = self;
 
     NSView* content = [[NSView alloc] initWithFrame:frame];
     _displaySettingsWindow.contentView = content;
 
-    NSTextField* title = make_label(@"Default application display", NSMakeRect(28, 280, 500, 28));
+    NSTextField* title =
+        make_label(tr(@"Default application display"), NSMakeRect(28, 280, 500, 28));
     title.font = [NSFont systemFontOfSize:22.0 weight:NSFontWeightBold];
     title.textColor = [NSColor labelColor];
     [content addSubview:title];
 
     NSTextField* subtitle =
-        make_label(@"Used when a new Android application window is opened.",
+        make_label(tr(@"Used when a new Android application window is opened."),
                    NSMakeRect(29, 255, 500, 18));
     subtitle.font = [NSFont systemFontOfSize:13.0 weight:NSFontWeightRegular];
     [content addSubview:subtitle];
 
-    NSTextField* profileLabel = make_label(@"Resolution and aspect ratio",
+    NSTextField* profileLabel = make_label(tr(@"Resolution and aspect ratio"),
                                            NSMakeRect(29, 218, 240, 18));
     profileLabel.textColor = [NSColor labelColor];
     [content addSubview:profileLabel];
@@ -928,13 +939,13 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
                                                                weight:NSFontWeightRegular];
     _displaySettingsPathValue.textColor = [NSColor tertiaryLabelColor];
     _displaySettingsPathValue.stringValue =
-        [NSString stringWithFormat:@"JSON: %@", _displaySettingsPath];
+        [NSString stringWithFormat:tr(@"JSON: %@"), _displaySettingsPath];
     [content addSubview:_displaySettingsPathValue];
 
-    NSButton* cancel = make_button(@"Cancel", @selector(cancelDisplaySettings:), self,
+    NSButton* cancel = make_button(tr(@"Cancel"), @selector(cancelDisplaySettings:), self,
                                    NSMakeRect(324, 16, 100, 32));
     [content addSubview:cancel];
-    NSButton* save = make_button(@"Save", @selector(saveDisplaySettings:), self,
+    NSButton* save = make_button(tr(@"Save"), @selector(saveDisplaySettings:), self,
                                  NSMakeRect(432, 16, 100, 32));
     save.keyEquivalent = @"\r";
     [content addSubview:save];
@@ -945,7 +956,7 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
     const DisplayLaunchProfile matched =
         screen_matched_display_profile([self defaultDisplayTargetScreen]);
     NSString* matchTitle =
-        [NSString stringWithFormat:@"Match Current Screen — %u × %u", matched.width,
+        [NSString stringWithFormat:tr(@"Match Current Screen — %u × %u"), matched.width,
                                    matched.height];
     [_defaultDisplayProfilePopup addItemWithTitle:matchTitle];
     _defaultDisplayProfilePopup.lastItem.tag = kScreenMatchedProfileTag;
@@ -968,7 +979,7 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
     }
     if (!_defaultDisplaySettings.matchCurrentScreen && !foundFixedProfile) {
         NSString* title =
-            [NSString stringWithFormat:@"Custom  %u × %u", _defaultDisplaySettings.width,
+            [NSString stringWithFormat:tr(@"Custom  %u × %u"), _defaultDisplaySettings.width,
                                        _defaultDisplaySettings.height];
         [_defaultDisplayProfilePopup addItemWithTitle:title];
         _defaultDisplayProfilePopup.lastItem.tag = kCustomFixedProfileTag;
@@ -986,10 +997,10 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
     if (tag == kScreenMatchedProfileTag) {
         NSScreen* screen = resolved_screen([self defaultDisplayTargetScreen]);
         const DisplayLaunchProfile profile = screen_matched_display_profile(screen);
-        NSString* screenName = screen.localizedName ?: @"Current Screen";
+        NSString* screenName = screen.localizedName ?: tr(@"Current Screen");
         _defaultDisplayProfileDetailValue.stringValue = [NSString
-            stringWithFormat:@"%@ backing pixels at %u dpi. Portrait uses %u × %u; landscape "
-                             @"uses %u × %u, so a full-screen Metal drawable is pixel-aligned.",
+            stringWithFormat:tr(@"%@ backing pixels at %u dpi. Portrait uses %u × %u; landscape "
+                                @"uses %u × %u, so a full-screen Metal drawable is pixel-aligned."),
                              screenName, profile.dpi, profile.width, profile.height,
                              profile.height, profile.width];
         return;
@@ -1005,8 +1016,8 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
         dpi = profile.dpi;
     }
     _defaultDisplayProfileDetailValue.stringValue =
-        [NSString stringWithFormat:@"New applications use a fixed %u × %u Android surface at "
-                                   @"%u dpi. Existing application windows are not changed.",
+        [NSString stringWithFormat:tr(@"New applications use a fixed %u × %u Android surface at "
+                                      @"%u dpi. Existing application windows are not changed."),
                                    width, height, dpi];
 }
 
@@ -1048,31 +1059,31 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
     [menu addItem:appItem];
 
     NSMenu* appMenu = [[NSMenu alloc] initWithTitle:@"MacMu"];
-    NSMenuItem* showItem = [appMenu addItemWithTitle:@"Show Applications"
+    NSMenuItem* showItem = [appMenu addItemWithTitle:tr(@"Show Applications")
                                               action:@selector(showStatusWindow:)
                                        keyEquivalent:@"0"];
     showItem.target = self;
-    NSMenuItem* refreshItem = [appMenu addItemWithTitle:@"Refresh Applications"
+    NSMenuItem* refreshItem = [appMenu addItemWithTitle:tr(@"Refresh Applications")
                                                  action:@selector(refreshApps:)
                                           keyEquivalent:@"r"];
     refreshItem.target = self;
-    NSMenuItem* settingsItem = [appMenu addItemWithTitle:@"Display Settings…"
+    NSMenuItem* settingsItem = [appMenu addItemWithTitle:tr(@"Display Settings…")
                                                   action:@selector(showDisplaySettings:)
                                            keyEquivalent:@","];
     settingsItem.target = self;
     [appMenu addItem:[NSMenuItem separatorItem]];
-    NSMenuItem* quitItem = [appMenu addItemWithTitle:@"Quit MacMu"
+    NSMenuItem* quitItem = [appMenu addItemWithTitle:tr(@"Quit MacMu")
                                               action:@selector(terminate:)
                                        keyEquivalent:@"q"];
     quitItem.target = NSApp;
     [appItem setSubmenu:appMenu];
 
-    _displayMenuItem = [[NSMenuItem alloc] initWithTitle:@"Display"
+    _displayMenuItem = [[NSMenuItem alloc] initWithTitle:tr(@"Display")
                                                   action:nil
                                            keyEquivalent:@""];
-    NSMenu* displayMenu = [[NSMenu alloc] initWithTitle:@"Display"];
+    NSMenu* displayMenu = [[NSMenu alloc] initWithTitle:tr(@"Display")];
     _rotateDisplayMenuItem =
-        [displayMenu addItemWithTitle:@"Rotate to Landscape"
+        [displayMenu addItemWithTitle:tr(@"Rotate to Landscape")
                                 action:@selector(rotateFocusedApplication:)
                          keyEquivalent:@"r"];
     _rotateDisplayMenuItem.target = self;
@@ -1115,7 +1126,7 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
     const bool landscape =
         profile != _displayLaunchProfiles.end() && profile->second.width > profile->second.height;
     _rotateDisplayMenuItem.title =
-        landscape ? @"Rotate to Portrait" : @"Rotate to Landscape";
+        landscape ? tr(@"Rotate to Portrait") : tr(@"Rotate to Landscape");
     auto channel = [self controlChannel];
     _rotateDisplayMenuItem.enabled =
         profile != _displayLaunchProfiles.end() && ![self isShuttingDown] &&
@@ -1138,52 +1149,53 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
 
 - (void)installStatusItem {
     _statusItem = [[NSStatusBar systemStatusBar] statusItemWithLength:NSVariableStatusItemLength];
-    _statusItem.button.title = @"MacMu: Starting";
-    _statusItem.button.toolTip = @"Starting Android";
+    _statusItem.button.title = tr(@"MacMu: Starting");
+    _statusItem.button.toolTip = tr(@"Starting Android");
 
     NSMenu* menu = [[NSMenu alloc] initWithTitle:@"MacMu"];
-    _machineStatusMenuItem = [[NSMenuItem alloc] initWithTitle:@"Status — Starting Android"
-                                                        action:nil
-                                                 keyEquivalent:@""];
+    _machineStatusMenuItem =
+        [[NSMenuItem alloc] initWithTitle:tr(@"Status — Starting Android")
+                                  action:nil
+                           keyEquivalent:@""];
     _machineStatusMenuItem.enabled = NO;
     [menu addItem:_machineStatusMenuItem];
     _machineStatusDetailMenuItem =
-        [[NSMenuItem alloc] initWithTitle:@"Preparing the emulator core…"
+        [[NSMenuItem alloc] initWithTitle:tr(@"Preparing the emulator core…")
                                   action:nil
                            keyEquivalent:@""];
     _machineStatusDetailMenuItem.enabled = NO;
     [menu addItem:_machineStatusDetailMenuItem];
     [menu addItem:[NSMenuItem separatorItem]];
 
-    NSMenuItem* showItem = [[NSMenuItem alloc] initWithTitle:@"Show Applications"
+    NSMenuItem* showItem = [[NSMenuItem alloc] initWithTitle:tr(@"Show Applications")
                                                       action:@selector(showStatusWindow:)
                                                keyEquivalent:@""];
     showItem.target = self;
     [menu addItem:showItem];
 
     _androidSettingsMenuItem =
-        [[NSMenuItem alloc] initWithTitle:@"Android Settings…"
+        [[NSMenuItem alloc] initWithTitle:tr(@"Android Settings…")
                                   action:@selector(openAndroidSettings:)
                            keyEquivalent:@""];
     _androidSettingsMenuItem.target = self;
     _androidSettingsMenuItem.enabled = NO;
     [menu addItem:_androidSettingsMenuItem];
 
-    NSMenuItem* settingsItem = [[NSMenuItem alloc] initWithTitle:@"Display Settings…"
+    NSMenuItem* settingsItem = [[NSMenuItem alloc] initWithTitle:tr(@"Display Settings…")
                                                           action:@selector(showDisplaySettings:)
                                                    keyEquivalent:@""];
     settingsItem.target = self;
     [menu addItem:settingsItem];
     [menu addItem:[NSMenuItem separatorItem]];
 
-    NSMenuItem* refreshItem = [[NSMenuItem alloc] initWithTitle:@"Refresh Applications"
+    NSMenuItem* refreshItem = [[NSMenuItem alloc] initWithTitle:tr(@"Refresh Applications")
                                                          action:@selector(refreshApps:)
                                                   keyEquivalent:@""];
     refreshItem.target = self;
     [menu addItem:refreshItem];
     [menu addItem:[NSMenuItem separatorItem]];
 
-    NSMenuItem* quitItem = [[NSMenuItem alloc] initWithTitle:@"Quit MacMu"
+    NSMenuItem* quitItem = [[NSMenuItem alloc] initWithTitle:tr(@"Quit MacMu")
                                                       action:@selector(quitFromStatusItem:)
                                                keyEquivalent:@""];
     quitItem.target = self;
@@ -1227,30 +1239,30 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
                 delegate->_appsLoaded = false;
                 if (connected) {
                     NSLog(@"MacMu Android boot completed; agent connected. Loading applications.");
-                    [delegate updateBootPresentation:@"Android started"
-                                               detail:@"MacMu Agent is ready. Loading applications…"
-                                                stage:@"LOADING"
+                    [delegate updateBootPresentation:tr(@"Android started")
+                                               detail:tr(@"MacMu Agent is ready. Loading applications…")
+                                                stage:tr(@"LOADING")
                                                  busy:YES
                                                  ready:NO];
-                    [delegate setAppsStatus:@"Loading applications…"];
+                    [delegate setAppsStatus:tr(@"Loading applications…")];
                     for (const auto& cleanup : delegate->_deferredLaunchCleanup) {
                         NSString* component = ns_string(cleanup.second);
                         [delegate cleanupFailedLaunchForDisplay:cleanup.first
                                                      component:component
-                                                       message:@"The previous application launch did not complete"];
+                                                       message:tr(@"The previous application launch did not complete")];
                     }
                     [delegate refreshApps:nil];
                 } else {
                     [delegate clearApplicationCatalog];
                     NSString* title = [delegate currentQemuPid] > 0
-                                          ? @"Reconnecting to Android"
-                                          : @"Starting Android";
+                                          ? tr(@"Reconnecting to Android")
+                                          : tr(@"Starting Android");
                     [delegate updateBootPresentation:title
-                                               detail:@"Waiting for Android and MacMu Agent…"
-                                                stage:@"STARTING"
+                                               detail:tr(@"Waiting for Android and MacMu Agent…")
+                                                stage:tr(@"STARTING")
                                                  busy:YES
                                                  ready:NO];
-                    [delegate setAppsStatus:@"Waiting for Android…"];
+                    [delegate setAppsStatus:tr(@"Waiting for Android…")];
                 }
                 [delegate updateApplicationActions];
             });
@@ -1271,74 +1283,83 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
         return;
     }
 
-    const NSRect frame = NSMakeRect(0, 0, 840, 700);
+    const NSRect frame = NSMakeRect(0, 0, 960, 720);
+    NSColor* applicationBackground =
+        [NSColor colorWithSRGBRed:0.105 green:0.118 blue:0.145 alpha:1.0];
     _statusWindow = [[NSWindow alloc]
         initWithContentRect:frame
                   styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
                             NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskResizable
                     backing:NSBackingStoreBuffered
                       defer:NO];
-    _statusWindow.title = @"Applications — MacMu";
+    _statusWindow.title = tr(@"Applications — MacMu");
+    _statusWindow.titleVisibility = NSWindowTitleHidden;
+    _statusWindow.titlebarAppearsTransparent = YES;
     _statusWindow.releasedWhenClosed = NO;
     _statusWindow.delegate = self;
-    _statusWindow.minSize = NSMakeSize(720, 600);
-    _statusWindow.backgroundColor = [NSColor windowBackgroundColor];
+    _statusWindow.minSize = NSMakeSize(720, 560);
+    _statusWindow.appearance = [NSAppearance appearanceNamed:NSAppearanceNameDarkAqua];
+    _statusWindow.backgroundColor = applicationBackground;
 
     NSView* content = [[NSView alloc] initWithFrame:frame];
+    content.wantsLayer = YES;
+    content.layer.backgroundColor = applicationBackground.CGColor;
     _statusWindow.contentView = content;
 
-    // --- Title region ----------------------------------------------------
-    NSTextField* title = make_label(@"Applications", NSMakeRect(24, 654, 420, 30));
+    // Match the pared-back Finder Applications layout: a single title at the
+    // upper left, one refresh control at the upper right, and no chrome around
+    // the icon grid.
+    NSTextField* title =
+        make_label(tr(@"Applications"), NSMakeRect(28, frame.size.height - 64, 420, 34));
     title.font = [NSFont systemFontOfSize:26.0 weight:NSFontWeightBold];
     title.textColor = [NSColor labelColor];
     title.autoresizingMask = NSViewMinYMargin;
     [content addSubview:title];
 
-    NSTextField* subtitle =
-        make_label(@"Android apps, each in its own Mac window", NSMakeRect(26, 630, 520, 18));
-    subtitle.font = [NSFont systemFontOfSize:13.0 weight:NSFontWeightRegular];
-    subtitle.textColor = [NSColor secondaryLabelColor];
-    subtitle.autoresizingMask = NSViewMinYMargin;
-    [content addSubview:subtitle];
-
-    const CGFloat cardX = 20.0;
-    const CGFloat cardW = frame.size.width - cardX * 2.0;
-    // --- Applications grid -----------------------------------------------
-    // The collection view mirrors Finder's Applications icon view. Machine
-    // state lives in the status-item menu; startup temporarily covers this
-    // entire window with the overlay created below.
-    const CGFloat appsCardY = 76.0;
-    const CGFloat appsCardH = 536.0;
-    NSView* appsCard = make_card(NSMakeRect(cardX, appsCardY, cardW, appsCardH));
-    appsCard.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
-    [content addSubview:appsCard];
-
-    NSTextField* appsHeader =
-        make_label(@"APPLICATIONS", NSMakeRect(16, appsCardH - 28, 160, 16));
-    appsHeader.font = [NSFont systemFontOfSize:11.0 weight:NSFontWeightSemibold];
-    appsHeader.textColor = [NSColor tertiaryLabelColor];
-    appsHeader.autoresizingMask = NSViewMinYMargin;
-    [appsCard addSubview:appsHeader];
-
-    _appsStatusValue = make_value(@"Waiting for Android…",
-                                  NSMakeRect(cardW - 330, appsCardH - 28, 314, 16));
-    _appsStatusValue.font = [NSFont systemFontOfSize:11.0 weight:NSFontWeightRegular];
-    _appsStatusValue.textColor = [NSColor tertiaryLabelColor];
-    _appsStatusValue.alignment = NSTextAlignmentRight;
-    _appsStatusValue.autoresizingMask = NSViewMinXMargin | NSViewMinYMargin;
-    [appsCard addSubview:_appsStatusValue];
+    NSImage* refreshImage =
+        [NSImage imageWithSystemSymbolName:@"arrow.clockwise"
+                  accessibilityDescription:tr(@"Refresh Applications")];
+    if (refreshImage) {
+        NSImageSymbolConfiguration* configuration =
+            [NSImageSymbolConfiguration configurationWithPointSize:17.0
+                                                            weight:NSFontWeightSemibold];
+        refreshImage = [refreshImage imageWithSymbolConfiguration:configuration];
+    }
+    _refreshAppsButton =
+        [[NSButton alloc] initWithFrame:NSMakeRect(frame.size.width - 72,
+                                                   frame.size.height - 73, 44, 44)];
+    _refreshAppsButton.target = self;
+    _refreshAppsButton.action = @selector(refreshApps:);
+    _refreshAppsButton.image = refreshImage;
+    _refreshAppsButton.title = refreshImage ? @"" : @"↻";
+    _refreshAppsButton.font = [NSFont systemFontOfSize:20.0 weight:NSFontWeightMedium];
+    _refreshAppsButton.bezelStyle = NSBezelStyleCircular;
+    _refreshAppsButton.buttonType = NSButtonTypeMomentaryPushIn;
+    _refreshAppsButton.imagePosition = refreshImage ? NSImageOnly : NSNoImage;
+    _refreshAppsButton.imageScaling = NSImageScaleProportionallyDown;
+    _refreshAppsButton.contentTintColor = [NSColor labelColor];
+    _refreshAppsButton.toolTip = tr(@"Refresh Applications");
+    _refreshAppsButton.autoresizingMask = NSViewMinXMargin | NSViewMinYMargin;
+    _refreshAppsButton.enabled = NO;
+    [_refreshAppsButton setAccessibilityLabel:tr(@"Refresh Applications")];
+    [content addSubview:_refreshAppsButton];
 
     NSScrollView* scroll =
-        [[NSScrollView alloc] initWithFrame:NSMakeRect(8, 8, cardW - 16, appsCardH - 46)];
+        [[NSScrollView alloc] initWithFrame:NSMakeRect(12, 14, frame.size.width - 24,
+                                                       frame.size.height - 112)];
     scroll.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
     scroll.hasVerticalScroller = YES;
+    scroll.hasHorizontalScroller = NO;
+    scroll.autohidesScrollers = YES;
+    scroll.scrollerStyle = NSScrollerStyleOverlay;
+    scroll.borderType = NSNoBorder;
     scroll.drawsBackground = NO;
 
     NSCollectionViewFlowLayout* layout = [[NSCollectionViewFlowLayout alloc] init];
-    layout.itemSize = NSMakeSize(116, 120);
-    layout.sectionInset = NSEdgeInsetsMake(16, 16, 16, 16);
+    layout.itemSize = NSMakeSize(120, 148);
+    layout.sectionInset = NSEdgeInsetsMake(20, 14, 24, 14);
     layout.minimumInteritemSpacing = 8.0;
-    layout.minimumLineSpacing = 10.0;
+    layout.minimumLineSpacing = 16.0;
 
     _appsCollection = [[MacMuApplicationsCollectionView alloc] initWithFrame:scroll.bounds];
     _appsCollection.collectionViewLayout = layout;
@@ -1353,15 +1374,15 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
     [_appsCollection registerClass:[MacMuApplicationItem class]
             forItemWithIdentifier:kApplicationItemIdentifier];
 
-    NSMenu* appsMenu = [[NSMenu alloc] initWithTitle:@"Applications"];
-    NSMenuItem* openItem = [appsMenu addItemWithTitle:@"Open"
+    NSMenu* appsMenu = [[NSMenu alloc] initWithTitle:tr(@"Applications")];
+    NSMenuItem* openItem = [appsMenu addItemWithTitle:tr(@"Open")
                                                action:@selector(openSelectedApplication:)
                                         keyEquivalent:@""];
     openItem.target = self;
-    NSMenuItem* openAsItem = [appsMenu addItemWithTitle:@"Open with Window Size"
+    NSMenuItem* openAsItem = [appsMenu addItemWithTitle:tr(@"Open with Window Size")
                                                  action:nil
                                           keyEquivalent:@""];
-    NSMenu* ratioMenu = [[NSMenu alloc] initWithTitle:@"Open with Window Size"];
+    NSMenu* ratioMenu = [[NSMenu alloc] initWithTitle:tr(@"Open with Window Size")];
     for (size_t i = 0; i < kDisplayLaunchProfileCount; ++i) {
         NSMenuItem* item =
             [ratioMenu addItemWithTitle:[NSString stringWithUTF8String:kDisplayLaunchProfiles[i].title]
@@ -1373,27 +1394,16 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
     [appsMenu setSubmenu:ratioMenu forItem:openAsItem];
     _appsCollection.menu = appsMenu;
     scroll.documentView = _appsCollection;
-    [appsCard addSubview:scroll];
+    [content addSubview:scroll];
 
-    _appsEmptyValue = make_label(@"Waiting for Android to finish starting…",
-                                 NSMakeRect(60, appsCardH / 2.0 - 12, cardW - 120, 24));
+    _appsEmptyValue = make_label(tr(@"Waiting for Android to finish starting…"),
+                                 NSMakeRect(60, (frame.size.height - 112) / 2.0,
+                                            frame.size.width - 120, 24));
     _appsEmptyValue.font = [NSFont systemFontOfSize:14.0 weight:NSFontWeightRegular];
     _appsEmptyValue.textColor = [NSColor secondaryLabelColor];
     _appsEmptyValue.alignment = NSTextAlignmentCenter;
     _appsEmptyValue.autoresizingMask = NSViewWidthSizable | NSViewMinYMargin | NSViewMaxYMargin;
-    [appsCard addSubview:_appsEmptyValue];
-
-    // --- Bottom button row ----------------------------------------------
-    NSBox* separator = [[NSBox alloc] initWithFrame:NSMakeRect(cardX, 66, cardW, 1)];
-    separator.boxType = NSBoxSeparator;
-    separator.autoresizingMask = NSViewWidthSizable | NSViewMaxYMargin;
-    [content addSubview:separator];
-
-    _refreshAppsButton = make_button(@"Refresh", @selector(refreshApps:), self,
-                                     NSMakeRect(cardX, 20, 110, 32));
-    _refreshAppsButton.autoresizingMask = NSViewMaxXMargin | NSViewMaxYMargin;
-    _refreshAppsButton.enabled = NO;
-    [content addSubview:_refreshAppsButton];
+    [content addSubview:_appsEmptyValue];
 
     // --- Full-window startup overlay ------------------------------------
     // Keep setup/loading out of the normal Applications layout. The overlay
@@ -1409,12 +1419,14 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
         [[NSColor windowBackgroundColor] colorWithAlphaComponent:0.82].CGColor;
     _startupOverlay = startupOverlay;
 
-    NSView* startupCard = make_card(NSMakeRect(170, 215, 500, 270));
+    NSView* startupCard =
+        make_card(NSMakeRect((frame.size.width - 500) * 0.5,
+                             (frame.size.height - 270) * 0.5, 500, 270));
     startupCard.autoresizingMask = NSViewMinXMargin | NSViewMaxXMargin |
                                    NSViewMinYMargin | NSViewMaxYMargin;
     [startupOverlay addSubview:startupCard];
 
-    _bootStageValue = make_label(@"STARTING", NSMakeRect(24, 230, 452, 16));
+    _bootStageValue = make_label(tr(@"STARTING"), NSMakeRect(24, 230, 452, 16));
     _bootStageValue.font = [NSFont systemFontOfSize:10.0 weight:NSFontWeightSemibold];
     _bootStageValue.textColor = [NSColor tertiaryLabelColor];
     _bootStageValue.alignment = NSTextAlignmentCenter;
@@ -1427,13 +1439,14 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
     [_bootSpinner startAnimation:nil];
     [startupCard addSubview:_bootSpinner];
 
-    _bootTitleValue = make_label(@"Starting Android", NSMakeRect(32, 138, 436, 30));
+    _bootTitleValue = make_label(tr(@"Starting Android"), NSMakeRect(32, 138, 436, 30));
     _bootTitleValue.font = [NSFont systemFontOfSize:22.0 weight:NSFontWeightSemibold];
     _bootTitleValue.textColor = [NSColor labelColor];
     _bootTitleValue.alignment = NSTextAlignmentCenter;
     [startupCard addSubview:_bootTitleValue];
 
-    _bootDetailValue = make_label(@"Preparing MacMu to start…", NSMakeRect(44, 86, 412, 42));
+    _bootDetailValue =
+        make_label(tr(@"Preparing MacMu to start…"), NSMakeRect(44, 86, 412, 42));
     _bootDetailValue.font = [NSFont systemFontOfSize:13.0 weight:NSFontWeightRegular];
     _bootDetailValue.textColor = [NSColor secondaryLabelColor];
     _bootDetailValue.alignment = NSTextAlignmentCenter;
@@ -1443,19 +1456,19 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
     [startupCard addSubview:_bootDetailValue];
 
     NSTextField* startupHint =
-        make_label(@"Applications appear automatically when Android is ready.",
+        make_label(tr(@"Applications appear automatically when Android is ready."),
                    NSMakeRect(44, 58, 412, 18));
     startupHint.font = [NSFont systemFontOfSize:11.0 weight:NSFontWeightRegular];
     startupHint.textColor = [NSColor tertiaryLabelColor];
     startupHint.alignment = NSTextAlignmentCenter;
     [startupCard addSubview:startupHint];
 
-    _createMachineButton = make_button(@"Import Image…", @selector(prepareDevice:), self,
+    _createMachineButton = make_button(tr(@"Import Image…"), @selector(prepareDevice:), self,
                                        NSMakeRect(175, 18, 150, 32));
     _createMachineButton.hidden = YES;
     [startupCard addSubview:_createMachineButton];
 
-    _startupRetryButton = make_button(@"Try Again", @selector(refreshApps:), self,
+    _startupRetryButton = make_button(tr(@"Try Again"), @selector(refreshApps:), self,
                                       NSMakeRect(175, 18, 150, 32));
     _startupRetryButton.hidden = YES;
     [startupCard addSubview:_startupRetryButton];
@@ -1537,7 +1550,7 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
                             NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskResizable
                     backing:NSBackingStoreBuffered
                       defer:NO];
-    window.title = @"Opening Application…";
+    window.title = tr(@"Opening Application…");
     window.releasedWhenClosed = NO;
     window.delegate = self;
     // Lock the window's content aspect ratio to the request immediately; the
@@ -1702,7 +1715,9 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
                     }
                     NSLog(@"MacMu display %u resize failed: %s", displayId, error.c_str());
                     if (notifyUser) {
-                        [delegate setAppsStatus:ns_string("Could not rotate application: " + error)];
+                        [delegate setAppsStatus:[NSString
+                            stringWithFormat:tr(@"Could not rotate application: %@"),
+                                             ns_string(error)]];
                         NSBeep();
                     }
                 } else {
@@ -1872,31 +1887,31 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
         _createMachineButton.enabled = !qemuRunning && (!hasSystemImage || !hasMachine);
         _createMachineButton.hidden = hasSystemImage && hasMachine;
         if (!hasSystemImage) {
-            _createMachineButton.title = @"Import Image…";
+            _createMachineButton.title = tr(@"Import Image…");
         } else if (!hasMachine) {
-            _createMachineButton.title = @"Prepare Device";
+            _createMachineButton.title = tr(@"Prepare Device");
         } else {
-            _createMachineButton.title = @"Device Ready";
+            _createMachineButton.title = tr(@"Device Ready");
         }
     }
     if (!_agentConnected) {
         if (!hasSystemImage) {
-            [self updateBootPresentation:@"System image required"
-                                   detail:@"Import a MacMu Android 16 image to continue."
-                                    stage:@"SETUP"
+            [self updateBootPresentation:tr(@"System image required")
+                                   detail:tr(@"Import a MacMu Android 16 image to continue.")
+                                    stage:tr(@"SETUP")
                                      busy:NO
                                      ready:NO];
-            [self setAppsStatus:@"Android image required"];
+            [self setAppsStatus:tr(@"Android image required")];
         } else if (!hasMachine) {
-            [self updateBootPresentation:@"Preparing Android device"
-                                   detail:@"Creating the managed MacMu virtual device…"
-                                    stage:@"PREPARING"
+            [self updateBootPresentation:tr(@"Preparing Android device")
+                                   detail:tr(@"Creating the managed MacMu virtual device…")
+                                    stage:tr(@"PREPARING")
                                      busy:YES
                                      ready:NO];
         } else if (!qemuRunning) {
-            [self updateBootPresentation:@"Starting Android"
-                                   detail:@"Launching the emulator core…"
-                                    stage:@"STARTING"
+            [self updateBootPresentation:tr(@"Starting Android")
+                                   detail:tr(@"Launching the emulator core…")
+                                    stage:tr(@"STARTING")
                                      busy:YES
                                      ready:NO];
         }
@@ -1913,16 +1928,16 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
 
 - (void)importSystemImage:(id)sender {
     if ([self currentQemuPid] > 0) {
-        [self publishQemuStatus:@"Quit MacMu before importing an image"];
+        [self publishQemuStatus:tr(@"Quit MacMu before importing an image")];
         NSBeep();
         return;
     }
 
     [self showStatusWindow:nil];
     NSOpenPanel* panel = [NSOpenPanel openPanel];
-    panel.title = @"Import MacMu System Image";
-    panel.message = @"Choose a MacMu AOSP16 arm64 system image zip.";
-    panel.prompt = @"Import";
+    panel.title = tr(@"Import MacMu System Image");
+    panel.message = tr(@"Choose a MacMu AOSP16 arm64 system image zip.");
+    panel.prompt = tr(@"Import");
     panel.canChooseFiles = YES;
     panel.canChooseDirectories = NO;
     panel.allowsMultipleSelection = NO;
@@ -1942,11 +1957,11 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
     ShellOptions options = _options;
     NSString* archivePath = archiveURL.path;
     if (archivePath.length == 0) {
-        [self publishQemuStatus:@"Import failed: empty path"];
+        [self publishQemuStatus:tr(@"Import failed: empty path")];
         return;
     }
 
-    [self publishQemuStatus:@"Importing system image"];
+    [self publishQemuStatus:tr(@"Importing system image")];
     if (_createMachineButton) {
         _createMachineButton.enabled = NO;
     }
@@ -2005,13 +2020,14 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
 
             dispatch_async(dispatch_get_main_queue(), ^{
                 if (ok) {
-                    [delegate publishBootPresentation:@"System image imported"
-                                                detail:@"The Android device is ready. Starting MacMu…"
-                                                 stage:@"STARTING"
+                    [delegate publishBootPresentation:tr(@"System image imported")
+                                                detail:tr(@"The Android device is ready. Starting MacMu…")
+                                                 stage:tr(@"STARTING")
                                                   busy:YES
                                                  ready:NO];
                 } else {
-                    [delegate publishQemuStatus:ns_string("Import failed: " + error)];
+                    [delegate publishQemuStatus:[NSString
+                        stringWithFormat:tr(@"Import failed: %@"), ns_string(error)]];
                     NSLog(@"MacMu image import failed: %s", error.c_str());
                 }
                 [delegate updateMachineControls];
@@ -2024,14 +2040,18 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
     std::string error;
     if (macmu_create_default_machine(_options, &error)) {
         [self updateMachineControls];
-        [self publishBootPresentation:@"Android device prepared"
-                                detail:@"Starting the emulator core…"
-                                 stage:@"STARTING"
+        [self publishBootPresentation:tr(@"Android device prepared")
+                                detail:tr(@"Starting the emulator core…")
+                                 stage:tr(@"STARTING")
                                   busy:YES
                                  ready:NO];
         return;
     }
-    [self publishQemuStatus:ns_string(error)];
+    [self publishBootPresentation:tr(@"Device preparation failed")
+                            detail:ns_string(error)
+                             stage:tr(@"ATTENTION")
+                              busy:NO
+                             ready:NO];
     NSLog(@"MacMu machine creation failed: %s", error.c_str());
     [self updateMachineControls];
 }
@@ -2089,14 +2109,15 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
     }
     if (_machineStatusMenuItem) {
         _machineStatusMenuItem.title =
-            [NSString stringWithFormat:@"Status — %@", resolvedTitle];
+            [NSString stringWithFormat:tr(@"Status — %@"), resolvedTitle];
     }
     if (_machineStatusDetailMenuItem) {
         _machineStatusDetailMenuItem.title = resolvedDetail;
     }
     if (_statusItem.button) {
-        _statusItem.button.title = ready ? @"MacMu: Ready"
-                                         : (busy ? @"MacMu: Starting" : @"MacMu: Attention");
+        _statusItem.button.title = ready ? tr(@"MacMu: Ready")
+                                         : (busy ? tr(@"MacMu: Starting")
+                                                 : tr(@"MacMu: Attention"));
         _statusItem.button.toolTip = resolvedDetail.length > 0
                                          ? [NSString stringWithFormat:@"%@ — %@", resolvedTitle,
                                                                       resolvedDetail]
@@ -2116,11 +2137,13 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
 
 // Compatibility helper for setup/import errors that only carry one message.
 - (void)publishQemuStatus:(NSString*)text {
-    const BOOL busy = [text hasPrefix:@"Importing"] || [text hasPrefix:@"Preparing"] ||
-                      [text hasPrefix:@"Starting"] || [text hasPrefix:@"Exited"];
+    const BOOL busy = [text isEqualToString:tr(@"Importing system image")] ||
+                      [text isEqualToString:tr(@"Preparing Android device")] ||
+                      [text isEqualToString:tr(@"Starting Android")];
     [self publishBootPresentation:text
-                           detail:busy ? @"This may take a moment…" : @"Check the MacMu setup and try again."
-                            stage:busy ? @"WORKING" : @"ATTENTION"
+                           detail:busy ? tr(@"This may take a moment…")
+                                       : tr(@"Check the MacMu setup and try again.")
+                            stage:busy ? tr(@"WORKING") : tr(@"ATTENTION")
                              busy:busy
                             ready:NO];
 }
@@ -2165,16 +2188,16 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
     const size_t running = bound >= transitional ? bound - transitional : 0;
     NSString* status = nil;
     if (opening > 0) {
-        status = [NSString stringWithFormat:@"%lu applications · %zu opening",
+        status = [NSString stringWithFormat:tr(@"%lu applications · %zu opening"),
                                             static_cast<unsigned long>(total), opening];
     } else if (closing > 0) {
-        status = [NSString stringWithFormat:@"%lu applications · %zu closing",
+        status = [NSString stringWithFormat:tr(@"%lu applications · %zu closing"),
                                             static_cast<unsigned long>(total), closing];
     } else if (running > 0) {
-        status = [NSString stringWithFormat:@"%lu applications · %zu running",
+        status = [NSString stringWithFormat:tr(@"%lu applications · %zu running"),
                                             static_cast<unsigned long>(total), running];
     } else {
-        status = [NSString stringWithFormat:@"%lu applications",
+        status = [NSString stringWithFormat:tr(@"%lu applications"),
                                             static_cast<unsigned long>(total)];
     }
     [self setAppsStatus:status];
@@ -2375,7 +2398,7 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
         [self openDisplayWindowForDisplay:displayId];
         [_appsCollection reloadData];
         [self updateApplicationActions];
-        [self setAppsStatus:@"Android agent disconnected; the application is still open"];
+        [self setAppsStatus:tr(@"Android agent disconnected; the application is still open")];
         return;
     }
 
@@ -2406,9 +2429,9 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
                                                  // also failed. Remove it instead of reopening
                                                  // a blank window as a running application.
                                                  const std::string message = launchFailure->second;
-                                                 [delegate setAppsStatus:ns_string(
-                                                                             "Could not open application: " +
-                                                                             message)];
+                                                 [delegate setAppsStatus:[NSString
+                                                     stringWithFormat:tr(@"Could not open application: %@"),
+                                                                      ns_string(message)]];
                                                  [delegate requestDisplayRemove:displayId];
                                                  return;
                                              }
@@ -2418,9 +2441,9 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
                                              [delegate openDisplayWindowForDisplay:displayId];
                                              [delegate->_appsCollection reloadData];
                                              [delegate updateApplicationActions];
-                                             [delegate setAppsStatus:ns_string(
-                                                                         "Could not close application: " +
-                                                                         payload)];
+                                             [delegate setAppsStatus:[NSString
+                                                 stringWithFormat:tr(@"Could not close application: %@"),
+                                                                  ns_string(payload)]];
                                              return;
                                          }
                                          [delegate requestDisplayRemove:displayId];
@@ -2457,22 +2480,23 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
         return;
     }
     if (!_guestControlClient || !_guestControlClient->ready()) {
-        [self setAppsStatus:@"Waiting for Android…"];
+        [self setAppsStatus:tr(@"Waiting for Android…")];
         return;
     }
-    [self setAppsStatus:@"Loading applications…"];
-    [self updateBootPresentation:@"Android started"
-                           detail:@"Discovering installed applications…"
-                            stage:@"LOADING"
+    [self setAppsStatus:tr(@"Loading applications…")];
+    [self updateBootPresentation:tr(@"Android started")
+                           detail:tr(@"Discovering installed applications…")
+                            stage:tr(@"LOADING")
                              busy:YES
                              ready:NO];
     MacMuAppDelegate* delegate = self;
     _guestControlClient->request("apps", 15000, [delegate](bool ok, std::string payload) {
         if (!ok) {
-            [delegate setAppsStatus:ns_string("Could not load applications: " + payload)];
-            [delegate publishBootPresentation:@"Android started"
-                                        detail:@"Application discovery failed. Use Refresh to retry."
-                                         stage:@"ATTENTION"
+            [delegate setAppsStatus:[NSString
+                stringWithFormat:tr(@"Could not load applications: %@"), ns_string(payload)]];
+            [delegate publishBootPresentation:tr(@"Android started")
+                                        detail:tr(@"Application discovery failed. Use Refresh to retry.")
+                                         stage:tr(@"ATTENTION")
                                           busy:NO
                                          ready:NO];
             return;
@@ -2481,10 +2505,10 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
         NSError* error = nil;
         id parsed = [NSJSONSerialization JSONObjectWithData:data options:0 error:&error];
         if (![parsed isKindOfClass:[NSArray class]]) {
-            [delegate setAppsStatus:@"Could not read the application list"];
-            [delegate publishBootPresentation:@"Android started"
-                                        detail:@"The application list was malformed. Use Refresh to retry."
-                                         stage:@"ATTENTION"
+            [delegate setAppsStatus:tr(@"Could not read the application list")];
+            [delegate publishBootPresentation:tr(@"Android started")
+                                        detail:tr(@"The application list was malformed. Use Refresh to retry.")
+                                         stage:tr(@"ATTENTION")
                                           busy:NO
                                          ready:NO];
             return;
@@ -2557,10 +2581,14 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
     [self updateApplicationsSummary];
     [self updateApplicationActions];
     NSString* detail = _apps.count == 0
-                           ? @"Android is ready, but no launcher applications were found."
-                           : [NSString stringWithFormat:@"%lu applications are ready to open.",
+                           ? tr(@"Android is ready, but no launcher applications were found.")
+                           : [NSString stringWithFormat:tr(@"%lu applications are ready to open."),
                                                         static_cast<unsigned long>(_apps.count)];
-    [self updateBootPresentation:@"Ready" detail:detail stage:@"READY" busy:NO ready:YES];
+    [self updateBootPresentation:tr(@"Ready")
+                           detail:detail
+                            stage:tr(@"READY")
+                             busy:NO
+                             ready:YES];
     NSLog(@"MacMu application catalog ready (%lu applications; Android Settings %@).",
           static_cast<unsigned long>(_apps.count),
           _androidSettingsEntry ? @"available in status menu" : @"not found");
@@ -2644,7 +2672,7 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
         NSString* name = [self applicationNameForPackage:packageName];
         if (_closingAppPackages.count(packageName) > 0 ||
             _displayRemovalPending.count(existingDisplayId) > 0) {
-            [self setAppsStatus:[NSString stringWithFormat:@"Closing %@…", name]];
+            [self setAppsStatus:[NSString stringWithFormat:tr(@"Closing %@…"), name]];
             return;
         }
         auto window = _displayWindows.find(existingDisplayId);
@@ -2654,17 +2682,17 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
             [NSApp activateIgnoringOtherApps:YES];
         }
         [self setAppsStatus:_pendingAppPackages.count(packageName) > 0
-                                ? [NSString stringWithFormat:@"Opening %@…", name]
-                                : [NSString stringWithFormat:@"%@ is already open", name]];
+                                ? [NSString stringWithFormat:tr(@"Opening %@…"), name]
+                                : [NSString stringWithFormat:tr(@"%@ is already open"), name]];
         return;
     }
     if (!_agentConnected) {
-        [self setAppsStatus:@"Waiting for Android…"];
+        [self setAppsStatus:tr(@"Waiting for Android…")];
         return;
     }
     auto channel = [self controlChannel];
     if (!channel || !channel->alive()) {
-        [self setAppsStatus:@"Control channel not connected"];
+        [self setAppsStatus:tr(@"Control channel not connected")];
         return;
     }
     // Reserve both sides of the package/display bijection before DISPLAY_ADD.
@@ -2672,7 +2700,7 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
     // new surface belongs to an application rather than a blank display.
     const uint32_t displayId = [self allocateUserDisplayId];
     if (displayId == 0) {
-        [self setAppsStatus:@"Up to 5 applications can run at the same time"];
+        [self setAppsStatus:tr(@"Up to 5 applications can run at the same time")];
         NSBeep();
         return;
     }
@@ -2686,7 +2714,7 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
     }
     [_appsCollection reloadData];
     [self updateApplicationActions];
-    [self setAppsStatus:[NSString stringWithFormat:@"Opening %@…",
+    [self setAppsStatus:[NSString stringWithFormat:tr(@"Opening %@…"),
                                                    [self applicationNameForPackage:packageName]]];
     macmu::ControlDisplayAdd request = {};
     request.displayId = displayId;
@@ -2704,8 +2732,9 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
             ControlChannel::Response response) {
             dispatch_async(dispatch_get_main_queue(), ^{
                 if (!response.ok) {
-                    NSString* message = ns_string("Could not open application: " +
-                                                  response.errorMessage);
+                    NSString* message = [NSString
+                        stringWithFormat:tr(@"Could not open application: %@"),
+                                         ns_string(response.errorMessage)];
                     if (response.type ==
                         static_cast<uint16_t>(macmu::ControlMessageType::kError)) {
                         // A direct QEMU error is authoritative: DISPLAY_ADD did
@@ -2723,7 +2752,7 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
                 }
                 if (response.payload.size() < sizeof(macmu::ControlDisplayAddOk)) {
                     [delegate rollbackApplicationDisplay:displayId
-                                                  message:@"Could not read the application window response"];
+                                                  message:tr(@"Could not read the application window response")];
                     return;
                 }
                 macmu::ControlDisplayAddOk ok;
@@ -2739,7 +2768,7 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
                 }
                 if (ok.displayId != displayId) {
                     [delegate rollbackApplicationDisplay:displayId
-                                                  message:@"Could not reserve an application window"];
+                                                  message:tr(@"Could not reserve an application window")];
                     [delegate requestDisplayRemove:ok.displayId];
                     return;
                 }
@@ -2751,7 +2780,7 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
                                                  dpi:aspectDpi];
                 if (![delegate hasDisplayWindow:ok.displayId]) {
                     [delegate rollbackApplicationDisplay:ok.displayId
-                                                  message:@"Application window is unavailable"];
+                                                  message:tr(@"Application window is unavailable")];
                     return;
                 }
                 [delegate updateApplicationWindowTitleForDisplay:ok.displayId];
@@ -2797,7 +2826,7 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
     [self updateApplicationsSummary];
 
     if (!_guestControlClient || !_guestControlClient->ready()) {
-        [self setAppsStatus:[NSString stringWithFormat:@"%@; cleanup will resume after Android reconnects",
+        [self setAppsStatus:[NSString stringWithFormat:tr(@"%@; cleanup will resume after Android reconnects"),
                                                        message]];
         return;
     }
@@ -2823,8 +2852,9 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
                 if (!ok) {
                     NSLog(@"MacMu display %u failed-launch cleanup failed: %s", displayId,
                           payload.c_str());
-                    [delegate setAppsStatus:ns_string(messageValue +
-                                                      "; close the application window to retry cleanup")];
+                    [delegate setAppsStatus:[NSString
+                        stringWithFormat:tr(@"%@; close the application window to retry cleanup"),
+                                         ns_string(messageValue)]];
                     return;
                 }
                 delegate->_deferredLaunchCleanup.erase(cleanup);
@@ -2840,7 +2870,7 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
     if (!_guestControlClient || !_guestControlClient->ready()) {
         [self cleanupFailedLaunchForDisplay:displayId
                                   component:component
-                                    message:@"Android agent disconnected during launch"];
+                                    message:tr(@"Android agent disconnected during launch")];
         return;
     }
     std::string command = "launch ";
@@ -2873,8 +2903,9 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
             if (!ok) {
                 [delegate cleanupFailedLaunchForDisplay:displayId
                                               component:component
-                                                message:ns_string("Could not open application: " +
-                                                                  payload)];
+                                                message:[NSString
+                                                    stringWithFormat:tr(@"Could not open application: %@"),
+                                                                     ns_string(payload)]];
                 return;
             }
             delegate->_pendingAppPackages.erase(packageName);
@@ -2906,7 +2937,7 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
     NSString* activity = app[@"activity"];
     NSString* name = _appNames[package] ?: package;
     NSImage* icon = _appIcons[package];
-    item.imageView.image = icon ?: placeholder_icon(name, NSMakeSize(64, 64));
+    item.imageView.image = icon ?: placeholder_icon(name, NSMakeSize(82, 82));
     item.textField.stringValue = name;
     item.view.toolTip = [NSString stringWithFormat:@"%@\n%@", package, activity];
 
@@ -2940,25 +2971,25 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
 - (void)qemuMonitorLoop {
     while (!_shuttingDown.load(std::memory_order_acquire)) {
         if (!macmu_system_image_exists(_options)) {
-            [self publishBootPresentation:@"System image required"
-                                    detail:@"Import a MacMu Android 16 image to continue."
-                                     stage:@"SETUP"
+            [self publishBootPresentation:tr(@"System image required")
+                                    detail:tr(@"Import a MacMu Android 16 image to continue.")
+                                     stage:tr(@"SETUP")
                                       busy:NO
                                      ready:NO];
             std::this_thread::sleep_for(std::chrono::seconds(2));
             continue;
         }
         if (!macmu_machine_exists(_options)) {
-            [self publishBootPresentation:@"Preparing Android device"
-                                    detail:@"Creating the managed virtual device…"
-                                     stage:@"PREPARING"
+            [self publishBootPresentation:tr(@"Preparing Android device")
+                                    detail:tr(@"Creating the managed virtual device…")
+                                     stage:tr(@"PREPARING")
                                       busy:YES
                                      ready:NO];
             std::string error;
             if (!macmu_create_default_machine(_options, &error)) {
-                [self publishBootPresentation:@"Device preparation failed"
+                [self publishBootPresentation:tr(@"Device preparation failed")
                                         detail:ns_string(error)
-                                         stage:@"ATTENTION"
+                                         stage:tr(@"ATTENTION")
                                           busy:NO
                                          ready:NO];
                 std::this_thread::sleep_for(std::chrono::seconds(2));
@@ -2969,9 +3000,9 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
                 [delegate updateMachineControls];
             });
         }
-        [self publishBootPresentation:@"Starting Android"
-                                detail:@"Launching the emulator core…"
-                                 stage:@"STARTING"
+        [self publishBootPresentation:tr(@"Starting Android")
+                                detail:tr(@"Launching the emulator core…")
+                                 stage:tr(@"STARTING")
                                   busy:YES
                                  ready:NO];
         if (_channelReady && _frameConsumer) {
@@ -2987,9 +3018,9 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
         const pid_t pid = launch_qemu(_options, doorbellFd, inputFd, controlFd);
         controlChannel->close_remote_fd();
         if (pid <= 0) {
-            [self publishBootPresentation:@"Could not start Android"
-                                    detail:@"MacMu will retry automatically."
-                                     stage:@"RETRYING"
+            [self publishBootPresentation:tr(@"Could not start Android")
+                                    detail:tr(@"MacMu will retry automatically.")
+                                     stage:tr(@"RETRYING")
                                       busy:YES
                                      ready:NO];
             std::this_thread::sleep_for(std::chrono::seconds(2));
@@ -3017,9 +3048,9 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
                 dispatch_async(dispatch_get_main_queue(), ^{
                     [delegate restoreDisplaySubscriptions];
                     if (!delegate->_agentConnected) {
-                        [delegate updateBootPresentation:@"Android is booting"
-                                                   detail:@"Waiting for Android to finish startup and launch MacMu Agent…"
-                                                    stage:@"BOOTING"
+                        [delegate updateBootPresentation:tr(@"Android is booting")
+                                                   detail:tr(@"Waiting for Android to finish startup and launch MacMu Agent…")
+                                                    stage:tr(@"BOOTING")
                                                      busy:YES
                                                      ready:NO];
                     }
@@ -3031,9 +3062,9 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
         if (_shuttingDown.load(std::memory_order_acquire)) {
             request_qemu_termination(pid);
         } else {
-            [self publishBootPresentation:@"Android is booting"
-                                    detail:@"Waiting for boot completion and MacMu Agent…"
-                                     stage:@"BOOTING"
+            [self publishBootPresentation:tr(@"Android is booting")
+                                    detail:tr(@"Waiting for boot completion and MacMu Agent…")
+                                     stage:tr(@"BOOTING")
                                       busy:YES
                                      ready:NO];
             dispatch_async(dispatch_get_main_queue(), ^{
@@ -3071,12 +3102,12 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
             delegate->_appsLoaded = false;
             [delegate resetSecondaryDisplayStateAfterQemuExit];
             [delegate clearApplicationCatalog];
-            [delegate setAppsStatus:@"Restarting Android…"];
+            [delegate setAppsStatus:tr(@"Restarting Android…")];
             [delegate updateMachineControls];
         });
-        [self publishBootPresentation:@"Restarting Android"
-                                detail:@"The emulator core exited; MacMu is starting it again."
-                                 stage:@"RESTARTING"
+        [self publishBootPresentation:tr(@"Restarting Android")
+                                detail:tr(@"The emulator core exited; MacMu is starting it again.")
+                                 stage:tr(@"RESTARTING")
                                   busy:YES
                                  ready:NO];
         std::this_thread::sleep_for(std::chrono::seconds(1));
@@ -3218,7 +3249,7 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
     }
 
     [self hideWindowsForTermination];
-    [self publishQemuStatus:@"Stopping"];
+    [self publishQemuStatus:tr(@"Stopping")];
 
     MacMuAppDelegate* delegate = self;
     std::thread([delegate] {

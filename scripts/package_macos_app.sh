@@ -95,6 +95,10 @@ done
 [[ -x "$dist_dir/$binary_name" ]] || die "missing app entry executable: $dist_dir/$binary_name"
 [[ -x "$dist_dir/$qemu_headless_rel" ]] || die "missing qemu backend: $dist_dir/$qemu_headless_rel"
 [[ -f "$dist_dir/LICENSE.shell-MIT" ]] || die "missing shell license: $dist_dir/LICENSE.shell-MIT"
+[[ -f "$dist_dir/share/macmu/en.lproj/Localizable.strings" ]] ||
+  die "missing English localization: $dist_dir/share/macmu/en.lproj/Localizable.strings"
+[[ -f "$dist_dir/share/macmu/zh-Hans.lproj/Localizable.strings" ]] ||
+  die "missing Simplified Chinese localization: $dist_dir/share/macmu/zh-Hans.lproj/Localizable.strings"
 
 command -v ditto >/dev/null 2>&1 || die "missing required command: ditto"
 command -v codesign >/dev/null 2>&1 || die "missing required command: codesign"
@@ -126,6 +130,15 @@ rm -f "$bundled_dist_dir/emulator"
 ditto "$dist_dir/$binary_name" "$macos_dir/$binary_name"
 chmod 755 "$macos_dir/$binary_name"
 
+# AppKit discovers localizations only at Contents/Resources/*.lproj. Keep the
+# distribution layout bundle-agnostic, then promote its language resources to
+# the native app-bundle location while packaging.
+for localization in en.lproj zh-Hans.lproj; do
+  ditto "$dist_dir/share/macmu/$localization" "$resources_dir/$localization"
+  rm -rf "$bundled_dist_dir/share/macmu/$localization"
+done
+rmdir "$bundled_dist_dir/share/macmu" 2>/dev/null || true
+
 cat > "$contents_dir/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
@@ -134,6 +147,11 @@ cat > "$contents_dir/Info.plist" <<EOF
 <dict>
   <key>CFBundleDevelopmentRegion</key>
   <string>en</string>
+  <key>CFBundleLocalizations</key>
+  <array>
+    <string>en</string>
+    <string>zh-Hans</string>
+  </array>
   <key>CFBundleDisplayName</key>
   <string>$app_name</string>
   <key>CFBundleExecutable</key>
@@ -165,6 +183,8 @@ printf 'APPL????' > "$contents_dir/PkgInfo"
 test -x "$macos_dir/$binary_name"
 test -x "$bundled_dist_dir/$qemu_headless_rel"
 test -f "$bundled_dist_dir/LICENSE.shell-MIT"
+test -f "$resources_dir/en.lproj/Localizable.strings"
+test -f "$resources_dir/zh-Hans.lproj/Localizable.strings"
 test ! -e "$bundled_dist_dir/$binary_name"
 test ! -e "$bundled_dist_dir/aemu-iosurface-shell"
 test ! -e "$bundled_dist_dir/emulator"

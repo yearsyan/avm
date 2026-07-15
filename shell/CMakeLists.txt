@@ -242,3 +242,8 @@ install(FILES LICENSE
     DESTINATION .
     RENAME LICENSE.shell-MIT
 )
+install(DIRECTORY
+    resources/en.lproj
+    resources/zh-Hans.lproj
+    DESTINATION share/macmu
+)
