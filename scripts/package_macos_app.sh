@@ -99,6 +99,8 @@ done
   die "missing English localization: $dist_dir/share/macmu/en.lproj/Localizable.strings"
 [[ -f "$dist_dir/share/macmu/zh-Hans.lproj/Localizable.strings" ]] ||
   die "missing Simplified Chinese localization: $dist_dir/share/macmu/zh-Hans.lproj/Localizable.strings"
+[[ -f "$dist_dir/share/macmu/MacMu.icns" ]] ||
+  die "missing app icon: $dist_dir/share/macmu/MacMu.icns"
 
 command -v ditto >/dev/null 2>&1 || die "missing required command: ditto"
 command -v codesign >/dev/null 2>&1 || die "missing required command: codesign"
@@ -137,6 +139,8 @@ for localization in en.lproj zh-Hans.lproj; do
   ditto "$dist_dir/share/macmu/$localization" "$resources_dir/$localization"
   rm -rf "$bundled_dist_dir/share/macmu/$localization"
 done
+ditto "$dist_dir/share/macmu/MacMu.icns" "$resources_dir/MacMu.icns"
+rm -f "$bundled_dist_dir/share/macmu/MacMu.icns"
 rmdir "$bundled_dist_dir/share/macmu" 2>/dev/null || true
 
 cat > "$contents_dir/Info.plist" <<EOF
@@ -158,6 +162,8 @@ cat > "$contents_dir/Info.plist" <<EOF
   <string>$binary_name</string>
   <key>CFBundleIdentifier</key>
   <string>$bundle_id</string>
+  <key>CFBundleIconFile</key>
+  <string>MacMu.icns</string>
   <key>CFBundleInfoDictionaryVersion</key>
   <string>6.0</string>
   <key>CFBundleName</key>
@@ -185,6 +191,7 @@ test -x "$bundled_dist_dir/$qemu_headless_rel"
 test -f "$bundled_dist_dir/LICENSE.shell-MIT"
 test -f "$resources_dir/en.lproj/Localizable.strings"
 test -f "$resources_dir/zh-Hans.lproj/Localizable.strings"
+test -f "$resources_dir/MacMu.icns"
 test ! -e "$bundled_dist_dir/$binary_name"
 test ! -e "$bundled_dist_dir/aemu-iosurface-shell"
 test ! -e "$bundled_dist_dir/emulator"

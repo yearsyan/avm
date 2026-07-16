@@ -249,6 +249,9 @@ install(DIRECTORY
     resources/zh-Hans.lproj
     DESTINATION share/macmu
 )
+install(FILES resources/MacMu.icns
+    DESTINATION share/macmu
+)
 
 if(BUILD_TESTING)
     add_executable(macmu_machine_manager_test
