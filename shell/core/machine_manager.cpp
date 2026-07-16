@@ -2,6 +2,9 @@
 
 #include "machine_manager.h"
 
+#include <array>
+#include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
@@ -13,6 +16,17 @@ namespace {
 
 namespace fs = std::filesystem;
 using macmu::shell::path_join;
+
+constexpr uint64_t kDiskSectorSize = 512;
+constexpr uint64_t kGptHeaderOffset = kDiskSectorSize;
+constexpr uint64_t kGptFirstEntryOffset = 2 * kDiskSectorSize;
+constexpr size_t kGptEntrySize = 128;
+constexpr size_t kGptFirstLbaOffset = 32;
+constexpr size_t kGptLastLbaOffset = 40;
+constexpr size_t kGptPartitionNameOffset = 56;
+constexpr uint64_t kExt4SuperblockOffset = 1024;
+constexpr size_t kExt4MagicOffset = 56;
+constexpr size_t kExt4VolumeNameOffset = 120;
 
 bool ensure_directory(const std::string& path, std::string* error) {
     std::error_code ec;
@@ -33,12 +47,107 @@ bool file_exists(const std::string& path) {
     return fs::is_regular_file(path, ec);
 }
 
+uint64_t read_little_endian_u64(const unsigned char* bytes) {
+    uint64_t value = 0;
+    for (size_t i = 0; i < sizeof(value); ++i) {
+        value |= static_cast<uint64_t>(bytes[i]) << (8 * i);
+    }
+    return value;
+}
+
+bool read_exact_at(std::ifstream* input, uint64_t offset, void* data, size_t size) {
+    input->clear();
+    input->seekg(static_cast<std::streamoff>(offset), std::ios::beg);
+    if (!*input) {
+        return false;
+    }
+    input->read(static_cast<char*>(data), static_cast<std::streamsize>(size));
+    return input->gcount() == static_cast<std::streamsize>(size);
+}
+
+bool has_utf16le_name(const unsigned char* bytes, size_t size, const char* expected) {
+    const size_t length = std::strlen(expected);
+    if (size < (length + 1) * 2) {
+        return false;
+    }
+    for (size_t i = 0; i < length; ++i) {
+        if (bytes[i * 2] != static_cast<unsigned char>(expected[i]) || bytes[i * 2 + 1] != 0) {
+            return false;
+        }
+    }
+    return bytes[length * 2] == 0 && bytes[length * 2 + 1] == 0;
+}
+
+bool metadata_disk_exists(const std::string& path) {
+    std::error_code ec;
+    if (!fs::is_regular_file(path, ec)) {
+        return false;
+    }
+    const uintmax_t file_size = fs::file_size(path, ec);
+    if (ec || file_size < 2 * 1024 * 1024) {
+        return false;
+    }
+
+    std::ifstream input(path, std::ios::in | std::ios::binary);
+    if (!input) {
+        return false;
+    }
+
+    std::array<unsigned char, 8> gpt_magic{};
+    if (!read_exact_at(&input, kGptHeaderOffset, gpt_magic.data(), gpt_magic.size()) ||
+        std::memcmp(gpt_magic.data(), "EFI PART", gpt_magic.size()) != 0) {
+        return false;
+    }
+
+    std::array<unsigned char, kGptEntrySize> entry{};
+    if (!read_exact_at(&input, kGptFirstEntryOffset, entry.data(), entry.size())) {
+        return false;
+    }
+    const uint64_t first_lba = read_little_endian_u64(entry.data() + kGptFirstLbaOffset);
+    const uint64_t last_lba = read_little_endian_u64(entry.data() + kGptLastLbaOffset);
+    if (first_lba == 0 || last_lba < first_lba ||
+        first_lba >= file_size / kDiskSectorSize ||
+        last_lba >= file_size / kDiskSectorSize ||
+        !has_utf16le_name(entry.data() + kGptPartitionNameOffset,
+                          entry.size() - kGptPartitionNameOffset, "metadata")) {
+        return false;
+    }
+
+    const uint64_t partition_offset = first_lba * kDiskSectorSize;
+    const uint64_t superblock_offset = partition_offset + kExt4SuperblockOffset;
+    if (superblock_offset + kExt4VolumeNameOffset + 16 > file_size) {
+        return false;
+    }
+
+    std::array<unsigned char, 2> ext4_magic{};
+    if (!read_exact_at(&input, superblock_offset + kExt4MagicOffset, ext4_magic.data(),
+                       ext4_magic.size()) ||
+        ext4_magic[0] != 0x53 || ext4_magic[1] != 0xef) {
+        return false;
+    }
+
+    std::array<char, 16> volume_name{};
+    if (!read_exact_at(&input, superblock_offset + kExt4VolumeNameOffset, volume_name.data(),
+                       volume_name.size())) {
+        return false;
+    }
+    return std::memcmp(volume_name.data(), "metadata", 8) == 0 && volume_name[8] == '\0';
+}
+
 bool system_image_exists_at(const std::string& path) {
-    return file_exists(path_join(path, "kernel-ranchu")) &&
-           file_exists(path_join(path, "ramdisk.img")) &&
-           file_exists(path_join(path, "system.img")) &&
-           file_exists(path_join(path, "vendor.img")) &&
-           file_exists(path_join(path, "vendor_boot.img"));
+    constexpr std::array<const char*, 9> kRequiredFiles = {
+        "advancedFeatures.ini",         "android-info.txt",
+        "VerifiedBootParams.textproto", "kernel-ranchu",
+        "ramdisk.img",                  "system-qemu.img",
+        "userdata.img",                 "vendor-qemu.img",
+        "vendor_boot.img",
+    };
+    for (const char* file : kRequiredFiles) {
+        if (!file_exists(path_join(path, file))) {
+            return false;
+        }
+    }
+    return metadata_disk_exists(path_join(path, "encryptionkey.img"));
 }
 
 bool write_text_file(const std::string& path, const std::string& text, std::string* error) {
@@ -79,6 +188,41 @@ bool ensure_sized_file(const std::string& path, uintmax_t size, std::string* err
     }
     if (error) {
         *error = "failed to create disk image: " + path + " (" + ec.message() + ")";
+    }
+    return false;
+}
+
+bool replace_with_symlink(const std::string& source, const std::string& destination,
+                          std::string* error) {
+    std::error_code ec;
+    fs::remove(destination, ec);
+    ec.clear();
+    fs::create_symlink(fs::absolute(source, ec), destination, ec);
+    if (!ec && file_exists(destination)) {
+        return true;
+    }
+    if (error) {
+        *error = "failed to link system image: " + destination + " (" + ec.message() + ")";
+    }
+    return false;
+}
+
+bool ensure_metadata_disk(const std::string& source, const std::string& destination,
+                          std::string* error) {
+    if (metadata_disk_exists(destination)) {
+        return true;
+    }
+
+    std::error_code ec;
+    fs::remove(destination, ec);
+    fs::remove(destination + ".qcow2", ec);
+    ec.clear();
+    fs::copy_file(source, destination, fs::copy_options::overwrite_existing, ec);
+    if (!ec && metadata_disk_exists(destination)) {
+        return true;
+    }
+    if (error) {
+        *error = "failed to install metadata disk: " + destination + " (" + ec.message() + ")";
     }
     return false;
 }
@@ -224,7 +368,9 @@ bool macmu_system_image_exists(const ShellOptions& options) {
 bool macmu_machine_exists(const ShellOptions& options) {
     return file_exists(macmu_machine_ini_path(options)) &&
            file_exists(path_join(macmu_machine_path(options), "config.ini")) &&
-           file_exists(path_join(macmu_machine_path(options), "encryptionkey.img"));
+           file_exists(path_join(macmu_machine_path(options), "system-qemu.img")) &&
+           file_exists(path_join(macmu_machine_path(options), "vendor-qemu.img")) &&
+           metadata_disk_exists(path_join(macmu_machine_path(options), "encryptionkey.img"));
 }
 
 bool macmu_create_default_machine(const ShellOptions& options, std::string* error) {
@@ -254,8 +400,14 @@ bool macmu_create_default_machine(const ShellOptions& options, std::string* erro
     if (!write_text_file(path_join(machinePath, "config.ini"), config_ini_for(options), error)) {
         return false;
     }
-    if (!ensure_sized_file(path_join(machinePath, "encryptionkey.img"), 64ull * 1024ull * 1024ull,
-                           error)) {
+    if (!replace_with_symlink(path_join(options.systemPath, "system-qemu.img"),
+                              path_join(machinePath, "system-qemu.img"), error) ||
+        !replace_with_symlink(path_join(options.systemPath, "vendor-qemu.img"),
+                              path_join(machinePath, "vendor-qemu.img"), error)) {
+        return false;
+    }
+    if (!ensure_metadata_disk(path_join(options.systemPath, "encryptionkey.img"),
+                              path_join(machinePath, "encryptionkey.img"), error)) {
         return false;
     }
     return ensure_sized_file(path_join(machinePath, "cache.img"), 66ull * 1024ull * 1024ull,

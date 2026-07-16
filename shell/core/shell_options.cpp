@@ -6,6 +6,7 @@
 
 #include "shell_options.h"
 
+#include <cctype>
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
@@ -33,6 +34,15 @@ std::string env_or_default(const char* name, const std::string& fallback) {
 std::string env_or_default(const char* name, const char* legacy_name,
                            const std::string& fallback) {
     return env_or_default(name, env_or_default(legacy_name, fallback));
+}
+
+bool env_bool_or_default(const char* name, const char* legacy_name, bool fallback) {
+    std::string value =
+        env_or_default(name, legacy_name, fallback ? std::string("1") : std::string("0"));
+    for (char& byte : value) {
+        byte = static_cast<char>(std::tolower(static_cast<unsigned char>(byte)));
+    }
+    return value != "0" && value != "false" && value != "no" && value != "off";
 }
 
 std::string directory_name(const std::string& path) {
@@ -196,6 +206,10 @@ ShellOptions parse_options(int argc, char** argv) {
     options.systemPath =
         env_or_default("MACMU_SYSTEM_PATH", "AEMU_SHELL_SYSTEM_PATH",
                        default_system_path(options.appDataDir));
+    options.imageImportSource =
+        env_or_default("MACMU_IMPORT_IMAGE", "AEMU_SHELL_IMPORT_IMAGE", "");
+    options.autoImportDefaultImage =
+        env_bool_or_default("MACMU_AUTO_IMPORT_IMAGE", "AEMU_SHELL_AUTO_IMPORT_IMAGE", true);
     options.guestRpcSocketPath =
         env_or_default("MACMU_GUEST_RPC_SOCKET", "AEMU_SHELL_GUEST_RPC_SOCKET",
                        default_guest_rpc_socket_path());
@@ -300,6 +314,12 @@ ShellOptions parse_options(int argc, char** argv) {
                 options.systemPath = value;
                 system_path_overridden = true;
             }
+        } else if (arg == "--import-image") {
+            if (const char* value = require_value("--import-image")) {
+                options.imageImportSource = value;
+            }
+        } else if (arg == "--no-auto-image-import") {
+            options.autoImportDefaultImage = false;
         } else if (arg == "--guest-rpc-socket") {
             if (const char* value = require_value("--guest-rpc-socket")) {
                 options.guestRpcSocketPath = value;

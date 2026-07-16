@@ -104,10 +104,14 @@ shell_cmake_args=(
   -DCMAKE_BUILD_TYPE=Release
   -DCMAKE_OSX_DEPLOYMENT_TARGET="${MACOS_DEPLOYMENT_TARGET}"
   -DCMAKE_PREFIX_PATH="${CONAN_DIR}"
+  -DBUILD_TESTING=ON
   -DMACMU_BINARY_NAME="${MACMU_BINARY_NAME}"
 )
 cmake "${shell_cmake_args[@]}"
-cmake --build "${SHELL_BUILD_DIR}" --config Release --target macmu_shell
+cmake --build "${SHELL_BUILD_DIR}" --config Release --target \
+  macmu_shell \
+  macmu_machine_manager_test
+ctest --test-dir "${SHELL_BUILD_DIR}" --output-on-failure
 cmake --install "${SHELL_BUILD_DIR}" --config Release --prefix "${DIST_DIR}"
 
 test -x "${DIST_DIR}/${MACMU_BINARY_NAME}"

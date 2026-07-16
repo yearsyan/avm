@@ -5,6 +5,7 @@ project(MacMuShell LANGUAGES CXX OBJCXX)
 # Emit compile_commands.json so clangd / VSCode intellisense can resolve the
 # shell's flags (includes, -fobjc-arc on .mm, etc.) without a manual config.
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+include(CTest)
 
 set(MACMU_BINARY_NAME "macmu" CACHE STRING "MacMu shell executable name")
 
@@ -21,6 +22,7 @@ add_executable(macmu_shell
     core/frame_consumer.cpp
     core/guest_control_client.cpp
     core/guest_input_sender.cpp
+    core/image_importer.mm
     core/input_sender.cpp
     core/machine_manager.cpp
     core/qemu_launcher.cpp
@@ -247,3 +249,16 @@ install(DIRECTORY
     resources/zh-Hans.lproj
     DESTINATION share/macmu
 )
+
+if(BUILD_TESTING)
+    add_executable(macmu_machine_manager_test
+        tests/machine_manager_test.cpp
+        core/machine_manager.cpp
+    )
+    target_include_directories(macmu_machine_manager_test PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/core"
+        "${CMAKE_CURRENT_SOURCE_DIR}/protocol"
+    )
+    target_compile_features(macmu_machine_manager_test PRIVATE cxx_std_17)
+    add_test(NAME macmu_machine_manager_test COMMAND macmu_machine_manager_test)
+endif()

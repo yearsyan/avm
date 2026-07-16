@@ -7,7 +7,7 @@ source, not for the Android SDK downloaded system image.
 The validated target is Android 16:
 
 ```text
-product: sdk_phone64_arm64
+product: macmu_sdk_phone64_arm64
 device:  emu64a
 variant: user
 ```
@@ -25,17 +25,31 @@ ssh aosp
 cd /home/user/aosp/android16
 ```
 
-Initialize the build environment and select the Android 16 emulator product:
+Install MacMu's additive product layer into the AOSP tree. This adds a new
+directory; it does not modify or commit anything in the upstream AOSP
+projects:
+
+```sh
+rsync -av --delete \
+  /Users/u/workspace/aemu/aosp/device/macmu/emu64a/ \
+  aosp:/home/user/aosp/android16/device/macmu/emu64a/
+```
+
+The product layer inherits the stock goldfish `sdk_phone64_arm64` definition
+and only adds the `MacMuAppExcludes` override module. The upstream
+`device/generic/goldfish` repository must remain unchanged.
+
+Initialize the build environment and select the Android 16 MacMu product:
 
 ```sh
 . build/envsetup.sh
-lunch sdk_phone64_arm64 trunk_staging user
+lunch macmu_sdk_phone64_arm64 trunk_staging user
 ```
 
 Some older trees use the single-argument lunch form instead:
 
 ```sh
-lunch sdk_phone64_arm64-trunk_staging-user
+lunch macmu_sdk_phone64_arm64-trunk_staging-user
 ```
 
 Build the image set used by MacMu:
@@ -51,32 +65,42 @@ The expected output directory is:
 out/target/product/emu64a
 ```
 
-The important artifacts are:
+The runtime release archive only needs:
 
 ```text
+advancedFeatures.ini
 android-info.txt
 VerifiedBootParams.textproto
-dtb.img
+encryptionkey.img
+kernel-ranchu
 ramdisk.img
 vendor_boot.img
 system-qemu.img
 vendor-qemu.img
-product-qemu.img
-system_ext-qemu.img
 userdata.img
-vbmeta.img
-super.img
 ```
 
-Keep the raw partition images too when archiving the build, because they are
-useful for inspection and debugging:
+`advancedFeatures.ini` is supplied by MacMu rather than the AOSP product output.
+It enables the modern Android boot-property path, dynamic partitions, virtio
+devices, and the metadata disk contract. A package without it can initialize
+gfxstream but leave Android stuck with an offline adb transport.
+
+`system-qemu.img` is a GPT disk containing `vbmeta` and `super`; the dynamic
+`system`, `product`, and `system_ext` partitions are already inside `super`.
+MacMu attaches that combined disk plus `vendor-qemu.img`, so standalone copies
+of the following files are build/debug artifacts and must not be included in
+the end-user image zip:
 
 ```text
+vbmeta.img
+super.img
 system.img
 vendor.img
 product.img
 system_ext.img
 system_dlkm.img
+product-qemu.img
+system_ext-qemu.img
 ```
 
 The product uses the ranchu 6.12 kernel from AOSP prebuilts:
@@ -87,24 +111,6 @@ prebuilts/qemu-kernel/arm64/6.12/kernel-6.12-gz
 
 Stage it as `kernel-ranchu` in the MacMu system image directory.
 
-## Known Build Fix
-
-If Soong reports a duplicate `vendor/etc/ueventd.rc` install between the
-platform device tree and `device/kernel_launcher/vz_arm64`, give the VZ device
-tree its own Soong namespace and add that namespace to the product:
-
-```bp
-// device/kernel_launcher/vz_arm64/Android.bp
-soong_namespace {}
-```
-
-```make
-# device/kernel_launcher/vz_arm64/aosp_vz_arm64.mk
-PRODUCT_SOONG_NAMESPACES += device/kernel_launcher/vz_arm64
-```
-
-Re-run the same `m ...` command after applying the fix.
-
 ## Stage the Image Directory on macOS
 
 Create a clean MacMu system image directory:
@@ -114,35 +120,37 @@ SYS=/Users/u/workspace/aemu/.codex-local/aosp16-emu64a-user-sysdir
 mkdir -p "$SYS"
 ```
 
-Copy the original AOSP build outputs:
+Copy the runtime AOSP build outputs:
 
 ```sh
 rsync -av --progress \
   aosp:/home/user/aosp/android16/out/target/product/emu64a/android-info.txt \
   aosp:/home/user/aosp/android16/out/target/product/emu64a/VerifiedBootParams.textproto \
-  aosp:/home/user/aosp/android16/out/target/product/emu64a/dtb.img \
   aosp:/home/user/aosp/android16/out/target/product/emu64a/ramdisk.img \
   aosp:/home/user/aosp/android16/out/target/product/emu64a/vendor_boot.img \
   aosp:/home/user/aosp/android16/out/target/product/emu64a/system-qemu.img \
   aosp:/home/user/aosp/android16/out/target/product/emu64a/vendor-qemu.img \
-  aosp:/home/user/aosp/android16/out/target/product/emu64a/product-qemu.img \
-  aosp:/home/user/aosp/android16/out/target/product/emu64a/system_ext-qemu.img \
   aosp:/home/user/aosp/android16/out/target/product/emu64a/userdata.img \
-  aosp:/home/user/aosp/android16/out/target/product/emu64a/vbmeta.img \
-  aosp:/home/user/aosp/android16/out/target/product/emu64a/super.img \
   "$SYS"/
 ```
 
-Copy optional raw partition images for debugging:
+Copy raw and standalone partition images separately only when debugging:
 
 ```sh
+DEBUG_SYS=/Users/u/workspace/aemu/.codex-local/aosp16-emu64a-user-debug-images
+mkdir -p "$DEBUG_SYS"
+
 rsync -av --progress \
   aosp:/home/user/aosp/android16/out/target/product/emu64a/system.img \
   aosp:/home/user/aosp/android16/out/target/product/emu64a/vendor.img \
   aosp:/home/user/aosp/android16/out/target/product/emu64a/product.img \
   aosp:/home/user/aosp/android16/out/target/product/emu64a/system_ext.img \
   aosp:/home/user/aosp/android16/out/target/product/emu64a/system_dlkm.img \
-  "$SYS"/
+  aosp:/home/user/aosp/android16/out/target/product/emu64a/super.img \
+  aosp:/home/user/aosp/android16/out/target/product/emu64a/vbmeta.img \
+  aosp:/home/user/aosp/android16/out/target/product/emu64a/product-qemu.img \
+  aosp:/home/user/aosp/android16/out/target/product/emu64a/system_ext-qemu.img \
+  "$DEBUG_SYS"/
 ```
 
 Copy the kernel and add the kernel command line file:
@@ -153,6 +161,9 @@ rsync -av --progress \
   "$SYS/kernel-ranchu"
 
 printf '8250.nr_uarts=1\n' > "$SYS/kernel_cmdline.txt"
+
+cp /Users/u/workspace/aemu/aosp/system-image/advancedFeatures.ini \
+  "$SYS/advancedFeatures.ini"
 ```
 
 Do not manually merge `vendor_boot.img` into `ramdisk.img`. MacMu's qemu startup
@@ -163,39 +174,59 @@ virtio modules live in the vendor ramdisk, including `virtio_mmio.ko` and
 
 ## Create the Metadata Disk
 
-The Android 16 emulator fstab first-stage mounts `/metadata` by partition name.
-Use a small GPT disk with a partition named `metadata`. The examples below run
-on the Linux AOSP host because it has the usual disk tools:
+The Android Emulator calls this file `encryptionkey.img` for historical
+reasons. In this MacMu Android 16 target it is not a password, certificate, or
+per-user secret. It is the small virtio disk on which first-stage init expects
+to find the `/metadata` partition.
+
+The disk is safe to distribute as a template. Every AVD receives its own copy,
+and qemu writes through a per-AVD qcow2 overlay.
+
+Create it on the Linux AOSP host without root or loop devices:
 
 ```sh
-ssh aosp
-mkdir -p /tmp/aosp16-metadata-disk
-cd /tmp/aosp16-metadata-disk
-
-dd if=/dev/zero of=metadata.img bs=1M count=64
-sgdisk --clear \
-  --new=1:2048:0 \
-  --change-name=1:metadata \
-  --typecode=1:8300 \
-  metadata.img
-
-loop=$(sudo losetup --show -Pf metadata.img)
-sudo mkfs.ext4 -F -L metadata "${loop}p1"
-sudo losetup -d "$loop"
+scp scripts/create_android16_metadata_image.sh aosp:/tmp/
+ssh aosp /tmp/create_android16_metadata_image.sh \
+  /home/user/aosp/android16/out/target/product/emu64a/encryptionkey.img
 ```
 
 Copy it to macOS:
 
 ```sh
-rsync -av --progress aosp:/tmp/aosp16-metadata-disk/metadata.img "$SYS/metadata.img"
+rsync -av --progress \
+  aosp:/home/user/aosp/android16/out/target/product/emu64a/encryptionkey.img \
+  "$SYS/"
 ```
 
-MacMu currently reuses the emulator encryption-key disk slot for this metadata
-disk in local validation:
+## Package the Release Image
+
+Create the complete end-user ZIP after staging the runtime files:
 
 ```sh
-cp "$SYS/metadata.img" "$SYS/encryptionkey.img"
+scripts/package_aosp16_image.sh \
+  --source-dir "$SYS" \
+  --output .codex-local/macmu-aosp16-arm64-system-image.zip
 ```
+
+The package script validates the GPT/ext4 metadata disk, excludes duplicate
+raw/debug images, creates a top-level `aosp16-arm64` directory, and writes a
+sidecar SHA-256 file.
+
+Create the CDN-friendly chunk manifest and immutable objects from the same
+staged directory:
+
+```sh
+scripts/package_aosp16_chunked.py \
+  --source-dir "$SYS" \
+  --output-dir .codex-local/macmu-aosp16-arm64-chunked
+```
+
+MacMu accepts either the complete ZIP or the chunked `manifest.json`. The
+chunked form defaults to 64 MiB chunks, deduplicates identical compressed
+objects, supports HTTPS resume and a persistent verified-object cache, and
+still reconstructs the same `aosp16-arm64` directory. See
+[IMAGE_DISTRIBUTION.md](IMAGE_DISTRIBUTION.md) for the manifest and CDN
+contract.
 
 ## Create an AVD
 
@@ -245,7 +276,8 @@ target=android-36
 userdata.useQcow2=no
 ```
 
-Link the writable AVD content images to the original qemu images:
+Link the runtime AVD content images to the combined qemu images and copy the
+metadata template:
 
 ```sh
 ln -s "$SYS/system-qemu.img" "$AVD_DIR/system-qemu.img"
@@ -315,6 +347,31 @@ The product entry point is the shell:
   --system-path "$SYS" \
   --avd "$AVD_NAME"
 ```
+
+To exercise first-run import without using the file picker, supply either a
+local complete ZIP, a local manifest, or an HTTPS manifest:
+
+```sh
+/Users/u/workspace/aemu/build/cmake/distribution/emulator/macmu \
+  --import-image /path/to/macmu-aosp16-arm64-system-image.zip
+
+/Users/u/workspace/aemu/build/cmake/distribution/emulator/macmu \
+  --import-image /path/to/macmu-aosp16-arm64-chunked/manifest.json
+
+/Users/u/workspace/aemu/build/cmake/distribution/emulator/macmu \
+  --import-image https://cdn.example.com/macmu/aosp16-arm64/manifest.json
+```
+
+The import option is used only when the managed image directory is absent.
+Without an explicit import option, a fresh MacMu installation automatically
+uses:
+
+```text
+https://storage.macmu.org/images/aosp16-arm64/manifest.json
+```
+
+Use `--no-auto-image-import` or `MACMU_AUTO_IMPORT_IMAGE=0` for offline
+development runs that should remain at the manual import screen.
 
 For strict original-image validation, use the original AOSP `ramdisk.img`:
 

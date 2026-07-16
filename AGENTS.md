@@ -59,7 +59,7 @@ validation. The source-built image flow is documented in
 The current validated target is:
 
 ```text
-product=sdk_phone64_arm64
+product=macmu_sdk_phone64_arm64
 device=emu64a
 variant=user
 target=android-36
@@ -77,16 +77,44 @@ The MacMu-managed default system image directory is:
 ~/Library/MacMu/images/aosp16-arm64
 ```
 
-The system image directory must contain the normal emulator image files used by
-MacMu, including:
+The end-user system image directory must contain the optimized runtime image
+set used by MacMu:
 
 ```text
+advancedFeatures.ini
+android-info.txt
+VerifiedBootParams.textproto
+encryptionkey.img
 kernel-ranchu
 ramdisk.img
 vendor_boot.img
-system.img
-vendor.img
+system-qemu.img
+vendor-qemu.img
+userdata.img
 ```
+
+`advancedFeatures.ini` is required for the Android 16 emulator boot contract,
+including `AndroidbootProps2`, dynamic partitions, virtio devices, and the
+metadata/encryption-key disk slot. Treating it as optional can leave a fresh
+AVD stuck with an offline adb transport.
+
+`system-qemu.img` already contains the GPT `vbmeta` and `super` partitions.
+Standalone `super.img`, raw `system.img` / `vendor.img`, and separate
+`product-qemu.img` / `system_ext-qemu.img` are build/debug artifacts and should
+not be shipped in the end-user image zip.
+
+MacMu supports both release transports:
+
+- A complete optimized ZIP produced by `scripts/package_aosp16_image.sh`.
+- A v2 `manifest.json` plus content-addressed object ZIPs produced by
+  `scripts/package_aosp16_chunked.py`.
+
+The chunked transport uses 64 MiB raw chunks by default, independently
+compresses each chunk, deduplicates objects by their compressed SHA-256, and
+reconstructs the same validated image directory as the complete ZIP. Keep the
+full ZIP for offline/backward-compatible distribution and use the manifest
+form for CDN delivery. The complete contract is in
+`docs/IMAGE_DISTRIBUTION.md`.
 
 Do not use ATD images for graphics/scrcpy validation. One known-bad example is:
 
@@ -124,8 +152,21 @@ image search path from `-sysdir` directly, and the AVD itself is located via
 (independent of the SDK root). The shell passes the same `-sysdir` through when
 launched with `--system-path <dir>` (or the `MACMU_SYSTEM_PATH` /
 `AEMU_SHELL_SYSTEM_PATH` env var). Product-style shell runs default to
-`~/Library/MacMu/images/aosp16-arm64` and can import an AOSP16 image archive
-into that directory.
+`~/Library/MacMu/images/aosp16-arm64` and can import either a complete AOSP16
+image ZIP or a chunk manifest into that directory. The first-run source can
+also be supplied with `--import-image` / `MACMU_IMPORT_IMAGE`; HTTPS sources
+must be manifests. Verified remote objects are resumed and cached under
+`~/Library/MacMu/cache/image-objects`.
+
+When the managed image is absent and no explicit source is set, MacMu
+automatically initializes from:
+
+```text
+https://storage.macmu.org/images/aosp16-arm64/manifest.json
+```
+
+This default can be disabled for offline/development runs with
+`--no-auto-image-import` or `MACMU_AUTO_IMPORT_IMAGE=0`.
 
 If a previous emulator session was killed while it was writing a snapshot, the
 next cold boot can segfault inside `drive_init` / `blk_bs` (the qcow2-on-qcow2

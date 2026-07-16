@@ -83,6 +83,10 @@
 "READY" = "已就绪";
 "WORKING" = "处理中";
 "ATTENTION" = "需要处理";
+"DOWNLOADING" = "下载中";
+"ASSEMBLING" = "组装中";
+"VERIFYING" = "校验中";
+"INSTALLING" = "安装中";
 "RETRYING" = "重试中";
 "RESTARTING" = "重启中";
 
@@ -101,9 +105,21 @@
 "Could not start Android" = "无法启动 Android";
 "Quit MacMu before importing an image" = "导入镜像前请先退出 MacMu";
 "Import MacMu System Image" = "导入 MacMu 系统镜像";
-"Choose a MacMu AOSP16 arm64 system image zip." = "请选择 MacMu AOSP16 arm64 系统镜像压缩包。";
+"Choose a complete image zip or a chunk manifest." = "请选择完整镜像 ZIP 或分块 manifest。";
 "Import" = "导入";
 "Importing system image" = "正在导入系统镜像";
+"Downloading Android image" = "正在下载 Android 镜像";
+"Verifying Android image parts" = "正在校验 Android 镜像分块";
+"Receiving and verifying image parts from MacMu storage…" = "正在从 MacMu 存储下载并校验镜像分块…";
+"Checking the selected local image parts…" = "正在检查所选本地镜像分块…";
+"%.1f%% · %@ / %@ · %zu / %zu parts verified" = "%.1f%% · %@ / %@ · 已校验 %zu / %zu 个分块";
+"Assembling Android image" = "正在组装 Android 镜像";
+"Reconstructing and verifying the Android system image…" = "正在重组并校验 Android 系统镜像…";
+"%.1f%% · %@ / %@ · %zu / %zu chunks assembled" = "%.1f%% · %@ / %@ · 已组装 %zu / %zu 个分块";
+"Validating Android image" = "正在校验 Android 镜像";
+"Checking the reconstructed image files…" = "正在检查重组后的镜像文件…";
+"Installing Android image" = "正在安装 Android 镜像";
+"Installing the verified image into MacMu…" = "正在将已校验镜像安装到 MacMu…";
 "Import failed: empty path" = "导入失败：路径为空";
 "Import failed: %@" = "导入失败：%@";
 "System image imported" = "系统镜像已导入";

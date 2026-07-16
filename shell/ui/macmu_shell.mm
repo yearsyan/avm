@@ -36,6 +36,7 @@
 #include "frame_consumer.h"
 #include "guest_control_client.h"
 #include "guest_input_sender.h"
+#include "image_importer.h"
 #include "input_sender.h"
 #include "machine_manager.h"
 #include "macmu_control_protocol.h"
@@ -56,6 +57,11 @@ NSString* ns_string(const std::string& value) {
 // packaged builds resolve the key from Contents/Resources/<language>.lproj.
 NSString* tr(NSString* key) {
     return [[NSBundle mainBundle] localizedStringForKey:key value:key table:nil];
+}
+
+NSString* formatted_byte_count(uint64_t bytes) {
+    return [NSByteCountFormatter stringFromByteCount:static_cast<long long>(bytes)
+                                           countStyle:NSByteCountFormatterCountStyleFile];
 }
 
 std::string package_from_component(const std::string& component) {
@@ -417,6 +423,13 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
                               message:(NSString*)message;
 - (void)restoreDisplaySubscriptions;
 - (void)enqueueFramePresentationForDisplay:(uint32_t)displayId;
+- (void)importSystemImageSource:(NSURL*)sourceURL;
+- (void)updateImageImportProgressPhase:(NSInteger)phase
+                        completedBytes:(uint64_t)completedBytes
+                            totalBytes:(uint64_t)totalBytes
+                        completedItems:(size_t)completedItems
+                            totalItems:(size_t)totalItems
+                               network:(BOOL)network;
 @end
 
 @implementation MacMuAppDelegate {
@@ -433,6 +446,8 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
     NSTextField* _bootDetailValue;
     NSTextField* _bootStageValue;
     NSProgressIndicator* _bootSpinner;
+    NSProgressIndicator* _bootProgressBar;
+    NSTextField* _bootProgressValue;
     NSButton* _createMachineButton;
     NSButton* _refreshAppsButton;
     NSButton* _startupRetryButton;
@@ -521,6 +536,8 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
 
     std::atomic<bool> _shuttingDown;
     std::atomic<bool> _runtimeShutdownComplete;
+    std::atomic<bool> _imageImportInProgress;
+    std::atomic<bool> _imageImportFailed;
     std::atomic<bool> _doorbellShutdown;
     std::atomic<uint64_t> _qemuGeneration;
     std::array<std::atomic_bool, kMacmuFrameSlotCount> _framePresentationPending;
@@ -551,6 +568,8 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
     _bootDetailValue = nil;
     _bootStageValue = nil;
     _bootSpinner = nil;
+    _bootProgressBar = nil;
+    _bootProgressValue = nil;
     _createMachineButton = nil;
     _refreshAppsButton = nil;
     _startupRetryButton = nil;
@@ -578,6 +597,8 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
     _androidSettingsMenuItem = nil;
     _shuttingDown.store(false, std::memory_order_relaxed);
     _runtimeShutdownComplete.store(false, std::memory_order_relaxed);
+    _imageImportInProgress.store(false, std::memory_order_relaxed);
+    _imageImportFailed.store(false, std::memory_order_relaxed);
     _doorbellShutdown.store(true, std::memory_order_relaxed);
     _qemuGeneration.store(0, std::memory_order_relaxed);
     for (auto& pending : _framePresentationPending) {
@@ -610,17 +631,31 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
     _orientationTimer.tolerance = 0.1;
     [self updateMachineControls];
     [self showStatusWindow:nil];
+    std::string imageImportSource = _options.imageImportSource;
+    if (imageImportSource.empty() && _options.autoImportDefaultImage) {
+        imageImportSource = macmu::kDefaultImageManifestUrl;
+    }
+    if (!imageImportSource.empty() && !macmu_system_image_exists(_options)) {
+        NSString* source = ns_string(imageImportSource);
+        NSURL* sourceURL =
+            [source hasPrefix:@"https://"] || [source hasPrefix:@"file://"]
+                ? [NSURL URLWithString:source]
+                : [NSURL fileURLWithPath:source];
+        [self importSystemImageSource:sourceURL];
+    }
     [self startQemuSupervisor];
     [NSApp activateIgnoringOtherApps:YES];
 }
 
 - (void)applicationWillTerminate:(NSNotification*)notification {
+    macmu_cancel_system_image_import();
     if (!_runtimeShutdownComplete.load(std::memory_order_acquire)) {
         [self shutdownRuntime];
     }
 }
 
 - (NSApplicationTerminateReply)applicationShouldTerminate:(NSApplication*)sender {
+    macmu_cancel_system_image_import();
     if (_runtimeShutdownComplete.load(std::memory_order_acquire)) {
         return NSTerminateNow;
     }
@@ -1284,8 +1319,6 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
     }
 
     const NSRect frame = NSMakeRect(0, 0, 960, 720);
-    NSColor* applicationBackground =
-        [NSColor colorWithSRGBRed:0.105 green:0.118 blue:0.145 alpha:1.0];
     _statusWindow = [[NSWindow alloc]
         initWithContentRect:frame
                   styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
@@ -1298,12 +1331,12 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
     _statusWindow.releasedWhenClosed = NO;
     _statusWindow.delegate = self;
     _statusWindow.minSize = NSMakeSize(720, 560);
-    _statusWindow.appearance = [NSAppearance appearanceNamed:NSAppearanceNameDarkAqua];
-    _statusWindow.backgroundColor = applicationBackground;
+    // Keep the Applications shell native to the current macOS appearance.
+    // A semantic NSColor remains dynamic when the user switches between the
+    // light and dark appearances while this window is already open.
+    _statusWindow.backgroundColor = [NSColor windowBackgroundColor];
 
     NSView* content = [[NSView alloc] initWithFrame:frame];
-    content.wantsLayer = YES;
-    content.layer.backgroundColor = applicationBackground.CGColor;
     _statusWindow.contentView = content;
 
     // Match the pared-back Finder Applications layout: a single title at the
@@ -1405,73 +1438,98 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
     _appsEmptyValue.autoresizingMask = NSViewWidthSizable | NSViewMinYMargin | NSViewMaxYMargin;
     [content addSubview:_appsEmptyValue];
 
-    // --- Full-window startup overlay ------------------------------------
-    // Keep setup/loading out of the normal Applications layout. The overlay
-    // owns the entire content area until Android and the app catalog are ready.
+    // --- Full-window startup state --------------------------------------
+    // Setup/loading is presented directly on the native window background.
+    // There is intentionally no nested card or dark panel: the status text,
+    // progress, and actions are first-class window content until Android is
+    // ready.
     NSVisualEffectView* startupOverlay =
         [[NSVisualEffectView alloc] initWithFrame:content.bounds];
     startupOverlay.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
     startupOverlay.material = NSVisualEffectMaterialWindowBackground;
     startupOverlay.blendingMode = NSVisualEffectBlendingModeWithinWindow;
     startupOverlay.state = NSVisualEffectStateActive;
-    startupOverlay.wantsLayer = YES;
-    startupOverlay.layer.backgroundColor =
-        [[NSColor windowBackgroundColor] colorWithAlphaComponent:0.82].CGColor;
     _startupOverlay = startupOverlay;
 
-    NSView* startupCard =
-        make_card(NSMakeRect((frame.size.width - 500) * 0.5,
-                             (frame.size.height - 270) * 0.5, 500, 270));
-    startupCard.autoresizingMask = NSViewMinXMargin | NSViewMaxXMargin |
-                                   NSViewMinYMargin | NSViewMaxYMargin;
-    [startupOverlay addSubview:startupCard];
+    const NSAutoresizingMaskOptions centeredMask =
+        NSViewMinXMargin | NSViewMaxXMargin | NSViewMinYMargin | NSViewMaxYMargin;
 
-    _bootStageValue = make_label(tr(@"STARTING"), NSMakeRect(24, 230, 452, 16));
+    _bootStageValue =
+        make_label(tr(@"STARTING"), NSMakeRect(170, 470, 620, 18));
     _bootStageValue.font = [NSFont systemFontOfSize:10.0 weight:NSFontWeightSemibold];
     _bootStageValue.textColor = [NSColor tertiaryLabelColor];
     _bootStageValue.alignment = NSTextAlignmentCenter;
-    [startupCard addSubview:_bootStageValue];
+    _bootStageValue.autoresizingMask = centeredMask;
+    [startupOverlay addSubview:_bootStageValue];
 
-    _bootSpinner = [[NSProgressIndicator alloc] initWithFrame:NSMakeRect(232, 178, 36, 36)];
+    _bootSpinner = [[NSProgressIndicator alloc] initWithFrame:NSMakeRect(462, 414, 36, 36)];
     _bootSpinner.style = NSProgressIndicatorStyleSpinning;
     _bootSpinner.controlSize = NSControlSizeRegular;
     _bootSpinner.displayedWhenStopped = NO;
+    _bootSpinner.autoresizingMask = centeredMask;
     [_bootSpinner startAnimation:nil];
-    [startupCard addSubview:_bootSpinner];
+    [startupOverlay addSubview:_bootSpinner];
 
-    _bootTitleValue = make_label(tr(@"Starting Android"), NSMakeRect(32, 138, 436, 30));
-    _bootTitleValue.font = [NSFont systemFontOfSize:22.0 weight:NSFontWeightSemibold];
+    _bootTitleValue =
+        make_label(tr(@"Starting Android"), NSMakeRect(150, 362, 660, 36));
+    _bootTitleValue.font = [NSFont systemFontOfSize:26.0 weight:NSFontWeightSemibold];
     _bootTitleValue.textColor = [NSColor labelColor];
     _bootTitleValue.alignment = NSTextAlignmentCenter;
-    [startupCard addSubview:_bootTitleValue];
+    _bootTitleValue.autoresizingMask = centeredMask;
+    [startupOverlay addSubview:_bootTitleValue];
 
     _bootDetailValue =
-        make_label(tr(@"Preparing MacMu to start…"), NSMakeRect(44, 86, 412, 42));
-    _bootDetailValue.font = [NSFont systemFontOfSize:13.0 weight:NSFontWeightRegular];
+        make_label(tr(@"Preparing MacMu to start…"), NSMakeRect(170, 306, 620, 44));
+    _bootDetailValue.font = [NSFont systemFontOfSize:14.0 weight:NSFontWeightRegular];
     _bootDetailValue.textColor = [NSColor secondaryLabelColor];
     _bootDetailValue.alignment = NSTextAlignmentCenter;
     _bootDetailValue.lineBreakMode = NSLineBreakByWordWrapping;
     _bootDetailValue.maximumNumberOfLines = 2;
     _bootDetailValue.usesSingleLineMode = NO;
-    [startupCard addSubview:_bootDetailValue];
+    _bootDetailValue.autoresizingMask = centeredMask;
+    [startupOverlay addSubview:_bootDetailValue];
+
+    _bootProgressBar =
+        [[NSProgressIndicator alloc] initWithFrame:NSMakeRect(210, 268, 540, 12)];
+    _bootProgressBar.style = NSProgressIndicatorStyleBar;
+    _bootProgressBar.indeterminate = NO;
+    _bootProgressBar.minValue = 0.0;
+    _bootProgressBar.maxValue = 100.0;
+    _bootProgressBar.doubleValue = 0.0;
+    _bootProgressBar.hidden = YES;
+    _bootProgressBar.autoresizingMask = centeredMask;
+    [startupOverlay addSubview:_bootProgressBar];
+
+    _bootProgressValue =
+        make_label(@"", NSMakeRect(170, 232, 620, 24));
+    _bootProgressValue.font =
+        [NSFont monospacedDigitSystemFontOfSize:12.0 weight:NSFontWeightMedium];
+    _bootProgressValue.textColor = [NSColor secondaryLabelColor];
+    _bootProgressValue.alignment = NSTextAlignmentCenter;
+    _bootProgressValue.hidden = YES;
+    _bootProgressValue.autoresizingMask = centeredMask;
+    [startupOverlay addSubview:_bootProgressValue];
 
     NSTextField* startupHint =
         make_label(tr(@"Applications appear automatically when Android is ready."),
-                   NSMakeRect(44, 58, 412, 18));
+                   NSMakeRect(170, 198, 620, 18));
     startupHint.font = [NSFont systemFontOfSize:11.0 weight:NSFontWeightRegular];
     startupHint.textColor = [NSColor tertiaryLabelColor];
     startupHint.alignment = NSTextAlignmentCenter;
-    [startupCard addSubview:startupHint];
+    startupHint.autoresizingMask = centeredMask;
+    [startupOverlay addSubview:startupHint];
 
     _createMachineButton = make_button(tr(@"Import Image…"), @selector(prepareDevice:), self,
-                                       NSMakeRect(175, 18, 150, 32));
+                                       NSMakeRect(405, 150, 150, 32));
     _createMachineButton.hidden = YES;
-    [startupCard addSubview:_createMachineButton];
+    _createMachineButton.autoresizingMask = centeredMask;
+    [startupOverlay addSubview:_createMachineButton];
 
     _startupRetryButton = make_button(tr(@"Try Again"), @selector(refreshApps:), self,
-                                      NSMakeRect(175, 18, 150, 32));
+                                      NSMakeRect(405, 150, 150, 32));
     _startupRetryButton.hidden = YES;
-    [startupCard addSubview:_startupRetryButton];
+    _startupRetryButton.autoresizingMask = centeredMask;
+    [startupOverlay addSubview:_startupRetryButton];
 
     [content addSubview:startupOverlay];
 
@@ -1936,12 +1994,15 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
     [self showStatusWindow:nil];
     NSOpenPanel* panel = [NSOpenPanel openPanel];
     panel.title = tr(@"Import MacMu System Image");
-    panel.message = tr(@"Choose a MacMu AOSP16 arm64 system image zip.");
+    panel.message = tr(@"Choose a complete image zip or a chunk manifest.");
     panel.prompt = tr(@"Import");
     panel.canChooseFiles = YES;
     panel.canChooseDirectories = NO;
     panel.allowsMultipleSelection = NO;
-    panel.allowedContentTypes = @[ [UTType typeWithIdentifier:@"public.zip-archive"] ];
+    panel.allowedContentTypes = @[
+        [UTType typeWithIdentifier:@"public.zip-archive"],
+        [UTType typeWithIdentifier:@"public.json"]
+    ];
 
     MacMuAppDelegate* delegate = self;
     [panel beginSheetModalForWindow:_statusWindow
@@ -1949,21 +2010,25 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
                       if (result != NSModalResponseOK || panel.URL == nil) {
                           return;
                       }
-                      [delegate importSystemImageArchive:panel.URL];
+                      [delegate importSystemImageSource:panel.URL];
                   }];
 }
 
-- (void)importSystemImageArchive:(NSURL*)archiveURL {
+- (void)importSystemImageSource:(NSURL*)sourceURL {
     ShellOptions options = _options;
-    NSString* archivePath = archiveURL.path;
-    if (archivePath.length == 0) {
+    NSString* source =
+        sourceURL.isFileURL ? sourceURL.path : sourceURL.absoluteString;
+    if (source.length == 0) {
         [self publishQemuStatus:tr(@"Import failed: empty path")];
         return;
     }
 
+    _imageImportFailed.store(false, std::memory_order_release);
+    _imageImportInProgress.store(true, std::memory_order_release);
     [self publishQemuStatus:tr(@"Importing system image")];
     if (_createMachineButton) {
         _createMachineButton.enabled = NO;
+        _createMachineButton.hidden = YES;
     }
 
     MacMuAppDelegate* delegate = self;
@@ -1985,32 +2050,52 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
 
             NSString* tempRoot = tempPath ? [NSString stringWithUTF8String:tempPath] : nil;
             if (ok) {
-                NSTask* task = [[NSTask alloc] init];
-                task.executableURL = [NSURL fileURLWithPath:@"/usr/bin/ditto"];
-                task.arguments = @[ @"-x", @"-k", archivePath, tempRoot ];
-                NSError* launchError = nil;
-                if (![task launchAndReturnError:&launchError]) {
-                    ok = NO;
-                    error = "failed to launch ditto: ";
-                    error += launchError.localizedDescription.UTF8String ?: "unknown error";
-                } else {
-                    [task waitUntilExit];
-                    if (task.terminationStatus != 0) {
-                        ok = NO;
-                        error = "failed to extract zip";
-                    }
-                }
+                const std::string imageSource = source.UTF8String ?: "";
+                ok = macmu_extract_system_image_source(
+                    options, imageSource, tempRoot.UTF8String,
+                    [delegate](const ImageImportProgress& progress) {
+                        const NSInteger phase = static_cast<NSInteger>(progress.phase);
+                        const uint64_t completedBytes = progress.completedBytes;
+                        const uint64_t totalBytes = progress.totalBytes;
+                        const size_t completedItems = progress.completedItems;
+                        const size_t totalItems = progress.totalItems;
+                        const BOOL network = progress.network;
+                        dispatch_async(dispatch_get_main_queue(), ^{
+                            [delegate updateImageImportProgressPhase:phase
+                                                     completedBytes:completedBytes
+                                                         totalBytes:totalBytes
+                                                     completedItems:completedItems
+                                                         totalItems:totalItems
+                                                            network:network];
+                        });
+                    },
+                    &error);
             }
 
             std::string extractedImageDir;
             if (ok) {
+                [delegate publishBootPresentation:tr(@"Validating Android image")
+                                            detail:tr(@"Checking the reconstructed image files…")
+                                             stage:tr(@"VERIFYING")
+                                              busy:YES
+                                             ready:NO];
                 ok = macmu_find_system_image_directory(tempRoot.UTF8String, &extractedImageDir,
                                                        &error);
             }
             if (ok) {
+                [delegate publishBootPresentation:tr(@"Installing Android image")
+                                            detail:tr(@"Installing the verified image into MacMu…")
+                                             stage:tr(@"INSTALLING")
+                                              busy:YES
+                                             ready:NO];
                 ok = macmu_replace_system_image_from_directory(options, extractedImageDir, &error);
             }
             if (ok) {
+                [delegate publishBootPresentation:tr(@"Preparing Android device")
+                                            detail:tr(@"Creating the managed MacMu virtual device…")
+                                             stage:tr(@"PREPARING")
+                                              busy:YES
+                                             ready:NO];
                 ok = macmu_create_default_machine(options, &error);
             }
 
@@ -2019,6 +2104,9 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
             }
 
             dispatch_async(dispatch_get_main_queue(), ^{
+                delegate->_imageImportFailed.store(!ok, std::memory_order_release);
+                delegate->_imageImportInProgress.store(false, std::memory_order_release);
+                [delegate updateMachineControls];
                 if (ok) {
                     [delegate publishBootPresentation:tr(@"System image imported")
                                                 detail:tr(@"The Android device is ready. Starting MacMu…")
@@ -2030,7 +2118,6 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
                         stringWithFormat:tr(@"Import failed: %@"), ns_string(error)]];
                     NSLog(@"MacMu image import failed: %s", error.c_str());
                 }
-                [delegate updateMachineControls];
             });
         }
     });
@@ -2054,6 +2141,65 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
                              ready:NO];
     NSLog(@"MacMu machine creation failed: %s", error.c_str());
     [self updateMachineControls];
+}
+
+- (void)updateImageImportProgressPhase:(NSInteger)phase
+                        completedBytes:(uint64_t)completedBytes
+                            totalBytes:(uint64_t)totalBytes
+                        completedItems:(size_t)completedItems
+                            totalItems:(size_t)totalItems
+                               network:(BOOL)network {
+    const uint64_t boundedBytes = std::min(completedBytes, totalBytes);
+    const double percentage =
+        totalBytes > 0 ? (100.0 * static_cast<double>(boundedBytes) /
+                          static_cast<double>(totalBytes))
+                       : 0.0;
+    NSString* completedSize = formatted_byte_count(boundedBytes);
+    NSString* totalSize = formatted_byte_count(totalBytes);
+    NSString* title = nil;
+    NSString* detail = nil;
+    NSString* stage = nil;
+    NSString* progressText = nil;
+
+    if (phase == static_cast<NSInteger>(ImageImportPhase::kAcquiringObjects)) {
+        title = network ? tr(@"Downloading Android image")
+                        : tr(@"Verifying Android image parts");
+        detail = network ? tr(@"Receiving and verifying image parts from MacMu storage…")
+                         : tr(@"Checking the selected local image parts…");
+        stage = network ? tr(@"DOWNLOADING") : tr(@"VERIFYING");
+        progressText =
+            [NSString stringWithFormat:
+                          tr(@"%.1f%% · %@ / %@ · %zu / %zu parts verified"),
+                          percentage, completedSize, totalSize, completedItems,
+                          totalItems];
+    } else {
+        title = tr(@"Assembling Android image");
+        detail = tr(@"Reconstructing and verifying the Android system image…");
+        stage = tr(@"ASSEMBLING");
+        progressText =
+            [NSString stringWithFormat:
+                          tr(@"%.1f%% · %@ / %@ · %zu / %zu chunks assembled"),
+                          percentage, completedSize, totalSize, completedItems,
+                          totalItems];
+    }
+
+    [self updateBootPresentation:title
+                           detail:detail
+                            stage:stage
+                             busy:YES
+                            ready:NO];
+    if (_bootSpinner) {
+        [_bootSpinner stopAnimation:nil];
+        _bootSpinner.hidden = YES;
+    }
+    if (_bootProgressBar) {
+        _bootProgressBar.doubleValue = percentage;
+        _bootProgressBar.hidden = NO;
+    }
+    if (_bootProgressValue) {
+        _bootProgressValue.stringValue = progressText;
+        _bootProgressValue.hidden = NO;
+    }
 }
 
 - (void)updateBootPresentation:(NSString*)title
@@ -2083,6 +2229,12 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
         } else {
             [_bootSpinner stopAnimation:nil];
         }
+    }
+    if (_bootProgressBar) {
+        _bootProgressBar.hidden = YES;
+    }
+    if (_bootProgressValue) {
+        _bootProgressValue.hidden = YES;
     }
     if (_startupRetryButton) {
         _startupRetryButton.hidden = ready || busy || !_agentConnected;
@@ -2970,6 +3122,11 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
 
 - (void)qemuMonitorLoop {
     while (!_shuttingDown.load(std::memory_order_acquire)) {
+        if (_imageImportInProgress.load(std::memory_order_acquire) ||
+            _imageImportFailed.load(std::memory_order_acquire)) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(250));
+            continue;
+        }
         if (!macmu_system_image_exists(_options)) {
             [self publishBootPresentation:tr(@"System image required")
                                     detail:tr(@"Import a MacMu Android 16 image to continue.")

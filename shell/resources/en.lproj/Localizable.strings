@@ -83,6 +83,10 @@
 "READY" = "READY";
 "WORKING" = "WORKING";
 "ATTENTION" = "ATTENTION";
+"DOWNLOADING" = "DOWNLOADING";
+"ASSEMBLING" = "ASSEMBLING";
+"VERIFYING" = "VERIFYING";
+"INSTALLING" = "INSTALLING";
 "RETRYING" = "RETRYING";
 "RESTARTING" = "RESTARTING";
 
@@ -101,9 +105,21 @@
 "Could not start Android" = "Could not start Android";
 "Quit MacMu before importing an image" = "Quit MacMu before importing an image";
 "Import MacMu System Image" = "Import MacMu System Image";
-"Choose a MacMu AOSP16 arm64 system image zip." = "Choose a MacMu AOSP16 arm64 system image zip.";
+"Choose a complete image zip or a chunk manifest." = "Choose a complete image zip or a chunk manifest.";
 "Import" = "Import";
 "Importing system image" = "Importing system image";
+"Downloading Android image" = "Downloading Android image";
+"Verifying Android image parts" = "Verifying Android image parts";
+"Receiving and verifying image parts from MacMu storage…" = "Receiving and verifying image parts from MacMu storage…";
+"Checking the selected local image parts…" = "Checking the selected local image parts…";
+"%.1f%% · %@ / %@ · %zu / %zu parts verified" = "%.1f%% · %@ / %@ · %zu / %zu parts verified";
+"Assembling Android image" = "Assembling Android image";
+"Reconstructing and verifying the Android system image…" = "Reconstructing and verifying the Android system image…";
+"%.1f%% · %@ / %@ · %zu / %zu chunks assembled" = "%.1f%% · %@ / %@ · %zu / %zu chunks assembled";
+"Validating Android image" = "Validating Android image";
+"Checking the reconstructed image files…" = "Checking the reconstructed image files…";
+"Installing Android image" = "Installing Android image";
+"Installing the verified image into MacMu…" = "Installing the verified image into MacMu…";
 "Import failed: empty path" = "Import failed: empty path";
 "Import failed: %@" = "Import failed: %@";
 "System image imported" = "System image imported";

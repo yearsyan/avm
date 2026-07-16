@@ -28,6 +28,13 @@ struct ShellOptions {
     // ANDROID_HOME: qemu resolves the AVD's image search path from this
     // directory directly. Empty means "not provided".
     std::string systemPath;
+    // Optional complete image ZIP, local chunk manifest, or HTTPS chunk
+    // manifest imported automatically when the managed system image is absent.
+    std::string imageImportSource;
+    // When no explicit imageImportSource is provided, import MacMu's hosted
+    // default manifest on first launch. Development runs can disable this with
+    // --no-auto-image-import or MACMU_AUTO_IMPORT_IMAGE=0.
+    bool autoImportDefaultImage = true;
     // Host Unix domain socket used by the guest MacMu RPC agent through
     // virtio-vsock's pipe:unix transport (input events, fire-and-forget).
     std::string guestRpcSocketPath;
