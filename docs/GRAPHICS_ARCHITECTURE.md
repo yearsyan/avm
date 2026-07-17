@@ -130,6 +130,13 @@ slot table on any wake. Display add/remove/list rides the separate MMCP
 control channel on inherited fd 197 (see
 docs/FRAME_CHANNEL_V2_CONTROL_PLANE.md).
 
+Before a removed display id becomes reusable, qemu disables its export,
+advances a producer-local lifecycle generation, and clears its slot back to
+`frame == 0`. GPU exports capture that generation before doing work, so a late
+frame from the previous application cannot repopulate the slot after the id is
+assigned to another application. Until the new display publishes its first
+frame, the Metal view presents only its clear color.
+
 The struct is duplicated in `hardware/google/gfxstream/host/common/iosurface_export.cpp`
 and `shell/core/frame_consumer.cpp` so the MIT shell remains self-contained.
 Any incompatible layout change must update both copies and bump the shm version.

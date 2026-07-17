@@ -983,6 +983,17 @@ void android_setDisplayExportEnabled(uint32_t displayId, int enabled) {
     }
 }
 
+void android_clearDisplayExportFrame(uint32_t displayId) {
+    if (displayId >= 16) {
+        return;
+    }
+    const uint32_t mask = uint32_t{1} << displayId;
+    sMacMuDisplayExportSubscriptions.fetch_and(~mask, std::memory_order_acq_rel);
+    if (gfxstream::Renderer* renderer = sMacMuRenderer.load(std::memory_order_acquire)) {
+        renderer->clearDisplayExportFrame(displayId);
+    }
+}
+
 void android_resetDisplayExportSubscriptions(void) {
     sMacMuDisplayExportSubscriptions.store(0, std::memory_order_release);
     if (gfxstream::Renderer* renderer = sMacMuRenderer.load(std::memory_order_acquire)) {

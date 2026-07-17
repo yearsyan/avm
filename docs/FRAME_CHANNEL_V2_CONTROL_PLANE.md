@@ -221,8 +221,12 @@ Publish rules:
 - A slot is published only after a real frame exists. `frame == 0` means "this
   display has never produced pixels"; the shell renders its placeholder clear
   color until then.
-- The producer never unpublishes a slot. Display removal is a control-plane
-  event; stale slot contents are inert because the shell stops sampling.
+- Display removal disables export, advances a producer-local lifecycle
+  generation, and clears that slot back to `frame == 0` before the ordered
+  `DISPLAY_REMOVE_OK` / `DISPLAY_REMOVED` messages make the id reusable.
+  Every GPU export captures the generation before it starts and supplies it
+  when publishing; an export from the previous display instance that finishes
+  late is discarded instead of repopulating the reused slot.
 - On display resize the producer allocates the new IOSurface and publishes it
   with the next frame; the consumer treats any `iosurfaceId` change as
   "release old texture, `IOSurfaceLookup` the new id" (v1 already behaves this
@@ -250,6 +254,7 @@ Publish rules:
 | qemu killed mid-write (slot left odd) | Shell zeroes the table on restart; within a session an odd `seq` only causes bounded retries and the next frame republishes. |
 | Doorbell datagrams dropped | Next successful send wakes the consumer; scan picks up all pending slots. The consumer also does a final non-blocking read at timeout, as in v1. |
 | Display removed while a view samples | IOSurface stays alive under the consumer's reference until it releases; control event tells the shell to close the window and drop the texture. |
+| Old export finishes after a display id is reused | Its captured lifecycle generation no longer matches, so `FrameChannel::publish` drops it. The cleared slot remains empty until the new display publishes. |
 | Slot id ≥ 16 requested | Rejected at `DISPLAY_ADD` with an error; the frame channel never sees it. |
 
 ---

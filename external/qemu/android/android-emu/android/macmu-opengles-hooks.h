@@ -18,6 +18,7 @@ AEMU_EXPORT void android_notifyDisplayColorBufferChanged(uint32_t displayId,
                                                          uint32_t colorBufferHandle);
 AEMU_EXPORT void android_exportDisplayFrame(uint32_t displayId);
 AEMU_EXPORT void android_setDisplayExportEnabled(uint32_t displayId, int enabled);
+AEMU_EXPORT void android_clearDisplayExportFrame(uint32_t displayId);
 AEMU_EXPORT void android_resetDisplayExportSubscriptions(void);
 
 #ifndef USING_ANDROID_BP

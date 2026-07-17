@@ -324,15 +324,16 @@ id<MTLRenderPipelineState> cached_surface_pipeline(id<MTLDevice> device,
     // view to redraw after expose/resize. In that case, reuse the last mapped
     // IOSurface instead of leaving the drawable at the window background.
     const BOOL hasNewFrame = [self reloadSurfaceIfNeeded];
-    if (!_surfaceTexture || !_pipeline) {
+    const BOOL canDrawSurface = _surfaceTexture != nil && _pipeline != nil;
+    if (!canDrawSurface) {
         if (renderer_debug_logs_enabled() && (hasNewFrame || !_loggedMissingTexture)) {
             NSLog(@"MacMu renderer cannot draw yet (texture=%@ pipeline=%@).",
                   _surfaceTexture ? @"yes" : @"no", _pipeline ? @"yes" : @"no");
             _loggedMissingTexture = true;
         }
-        return;
+    } else {
+        _loggedMissingTexture = false;
     }
-    _loggedMissingTexture = false;
 
     id<CAMetalDrawable> drawable = view.currentDrawable;
     MTLRenderPassDescriptor* pass = view.currentRenderPassDescriptor;
@@ -348,23 +349,28 @@ id<MTLRenderPipelineState> cached_surface_pipeline(id<MTLDevice> device,
     pass.colorAttachments[0].loadAction = MTLLoadActionClear;
     pass.colorAttachments[0].clearColor = view.clearColor;
 
-    if (!_viewportValid) {
-        [self recomputeViewport:view];
-    }
-    // Viewport is layout-compatible with MTLViewport (6 x double).
-    MTLViewport metalViewport;
-    std::memcpy(&metalViewport, &_cachedViewport, sizeof(metalViewport));
     id<MTLCommandBuffer> commandBuffer = [_queue commandBuffer];
     id<MTLRenderCommandEncoder> encoder =
         [commandBuffer renderCommandEncoderWithDescriptor:pass];
-    [encoder setViewport:metalViewport];
-    [encoder setRenderPipelineState:_pipeline];
-    [encoder setFragmentTexture:_surfaceTexture atIndex:0];
-    [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    if (canDrawSurface) {
+        if (!_viewportValid) {
+            [self recomputeViewport:view];
+        }
+        // Viewport is layout-compatible with MTLViewport (6 x double).
+        MTLViewport metalViewport;
+        std::memcpy(&metalViewport, &_cachedViewport, sizeof(metalViewport));
+        [encoder setViewport:metalViewport];
+        [encoder setRenderPipelineState:_pipeline];
+        [encoder setFragmentTexture:_surfaceTexture atIndex:0];
+        [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    }
     [encoder endEncoding];
     [commandBuffer presentDrawable:drawable];
     [commandBuffer commit];
 
+    if (!canDrawSurface) {
+        return;
+    }
     if (hasNewFrame) {
         _lastDrawnFrame = _metadata.frame;
     }

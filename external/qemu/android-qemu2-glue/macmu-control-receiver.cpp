@@ -380,6 +380,10 @@ private:
             return;
         }
         set_display_streaming(request.displayId, false);
+        // Invalidate the per-display frame slot before the ordered removal
+        // response/event makes this id reusable in the shell. Generation-aware
+        // publication also drops any old GPU export that finishes late.
+        android_clearDisplayExportFrame(request.displayId);
         send_frame(static_cast<uint16_t>(ControlMessageType::kDisplayRemoveOk), requestId,
                    nullptr, 0);
         send_display_event(request.displayId, macmu::kControlDisplayRemoved, 0, 0, 0, 0);
