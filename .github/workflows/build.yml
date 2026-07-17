@@ -436,10 +436,22 @@ jobs:
       - name: Verify release payload
         run: test -f "$RUNNER_TEMP/release/$PACKAGE_BASENAME.dmg"
 
-      - name: Create release
-        uses: https://gitea.com/actions/gitea-release-action@v1.3.6
-        with:
-          token: ${{ secrets.GITEA_TOKEN }}
-          tag_name: ${{ github.ref_name }}
-          name: ${{ github.ref_name }}
-          files: ${{ runner.temp }}/release/${{ env.PACKAGE_BASENAME }}.dmg
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="$GITHUB_REF_NAME"
+          dmg="$RUNNER_TEMP/release/$PACKAGE_BASENAME.dmg"
+
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$tag" "$dmg" \
+              --clobber \
+              --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$tag" "$dmg" \
+              --generate-notes \
+              --title "$tag" \
+              --verify-tag \
+              --repo "$GITHUB_REPOSITORY"
+          fi
