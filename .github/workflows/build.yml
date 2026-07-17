@@ -4,6 +4,8 @@ on:
   push:
     branches:
       - main
+    tags:
+      - "v*"
   pull_request:
     branches:
       - main
@@ -404,3 +406,40 @@ jobs:
             ${{ runner.temp }}/${{ env.PACKAGE_BASENAME }}.sha256
           if-no-files-found: error
           retention-days: 14
+
+      - name: Upload release DMG
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.PACKAGE_BASENAME }}-release-dmg
+          path: ${{ runner.temp }}/${{ env.PACKAGE_BASENAME }}.dmg
+          if-no-files-found: error
+          retention-days: 1
+
+  release:
+    name: Publish tagged DMG release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build-macos-arm64
+    runs-on: macos-15
+    permissions:
+      contents: write
+    env:
+      PACKAGE_BASENAME: macmu-macos-arm64
+
+    steps:
+      - name: Download release DMG
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.PACKAGE_BASENAME }}-release-dmg
+          path: ${{ runner.temp }}/release
+
+      - name: Verify release payload
+        run: test -f "$RUNNER_TEMP/release/$PACKAGE_BASENAME.dmg"
+
+      - name: Create release
+        uses: https://gitea.com/actions/gitea-release-action@v1.3.6
+        with:
+          token: ${{ secrets.GITEA_TOKEN }}
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          files: ${{ runner.temp }}/release/${{ env.PACKAGE_BASENAME }}.dmg
