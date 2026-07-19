@@ -209,7 +209,7 @@ ShellOptions parse_options(int argc, char** argv) {
     options.imageImportSource =
         env_or_default("MACMU_IMPORT_IMAGE", "AEMU_SHELL_IMPORT_IMAGE", "");
     options.autoImportDefaultImage =
-        env_bool_or_default("MACMU_AUTO_IMPORT_IMAGE", "AEMU_SHELL_AUTO_IMPORT_IMAGE", true);
+        env_bool_or_default("MACMU_AUTO_IMPORT_IMAGE", "AEMU_SHELL_AUTO_IMPORT_IMAGE", false);
     options.guestRpcSocketPath =
         env_or_default("MACMU_GUEST_RPC_SOCKET", "AEMU_SHELL_GUEST_RPC_SOCKET",
                        default_guest_rpc_socket_path());
@@ -318,6 +318,8 @@ ShellOptions parse_options(int argc, char** argv) {
             if (const char* value = require_value("--import-image")) {
                 options.imageImportSource = value;
             }
+        } else if (arg == "--auto-image-import") {
+            options.autoImportDefaultImage = true;
         } else if (arg == "--no-auto-image-import") {
             options.autoImportDefaultImage = false;
         } else if (arg == "--guest-rpc-socket") {

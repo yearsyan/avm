@@ -16,15 +16,20 @@ adjacent stale guidance that should be updated at the same time. Keep
 MacMu is a macOS arm64 focused cut of Android Emulator / QEMU.
 
 The goal is to keep the emulator core needed for Android guest execution,
-CPU acceleration, and GPU acceleration, while removing the Qt desktop UI
-launcher and nonessential remote/control features. The intended architecture is:
+CPU acceleration, and GPU acceleration, while replacing the Qt desktop UI
+launcher with a native AppKit product UI and removing nonessential
+remote/control features. The intended architecture is:
 
 - Host platform: macOS arm64.
 - CPU acceleration: Hypervisor.Framework.
-- Display mode: headless / no Qt window.
+- Product display mode: visible native AppKit application launcher and per-app
+  macOS windows.
+- Emulator backend: headless / no Qt window; users do not interact with this
+  process directly.
 - Rendering: keep host GPU acceleration through gfxstream.
-- UI shell: `shell/macmu`, which directly launches qemu headless
-  and renders exported IOSurfaces.
+- UI shell: `shell/macmu`, which directly launches the headless QEMU backend,
+  manages Android applications, and renders exported IOSurfaces in native
+  windows.
 - Licensing boundary: the shell source is MIT-licensed; qemu, gfxstream,
   Android Emulator, and bundled runtime components keep their upstream licenses
   and notices.
@@ -130,11 +135,12 @@ com.android.fakesystemapp/.launcher.EmptyHomeActivity
 
 That image booted successfully but produced black/gray screenshots and scrcpy
 output even under the official SDK emulator. Treat that as an image limitation,
-not as proof that the headless core rendering path is broken.
+not as proof that the QEMU-to-native-shell rendering path is broken.
 
 ## Runtime Notes
 
-Recommended launch shape:
+Direct backend launch shape for diagnostics (normal product runs launch
+`build/cmake/distribution/emulator/macmu` instead):
 
 ```sh
 ANDROID_EMULATOR_LAUNCHER_DIR=build/cmake/distribution/emulator \
@@ -153,20 +159,25 @@ image search path from `-sysdir` directly, and the AVD itself is located via
 launched with `--system-path <dir>` (or the `MACMU_SYSTEM_PATH` /
 `AEMU_SHELL_SYSTEM_PATH` env var). Product-style shell runs default to
 `~/Library/MacMu/images/aosp16-arm64` and can import either a complete AOSP16
-image ZIP or a chunk manifest into that directory. The first-run source can
-also be supplied with `--import-image` / `MACMU_IMPORT_IMAGE`; HTTPS sources
-must be manifests. Verified remote objects are resumed and cached under
+image ZIP, a chunk `manifest.json`, or a directory containing `manifest.json`
+into that directory. The first-run source can also be supplied with
+`--import-image` / `MACMU_IMPORT_IMAGE`; HTTPS sources must be manifests.
+Verified remote objects are resumed and cached under
 `~/Library/MacMu/cache/image-objects`.
 
-When the managed image is absent and no explicit source is set, MacMu
-automatically initializes from:
+When the managed image is absent and no explicit source is set, MacMu waits at
+the setup screen instead of downloading automatically. The user chooses either
+**Official Image** or **Other Source…**. The official option imports:
 
 ```text
 https://storage.macmu.org/images/aosp16-arm64/manifest.json
 ```
 
-This default can be disabled for offline/development runs with
-`--no-auto-image-import` or `MACMU_AUTO_IMPORT_IMAGE=0`.
+**Other Source…** accepts a local ZIP, manifest, or manifest directory. An
+explicit `--import-image` / `MACMU_IMPORT_IMAGE` source still starts unattended.
+Automation can opt into unattended official-image initialization with
+`--auto-image-import` or `MACMU_AUTO_IMPORT_IMAGE=1`; `--no-auto-image-import`
+forces the interactive chooser when a wrapper environment enables it.
 
 If a previous emulator session was killed while it was writing a snapshot, the
 next cold boot can segfault inside `drive_init` / `blk_bs` (the qcow2-on-qcow2
@@ -213,13 +224,15 @@ the stronger source of truth for host GPU/Vulkan state.
 
 ## Build configuration (core-only)
 
-This tree is permanently configured as **MacMu core-only**: macOS arm64,
-headless, HVF CPU acceleration + gfxstream GPU acceleration + Vulkan runtime,
-no Qt UI shell, no WebRTC/netsim/modem-simulator/recording/virtualscene/telephony-gRPC,
-single aarch64 guest architecture. The `OPTION_AEMU_CORE_ONLY` CMake variable is
-a constant `TRUE` (kept so legacy `if(NOT OPTION_AEMU_CORE_ONLY)` guards resolve
-to the disabled branch); `AEMU_CORE_ONLY=1` is always defined as a compile
-definition because some source files use it to select headless stubs.
+This tree is permanently configured as **MacMu core-only**: macOS arm64, a
+headless/no-Qt QEMU backend consumed by the visible native AppKit shell, HVF CPU
+acceleration + gfxstream GPU acceleration + Vulkan runtime, no upstream Qt UI,
+no WebRTC/netsim/modem-simulator/recording/virtualscene/telephony-gRPC, and a
+single aarch64 guest architecture. The `OPTION_AEMU_CORE_ONLY` CMake variable
+is a constant `TRUE` (kept so legacy `if(NOT OPTION_AEMU_CORE_ONLY)` guards
+resolve to the disabled branch); `AEMU_CORE_ONLY=1` is always defined as a
+compile definition because some backend source files use it to select headless
+stubs.
 
 Configure + build (Ninja):
 

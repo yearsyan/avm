@@ -295,7 +295,10 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
     @"MacMuApplicationItem";
 
 @interface MacMuApplicationItem : NSCollectionViewItem
-- (void)setApplicationRunning:(BOOL)running opening:(BOOL)opening closing:(BOOL)closing;
+- (void)setApplicationRunning:(BOOL)running
+                       opening:(BOOL)opening
+                       closing:(BOOL)closing
+                  uninstalling:(BOOL)uninstalling;
 @end
 
 @implementation MacMuApplicationItem {
@@ -351,12 +354,18 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
             .CGColor;
 }
 
-- (void)setApplicationRunning:(BOOL)running opening:(BOOL)opening closing:(BOOL)closing {
-    _runningLabel.stringValue = opening ? tr(@"Opening…")
-                                        : (closing ? tr(@"Closing…")
-                                                   : (running ? tr(@"●  Running") : @""));
-    _runningLabel.textColor = (opening || closing) ? [NSColor secondaryLabelColor]
-                                                   : [NSColor systemGreenColor];
+- (void)setApplicationRunning:(BOOL)running
+                       opening:(BOOL)opening
+                       closing:(BOOL)closing
+                  uninstalling:(BOOL)uninstalling {
+    _runningLabel.stringValue = uninstalling ? tr(@"Uninstalling…")
+                                             : (opening ? tr(@"Opening…")
+                                                        : (closing ? tr(@"Closing…")
+                                                                   : (running ? tr(@"●  Running")
+                                                                              : @"")));
+    _runningLabel.textColor = (opening || closing || uninstalling)
+                                  ? [NSColor secondaryLabelColor]
+                                  : [NSColor systemGreenColor];
 }
 
 @end
@@ -364,9 +373,101 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
 @interface MacMuApplicationsCollectionView : NSCollectionView
 @property(nonatomic, weak) id activationTarget;
 @property(nonatomic) SEL activationAction;
+@property(nonatomic, weak) id apkDropTarget;
+@property(nonatomic) SEL apkDropAction;
+@property(nonatomic) BOOL apkDropEnabled;
+@property(nonatomic, readonly) NSArray<NSURL*>* droppedApkURLs;
 @end
 
-@implementation MacMuApplicationsCollectionView
+@implementation MacMuApplicationsCollectionView {
+    NSArray<NSURL*>* _droppedApkURLs;
+    BOOL _apkDropEnabled;
+}
+
+- (instancetype)initWithFrame:(NSRect)frameRect {
+    self = [super initWithFrame:frameRect];
+    if (self) {
+        _apkDropEnabled = NO;
+    }
+    return self;
+}
+
+- (NSArray<NSURL*>*)apkURLsFromDraggingInfo:(id<NSDraggingInfo>)sender {
+    if (!_apkDropEnabled) {
+        return @[];
+    }
+    NSDictionary* options = @{NSPasteboardURLReadingFileURLsOnlyKey : @YES};
+    NSArray* objects = [sender.draggingPasteboard readObjectsForClasses:@[ [NSURL class] ]
+                                                                 options:options];
+    NSMutableArray<NSURL*>* apks = [NSMutableArray array];
+    for (id object in objects) {
+        if (![object isKindOfClass:[NSURL class]]) {
+            continue;
+        }
+        NSURL* url = (NSURL*)object;
+        if (url.isFileURL && [url.pathExtension caseInsensitiveCompare:@"apk"] == NSOrderedSame) {
+            [apks addObject:url];
+        }
+    }
+    return apks;
+}
+
+- (void)setApkDropHighlighted:(BOOL)highlighted {
+    self.wantsLayer = YES;
+    self.layer.cornerRadius = 12.0;
+    self.layer.borderWidth = highlighted ? 3.0 : 0.0;
+    self.layer.borderColor =
+        [[[NSColor selectedContentBackgroundColor] colorWithAlphaComponent:0.75] CGColor];
+}
+
+- (void)setApkDropEnabled:(BOOL)enabled {
+    if (_apkDropEnabled == enabled) {
+        return;
+    }
+    _apkDropEnabled = enabled;
+    if (enabled) {
+        [self registerForDraggedTypes:@[ NSPasteboardTypeFileURL ]];
+    } else {
+        [self unregisterDraggedTypes];
+        [self setApkDropHighlighted:NO];
+    }
+}
+
+- (BOOL)apkDropEnabled {
+    return _apkDropEnabled;
+}
+
+- (NSDragOperation)draggingEntered:(id<NSDraggingInfo>)sender {
+    const BOOL accepted = [self apkURLsFromDraggingInfo:sender].count > 0;
+    [self setApkDropHighlighted:accepted];
+    return accepted ? NSDragOperationCopy : NSDragOperationNone;
+}
+
+- (NSDragOperation)draggingUpdated:(id<NSDraggingInfo>)sender {
+    return [self draggingEntered:sender];
+}
+
+- (void)draggingExited:(id<NSDraggingInfo>)sender {
+    (void)sender;
+    [self setApkDropHighlighted:NO];
+}
+
+- (BOOL)prepareForDragOperation:(id<NSDraggingInfo>)sender {
+    return [self apkURLsFromDraggingInfo:sender].count > 0;
+}
+
+- (BOOL)performDragOperation:(id<NSDraggingInfo>)sender {
+    NSArray<NSURL*>* urls = [self apkURLsFromDraggingInfo:sender];
+    [self setApkDropHighlighted:NO];
+    if (urls.count == 0 || !_apkDropAction) {
+        return NO;
+    }
+    _droppedApkURLs = [urls copy];
+    const BOOL handled = [NSApp sendAction:_apkDropAction to:_apkDropTarget from:self];
+    _droppedApkURLs = nil;
+    return handled;
+}
+
 - (NSMenu*)menuForEvent:(NSEvent*)event {
     NSPoint point = [self convertPoint:event.locationInWindow fromView:nil];
     NSIndexPath* indexPath = [self indexPathForItemAtPoint:point];
@@ -400,7 +501,7 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
 
 @interface MacMuAppDelegate
     : NSObject <NSApplicationDelegate, NSWindowDelegate, NSCollectionViewDataSource,
-                NSCollectionViewDelegate>
+                NSCollectionViewDelegate, NSMenuDelegate>
 - (instancetype)initWithOptions:(const ShellOptions&)options;
 // Opens (or focuses) the application window bound to virtual display
 // |displayId|. Display 0 is deliberately rejected: it is an internal Android
@@ -423,6 +524,14 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
                               message:(NSString*)message;
 - (void)restoreDisplaySubscriptions;
 - (void)enqueueFramePresentationForDisplay:(uint32_t)displayId;
+- (void)installDroppedApks:(MacMuApplicationsCollectionView*)sender;
+- (void)chooseApksToInstall:(id)sender;
+- (void)installApkURLs:(NSArray<NSURL*>*)urls;
+- (void)apkInstallFinished:(NSString*)fileName ok:(BOOL)ok error:(NSString*)error;
+- (void)searchApplications:(id)sender;
+- (void)applyApplicationSearchFilter;
+- (void)uninstallSelectedApplication:(id)sender;
+- (void)importOfficialSystemImage:(id)sender;
 - (void)importSystemImageSource:(NSURL*)sourceURL;
 - (void)updateImageImportProgressPhase:(NSInteger)phase
                         completedBytes:(uint64_t)completedBytes
@@ -448,8 +557,13 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
     NSProgressIndicator* _bootSpinner;
     NSProgressIndicator* _bootProgressBar;
     NSTextField* _bootProgressValue;
+    NSButton* _officialImageButton;
     NSButton* _createMachineButton;
+    NSURL* _pendingImageImportSourceURL;
+    BOOL _imageSourcePanelOpen;
+    NSButton* _installApkButton;
     NSButton* _refreshAppsButton;
+    NSSearchField* _appsSearchField;
     NSButton* _startupRetryButton;
     NSView* _startupOverlay;
     BOOL _bootPresentationReady;
@@ -483,6 +597,9 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
     // closing an application while launch is already in flight.
     std::set<std::string> _launchRequestsInFlight;
     std::set<std::string> _closingAppPackages;
+    // Packages with an accepted uninstall request. They cannot be launched,
+    // refreshed away, or submitted twice until the guest responds.
+    std::set<std::string> _uninstallingAppPackages;
     // When a launch RPC returns a definitive guest-side error during a close
     // transaction, preserve it until the ordered close response arrives. If
     // close also fails, the display is empty and should be removed rather than
@@ -515,8 +632,13 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
     std::set<uint32_t> _activeUserDisplayIds;
 
     MacMuApplicationsCollectionView* _appsCollection;
+    NSMenuItem* _openAppMenuItem;
+    NSMenuItem* _openAppWithSizeMenuItem;
+    NSMenuItem* _uninstallAppMenuItem;
     NSTextField* _appsStatusValue;
     NSTextField* _appsEmptyValue;
+    // Complete launcher catalog and the currently displayed search result.
+    NSMutableArray<NSDictionary*>* _allApps;
     NSMutableArray<NSDictionary*>* _apps;
     // Android Settings is a system entry exposed from the status-item menu,
     // not a tile in the Applications grid.
@@ -525,6 +647,10 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
     // Used by the icon table cell; missing entries fall back to a placeholder.
     NSMutableDictionary<NSString*, NSString*>* _appNames;
     NSMutableDictionary<NSString*, NSImage*>* _appIcons;
+    NSOperationQueue* _apkInstallQueue;
+    NSUInteger _pendingApkInstalls;
+    NSUInteger _successfulApkInstalls;
+    NSMutableArray<NSString*>* _apkInstallErrors;
 
     NSStatusItem* _statusItem;
     NSMenuItem* _machineStatusMenuItem;
@@ -570,8 +696,13 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
     _bootSpinner = nil;
     _bootProgressBar = nil;
     _bootProgressValue = nil;
+    _officialImageButton = nil;
     _createMachineButton = nil;
+    _pendingImageImportSourceURL = nil;
+    _imageSourcePanelOpen = NO;
+    _installApkButton = nil;
     _refreshAppsButton = nil;
+    _appsSearchField = nil;
     _startupRetryButton = nil;
     _startupOverlay = nil;
     _bootPresentationReady = NO;
@@ -585,12 +716,23 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
     _displaySettingsPath = ns_string(_options.appDataDir + "/display-settings.json");
     _defaultDisplaySettings = initial_default_display_settings();
     _appsCollection = nil;
+    _openAppMenuItem = nil;
+    _openAppWithSizeMenuItem = nil;
+    _uninstallAppMenuItem = nil;
     _appsStatusValue = nil;
     _appsEmptyValue = nil;
+    _allApps = [[NSMutableArray alloc] init];
     _apps = [[NSMutableArray alloc] init];
     _androidSettingsEntry = nil;
     _appNames = [[NSMutableDictionary alloc] init];
     _appIcons = [[NSMutableDictionary alloc] init];
+    _apkInstallQueue = [[NSOperationQueue alloc] init];
+    _apkInstallQueue.name = @"dev.macmu.apk-install";
+    _apkInstallQueue.qualityOfService = NSQualityOfServiceUserInitiated;
+    _apkInstallQueue.maxConcurrentOperationCount = 1;
+    _pendingApkInstalls = 0;
+    _successfulApkInstalls = 0;
+    _apkInstallErrors = [[NSMutableArray alloc] init];
     _statusItem = nil;
     _machineStatusMenuItem = nil;
     _machineStatusDetailMenuItem = nil;
@@ -727,6 +869,16 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
 }
 
 - (void)windowDidResignKey:(NSNotification*)notification {
+    NSWindow* window = [notification object];
+    for (const auto& entry : _displayWindows) {
+        if (entry.second.window == window && entry.second.view) {
+            // A physical UHID keyboard retains every key until a later report
+            // releases it. Clear the complete report when host focus leaves
+            // this application window so modifiers cannot remain stuck.
+            macmu_input_view_reset_state(entry.second.view);
+            break;
+        }
+    }
     // AppKit assigns the next key window after sending the resign callback.
     dispatch_async(dispatch_get_main_queue(), ^{
         [self updateDisplayMenu];
@@ -798,6 +950,7 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
 
 - (void)teardownDisplayWindowEntry:(DisplayWindow&)entry {
     if (entry.view) {
+        macmu_input_view_reset_state(entry.view);
         entry.view.paused = YES;
         entry.view.delegate = nil;
         macmu_input_view_set_renderer(entry.view, nil);
@@ -1339,15 +1492,56 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
     NSView* content = [[NSView alloc] initWithFrame:frame];
     _statusWindow.contentView = content;
 
-    // Match the pared-back Finder Applications layout: a single title at the
-    // upper left, one refresh control at the upper right, and no chrome around
-    // the icon grid.
+    // Match the pared-back Finder Applications layout: title at the upper
+    // left, search/install/refresh controls at the upper right, and no chrome
+    // around the icon grid.
     NSTextField* title =
-        make_label(tr(@"Applications"), NSMakeRect(28, frame.size.height - 64, 420, 34));
+        make_label(tr(@"Applications"), NSMakeRect(28, frame.size.height - 64, 240, 34));
     title.font = [NSFont systemFontOfSize:26.0 weight:NSFontWeightBold];
     title.textColor = [NSColor labelColor];
     title.autoresizingMask = NSViewMinYMargin;
     [content addSubview:title];
+
+    _appsSearchField =
+        [[NSSearchField alloc] initWithFrame:NSMakeRect(frame.size.width - 400,
+                                                        frame.size.height - 65, 252, 28)];
+    _appsSearchField.placeholderString = tr(@"Search Applications");
+    _appsSearchField.target = self;
+    _appsSearchField.action = @selector(searchApplications:);
+    _appsSearchField.sendsSearchStringImmediately = YES;
+    _appsSearchField.sendsWholeSearchString = NO;
+    _appsSearchField.autoresizingMask = NSViewMinXMargin | NSViewMinYMargin;
+    _appsSearchField.enabled = NO;
+    [_appsSearchField setAccessibilityLabel:tr(@"Search Applications")];
+    [content addSubview:_appsSearchField];
+
+    NSImage* installImage =
+        [NSImage imageWithSystemSymbolName:@"plus"
+                  accessibilityDescription:tr(@"Install APK…")];
+    if (installImage) {
+        NSImageSymbolConfiguration* configuration =
+            [NSImageSymbolConfiguration configurationWithPointSize:17.0
+                                                            weight:NSFontWeightSemibold];
+        installImage = [installImage imageWithSymbolConfiguration:configuration];
+    }
+    _installApkButton =
+        [[NSButton alloc] initWithFrame:NSMakeRect(frame.size.width - 124,
+                                                   frame.size.height - 73, 44, 44)];
+    _installApkButton.target = self;
+    _installApkButton.action = @selector(chooseApksToInstall:);
+    _installApkButton.image = installImage;
+    _installApkButton.title = installImage ? @"" : @"+";
+    _installApkButton.font = [NSFont systemFontOfSize:20.0 weight:NSFontWeightMedium];
+    _installApkButton.bezelStyle = NSBezelStyleCircular;
+    _installApkButton.buttonType = NSButtonTypeMomentaryPushIn;
+    _installApkButton.imagePosition = installImage ? NSImageOnly : NSNoImage;
+    _installApkButton.imageScaling = NSImageScaleProportionallyDown;
+    _installApkButton.contentTintColor = [NSColor labelColor];
+    _installApkButton.toolTip = tr(@"Install APK…");
+    _installApkButton.autoresizingMask = NSViewMinXMargin | NSViewMinYMargin;
+    _installApkButton.enabled = NO;
+    [_installApkButton setAccessibilityLabel:tr(@"Install APK…")];
+    [content addSubview:_installApkButton];
 
     NSImage* refreshImage =
         [NSImage imageWithSystemSymbolName:@"arrow.clockwise"
@@ -1378,8 +1572,8 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
     [content addSubview:_refreshAppsButton];
 
     NSScrollView* scroll =
-        [[NSScrollView alloc] initWithFrame:NSMakeRect(12, 14, frame.size.width - 24,
-                                                       frame.size.height - 112)];
+        [[NSScrollView alloc] initWithFrame:NSMakeRect(12, 36, frame.size.width - 24,
+                                                       frame.size.height - 134)];
     scroll.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
     scroll.hasVerticalScroller = YES;
     scroll.hasHorizontalScroller = NO;
@@ -1404,17 +1598,25 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
     _appsCollection.backgroundColors = @[ [NSColor clearColor] ];
     _appsCollection.activationTarget = self;
     _appsCollection.activationAction = @selector(openSelectedApplication:);
+    _appsCollection.apkDropTarget = self;
+    _appsCollection.apkDropAction = @selector(installDroppedApks:);
+    _appsCollection.toolTip = nil;
     [_appsCollection registerClass:[MacMuApplicationItem class]
             forItemWithIdentifier:kApplicationItemIdentifier];
 
     NSMenu* appsMenu = [[NSMenu alloc] initWithTitle:tr(@"Applications")];
-    NSMenuItem* openItem = [appsMenu addItemWithTitle:tr(@"Open")
-                                               action:@selector(openSelectedApplication:)
-                                        keyEquivalent:@""];
-    openItem.target = self;
-    NSMenuItem* openAsItem = [appsMenu addItemWithTitle:tr(@"Open with Window Size")
-                                                 action:nil
-                                          keyEquivalent:@""];
+    appsMenu.delegate = self;
+    // menuNeedsUpdate: owns enablement because uninstall availability depends
+    // on package metadata and live application/display transactions.
+    appsMenu.autoenablesItems = NO;
+    _openAppMenuItem = [appsMenu addItemWithTitle:tr(@"Open")
+                                           action:@selector(openSelectedApplication:)
+                                    keyEquivalent:@""];
+    _openAppMenuItem.target = self;
+    _openAppWithSizeMenuItem =
+        [appsMenu addItemWithTitle:tr(@"Open with Window Size")
+                            action:nil
+                     keyEquivalent:@""];
     NSMenu* ratioMenu = [[NSMenu alloc] initWithTitle:tr(@"Open with Window Size")];
     for (size_t i = 0; i < kDisplayLaunchProfileCount; ++i) {
         NSMenuItem* item =
@@ -1424,10 +1626,24 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
         item.target = self;
         item.representedObject = @(i);
     }
-    [appsMenu setSubmenu:ratioMenu forItem:openAsItem];
+    [appsMenu setSubmenu:ratioMenu forItem:_openAppWithSizeMenuItem];
+    [appsMenu addItem:[NSMenuItem separatorItem]];
+    _uninstallAppMenuItem =
+        [appsMenu addItemWithTitle:tr(@"Uninstall…")
+                            action:@selector(uninstallSelectedApplication:)
+                     keyEquivalent:@""];
+    _uninstallAppMenuItem.target = self;
     _appsCollection.menu = appsMenu;
     scroll.documentView = _appsCollection;
     [content addSubview:scroll];
+
+    _appsStatusValue = make_label(tr(@"Waiting for Android…"),
+                                  NSMakeRect(28, 10, frame.size.width - 56, 18));
+    _appsStatusValue.font = [NSFont systemFontOfSize:11.0 weight:NSFontWeightRegular];
+    _appsStatusValue.textColor = [NSColor tertiaryLabelColor];
+    _appsStatusValue.lineBreakMode = NSLineBreakByTruncatingTail;
+    _appsStatusValue.autoresizingMask = NSViewWidthSizable | NSViewMaxYMargin;
+    [content addSubview:_appsStatusValue];
 
     _appsEmptyValue = make_label(tr(@"Waiting for Android to finish starting…"),
                                  NSMakeRect(60, (frame.size.height - 112) / 2.0,
@@ -1519,8 +1735,16 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
     startupHint.autoresizingMask = centeredMask;
     [startupOverlay addSubview:startupHint];
 
-    _createMachineButton = make_button(tr(@"Import Image…"), @selector(prepareDevice:), self,
-                                       NSMakeRect(405, 150, 150, 32));
+    _officialImageButton =
+        make_button(tr(@"Official Image"), @selector(importOfficialSystemImage:), self,
+                    NSMakeRect(390, 150, 180, 32));
+    _officialImageButton.hidden = YES;
+    _officialImageButton.autoresizingMask = centeredMask;
+    _officialImageButton.keyEquivalent = @"\r";
+    [startupOverlay addSubview:_officialImageButton];
+
+    _createMachineButton = make_button(tr(@"Other Source…"), @selector(prepareDevice:), self,
+                                       NSMakeRect(390, 106, 180, 32));
     _createMachineButton.hidden = YES;
     _createMachineButton.autoresizingMask = centeredMask;
     [startupOverlay addSubview:_createMachineButton];
@@ -1624,7 +1848,7 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
                                 : [self defaultDisplayTargetScreen]);
 
     MTKView* view =
-        macmu_input_view_create(frame, _metalDevice, _inputSender, _guestInputSender);
+        macmu_input_view_create(frame, _metalDevice, _inputSender, _guestInputSender, displayId);
     view.colorPixelFormat = MTLPixelFormatBGRA8Unorm;
     view.clearColor = MTLClearColorMake(0.03, 0.03, 0.035, 1.0);
     view.preferredFramesPerSecond =
@@ -1941,21 +2165,49 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
     const bool hasSystemImage = macmu_system_image_exists(_options);
     const bool hasMachine = macmu_machine_exists(_options);
     const bool qemuRunning = [self currentQemuPid] > 0;
+    const bool importing = _imageImportInProgress.load(std::memory_order_acquire);
+    const NSRect centeredActionFrame = NSMakeRect(390, 150, 180, 32);
+    const NSRect officialActionFrame = NSMakeRect(390, 150, 180, 32);
+    const NSRect otherSourceActionFrame = NSMakeRect(390, 106, 180, 32);
+    if (_officialImageButton) {
+        const bool choosingInitialSource = !importing && !hasSystemImage;
+        _officialImageButton.enabled = choosingInitialSource && !qemuRunning;
+        _officialImageButton.hidden = !choosingInitialSource;
+        _officialImageButton.frame = officialActionFrame;
+    }
     if (_createMachineButton) {
-        _createMachineButton.enabled = !qemuRunning && (!hasSystemImage || !hasMachine);
-        _createMachineButton.hidden = hasSystemImage && hasMachine;
-        if (!hasSystemImage) {
-            _createMachineButton.title = tr(@"Import Image…");
+        if (importing) {
+            _createMachineButton.enabled =
+                !qemuRunning && _pendingImageImportSourceURL == nil;
+            _createMachineButton.hidden = NO;
+            _createMachineButton.title =
+                _pendingImageImportSourceURL != nil
+                    ? tr(@"Switching Image Source…")
+                    : tr(@"Choose Another Image…");
+            _createMachineButton.frame = centeredActionFrame;
+        } else if (!hasSystemImage) {
+            _createMachineButton.enabled = !qemuRunning;
+            _createMachineButton.hidden = NO;
+            _createMachineButton.title = tr(@"Other Source…");
+            _createMachineButton.frame = otherSourceActionFrame;
         } else if (!hasMachine) {
+            _createMachineButton.enabled = !qemuRunning;
+            _createMachineButton.hidden = NO;
             _createMachineButton.title = tr(@"Prepare Device");
+            _createMachineButton.frame = centeredActionFrame;
         } else {
+            _createMachineButton.enabled = NO;
+            _createMachineButton.hidden = YES;
             _createMachineButton.title = tr(@"Device Ready");
         }
     }
-    if (!_agentConnected) {
+    // Import progress owns the startup presentation while an image source is
+    // active. Do not replace it with the idle "System image required" state,
+    // especially for complete ZIP imports which do not emit chunk progress.
+    if (!_agentConnected && !importing) {
         if (!hasSystemImage) {
             [self updateBootPresentation:tr(@"System image required")
-                                   detail:tr(@"Import a MacMu Android 16 image to continue.")
+                                   detail:tr(@"Choose the official image or another source to continue.")
                                     stage:tr(@"SETUP")
                                      busy:NO
                                      ready:NO];
@@ -1977,11 +2229,17 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
 }
 
 - (void)prepareDevice:(id)sender {
-    if (!macmu_system_image_exists(_options)) {
+    if (_imageImportInProgress.load(std::memory_order_acquire) ||
+        !macmu_system_image_exists(_options)) {
         [self importSystemImage:sender];
         return;
     }
     [self createMachine:sender];
+}
+
+- (void)importOfficialSystemImage:(id)sender {
+    NSString* source = ns_string(macmu::kDefaultImageManifestUrl);
+    [self importSystemImageSource:[NSURL URLWithString:source]];
 }
 
 - (void)importSystemImage:(id)sender {
@@ -1990,23 +2248,29 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
         NSBeep();
         return;
     }
+    if (_imageSourcePanelOpen) {
+        return;
+    }
 
     [self showStatusWindow:nil];
     NSOpenPanel* panel = [NSOpenPanel openPanel];
     panel.title = tr(@"Import MacMu System Image");
-    panel.message = tr(@"Choose a complete image zip or a chunk manifest.");
+    panel.message = tr(@"Choose a complete image ZIP, a chunk manifest, or a folder containing manifest.json.");
     panel.prompt = tr(@"Import");
     panel.canChooseFiles = YES;
-    panel.canChooseDirectories = NO;
+    panel.canChooseDirectories = YES;
     panel.allowsMultipleSelection = NO;
+    panel.resolvesAliases = YES;
     panel.allowedContentTypes = @[
         [UTType typeWithIdentifier:@"public.zip-archive"],
         [UTType typeWithIdentifier:@"public.json"]
     ];
 
+    _imageSourcePanelOpen = YES;
     MacMuAppDelegate* delegate = self;
     [panel beginSheetModalForWindow:_statusWindow
                   completionHandler:^(NSModalResponse result) {
+                      delegate->_imageSourcePanelOpen = NO;
                       if (result != NSModalResponseOK || panel.URL == nil) {
                           return;
                       }
@@ -2015,6 +2279,14 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
 }
 
 - (void)importSystemImageSource:(NSURL*)sourceURL {
+    if ([self isShuttingDown]) {
+        return;
+    }
+    if ([self currentQemuPid] > 0) {
+        [self publishQemuStatus:tr(@"Quit MacMu before importing an image")];
+        NSBeep();
+        return;
+    }
     ShellOptions options = _options;
     NSString* source =
         sourceURL.isFileURL ? sourceURL.path : sourceURL.absoluteString;
@@ -2023,13 +2295,22 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
         return;
     }
 
-    _imageImportFailed.store(false, std::memory_order_release);
-    _imageImportInProgress.store(true, std::memory_order_release);
-    [self publishQemuStatus:tr(@"Importing system image")];
-    if (_createMachineButton) {
-        _createMachineButton.enabled = NO;
-        _createMachineButton.hidden = YES;
+    if (_imageImportInProgress.load(std::memory_order_acquire)) {
+        _pendingImageImportSourceURL = [sourceURL copy];
+        macmu_cancel_system_image_import();
+        [self publishBootPresentation:tr(@"Switching image source")
+                                detail:tr(@"Stopping the current import before opening the selected image…")
+                                 stage:tr(@"WORKING")
+                                  busy:YES
+                                 ready:NO];
+        [self updateMachineControls];
+        return;
     }
+
+    _imageImportInProgress.store(true, std::memory_order_release);
+    _imageImportFailed.store(false, std::memory_order_release);
+    [self publishQemuStatus:tr(@"Importing system image")];
+    [self updateMachineControls];
 
     MacMuAppDelegate* delegate = self;
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
@@ -2104,6 +2385,17 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
             }
 
             dispatch_async(dispatch_get_main_queue(), ^{
+                NSURL* pendingSource = delegate->_pendingImageImportSourceURL;
+                delegate->_pendingImageImportSourceURL = nil;
+                if (pendingSource != nil) {
+                    // Keep the supervisor blocked across the hand-off. The new
+                    // import sets _imageImportInProgress before clearing this
+                    // temporary failure flag, so there is no launch window.
+                    delegate->_imageImportFailed.store(true, std::memory_order_release);
+                    delegate->_imageImportInProgress.store(false, std::memory_order_release);
+                    [delegate importSystemImageSource:pendingSource];
+                    return;
+                }
                 delegate->_imageImportFailed.store(!ok, std::memory_order_release);
                 delegate->_imageImportInProgress.store(false, std::memory_order_release);
                 [delegate updateMachineControls];
@@ -2275,6 +2567,10 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
                                                                       resolvedDetail]
                                          : resolvedTitle;
     }
+    // APK installation (button and drag destination) is deliberately exposed
+    // only after the ready presentation and application catalog agree that
+    // startup is complete.
+    [self updateApplicationActions];
 }
 
 - (void)publishBootPresentation:(NSString*)title
@@ -2321,7 +2617,16 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
     if (!_appsLoaded) {
         return;
     }
-    const NSUInteger total = _apps.count;
+    const NSUInteger total = _allApps.count;
+    const NSUInteger visible = _apps.count;
+    NSString* query = [_appsSearchField.stringValue
+        stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (query.length > 0) {
+        [self setAppsStatus:[NSString stringWithFormat:tr(@"%lu of %lu applications"),
+                                                       static_cast<unsigned long>(visible),
+                                                       static_cast<unsigned long>(total)]];
+        return;
+    }
     const auto isCatalogApplication = [](const std::string& packageName) {
         return packageName != kAndroidSettingsPackage;
     };
@@ -2356,8 +2661,24 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
 }
 
 - (void)updateApplicationActions {
+    const BOOL startupComplete =
+        _agentConnected && _appsLoaded && _bootPresentationReady;
+    const BOOL canManageApks = startupComplete && ![self isShuttingDown] &&
+                               _uninstallingAppPackages.empty();
     if (_refreshAppsButton) {
-        _refreshAppsButton.enabled = _agentConnected;
+        _refreshAppsButton.enabled = _agentConnected && _pendingApkInstalls == 0 &&
+                                     _uninstallingAppPackages.empty();
+    }
+    if (_installApkButton) {
+        _installApkButton.enabled = canManageApks;
+    }
+    if (_appsSearchField) {
+        _appsSearchField.enabled = _appsLoaded;
+    }
+    if (_appsCollection) {
+        _appsCollection.apkDropEnabled = canManageApks;
+        _appsCollection.toolTip =
+            canManageApks ? tr(@"Drop APK files here to install") : nil;
     }
     if (_androidSettingsMenuItem) {
         _androidSettingsMenuItem.enabled = _agentConnected && _androidSettingsEntry != nil;
@@ -2369,10 +2690,13 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
 }
 
 - (void)clearApplicationCatalog {
+    _appsLoaded = false;
+    [_allApps removeAllObjects];
     [_apps removeAllObjects];
     _androidSettingsEntry = nil;
     [_appNames removeAllObjects];
     [_appIcons removeAllObjects];
+    _appsCollection.selectionIndexPaths = [NSSet set];
     [_appsCollection reloadData];
     _appsEmptyValue.hidden = NO;
     [self updateApplicationActions];
@@ -2610,6 +2934,174 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
 
 #pragma mark - Applications
 
+- (void)installDroppedApks:(MacMuApplicationsCollectionView*)sender {
+    [self installApkURLs:[sender.droppedApkURLs copy]];
+}
+
+- (void)chooseApksToInstall:(id)sender {
+    if ([self isShuttingDown] || !_guestControlClient || !_guestControlClient->ready() ||
+        !_agentConnected || !_appsLoaded || !_bootPresentationReady ||
+        !_uninstallingAppPackages.empty()) {
+        [self setAppsStatus:!_uninstallingAppPackages.empty()
+                                ? tr(@"Wait for application uninstall to finish")
+                                : tr(@"Waiting for Android…")];
+        NSBeep();
+        return;
+    }
+
+    NSOpenPanel* panel = [NSOpenPanel openPanel];
+    panel.title = tr(@"Choose APK Files");
+    panel.message = tr(@"Choose one or more APK files to install.");
+    panel.prompt = tr(@"Install");
+    panel.canChooseFiles = YES;
+    panel.canChooseDirectories = NO;
+    panel.allowsMultipleSelection = YES;
+    UTType* apkType = [UTType typeWithFilenameExtension:@"apk"];
+    if (apkType) {
+        panel.allowedContentTypes = @[ apkType ];
+    }
+
+    MacMuAppDelegate* delegate = self;
+    [panel beginSheetModalForWindow:_statusWindow
+                  completionHandler:^(NSModalResponse result) {
+                      if (result != NSModalResponseOK || panel.URLs.count == 0) {
+                          return;
+                      }
+                      [delegate installApkURLs:panel.URLs];
+                  }];
+}
+
+- (void)installApkURLs:(NSArray<NSURL*>*)urls {
+    if ([self isShuttingDown] || !_guestControlClient || !_guestControlClient->ready() ||
+        !_agentConnected || !_appsLoaded || !_bootPresentationReady ||
+        !_uninstallingAppPackages.empty()) {
+        [self setAppsStatus:!_uninstallingAppPackages.empty()
+                                ? tr(@"Wait for application uninstall to finish")
+                                : tr(@"Waiting for Android…")];
+        NSBeep();
+        return;
+    }
+    NSMutableArray<NSURL*>* apkURLs = [NSMutableArray array];
+    for (id candidate in urls) {
+        if (![candidate isKindOfClass:[NSURL class]]) {
+            continue;
+        }
+        NSURL* url = (NSURL*)candidate;
+        if (url.isFileURL &&
+            [url.pathExtension caseInsensitiveCompare:@"apk"] == NSOrderedSame) {
+            [apkURLs addObject:url];
+        }
+    }
+    if (apkURLs.count == 0) {
+        if (urls.count > 0) {
+            [self setAppsStatus:tr(@"Only APK files can be installed")];
+            NSBeep();
+        }
+        return;
+    }
+
+    if (_pendingApkInstalls == 0) {
+        _successfulApkInstalls = 0;
+        [_apkInstallErrors removeAllObjects];
+    }
+    _pendingApkInstalls += apkURLs.count;
+    [self updateApplicationActions];
+
+    MacMuAppDelegate* delegate = self;
+    for (NSURL* url in apkURLs) {
+        NSString* fileName = url.lastPathComponent.length > 0 ? url.lastPathComponent : @"APK";
+        [_apkInstallQueue addOperationWithBlock:^{
+            @autoreleasepool {
+                if ([delegate isShuttingDown]) {
+                    return;
+                }
+                const BOOL securityScope = [url startAccessingSecurityScopedResource];
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    if (![delegate isShuttingDown]) {
+                        [delegate setAppsStatus:[NSString
+                            stringWithFormat:tr(@"Installing %@…"), fileName]];
+                    }
+                });
+
+                dispatch_semaphore_t finished = dispatch_semaphore_create(0);
+                const char* fileSystemPath = url.fileSystemRepresentation;
+                if (!fileSystemPath || !delegate->_guestControlClient) {
+                    dispatch_async(dispatch_get_main_queue(), ^{
+                        [delegate apkInstallFinished:fileName
+                                                 ok:NO
+                                              error:tr(@"The APK path is unavailable")];
+                    });
+                    dispatch_semaphore_signal(finished);
+                } else {
+                    const std::string path(fileSystemPath);
+                    delegate->_guestControlClient->install_apk(
+                        path, 10 * 60 * 1000,
+                        [delegate, fileName, finished](bool ok, std::string payload) {
+                            dispatch_async(dispatch_get_main_queue(), ^{
+                                [delegate apkInstallFinished:fileName
+                                                         ok:ok ? YES : NO
+                                                      error:ns_string(payload)];
+                            });
+                            dispatch_semaphore_signal(finished);
+                        });
+                }
+                dispatch_semaphore_wait(finished, DISPATCH_TIME_FOREVER);
+                if (securityScope) {
+                    [url stopAccessingSecurityScopedResource];
+                }
+            }
+        }];
+    }
+}
+
+- (void)apkInstallFinished:(NSString*)fileName ok:(BOOL)ok error:(NSString*)error {
+    if ([self isShuttingDown]) {
+        return;
+    }
+    if (_pendingApkInstalls > 0) {
+        --_pendingApkInstalls;
+    }
+    if (ok) {
+        ++_successfulApkInstalls;
+    } else {
+        NSString* detail = error.length > 0 ? error : tr(@"Unknown installation error");
+        [_apkInstallErrors
+            addObject:[NSString stringWithFormat:@"%@: %@", fileName, detail]];
+    }
+
+    [self updateApplicationActions];
+    if (_pendingApkInstalls > 0) {
+        [self setAppsStatus:[NSString stringWithFormat:tr(@"Installing APK files… %lu remaining"),
+                                                       static_cast<unsigned long>(_pendingApkInstalls)]];
+        return;
+    }
+
+    const NSUInteger installed = _successfulApkInstalls;
+    NSArray<NSString*>* errors = [_apkInstallErrors copy];
+    _successfulApkInstalls = 0;
+    [_apkInstallErrors removeAllObjects];
+
+    if (installed > 0) {
+        [self setAppsStatus:installed == 1
+                                ? tr(@"APK installed. Refreshing applications…")
+                                : [NSString stringWithFormat:
+                                      tr(@"%lu APK files installed. Refreshing applications…"),
+                                      static_cast<unsigned long>(installed)]];
+        [self refreshApps:nil];
+    } else if (errors.count > 0) {
+        [self setAppsStatus:errors.firstObject];
+    }
+
+    if (errors.count > 0 && _statusWindow) {
+        NSAlert* alert = [[NSAlert alloc] init];
+        alert.alertStyle = NSAlertStyleWarning;
+        alert.messageText = errors.count == 1 ? tr(@"Could not install APK")
+                                              : tr(@"Could not install APK files");
+        alert.informativeText = [errors componentsJoinedByString:@"\n\n"];
+        [alert beginSheetModalForWindow:_statusWindow completionHandler:nil];
+    }
+}
+
 - (void)setAppsStatus:(NSString*)status {
     void (^update)(void) = ^{
         if (self->_appsStatusValue) {
@@ -2629,6 +3121,20 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
 
 - (void)refreshApps:(id)sender {
     if ([self isShuttingDown]) {
+        return;
+    }
+    if (_pendingApkInstalls > 0) {
+        [self setAppsStatus:tr(@"Wait for APK installation to finish")];
+        if (sender) {
+            NSBeep();
+        }
+        return;
+    }
+    if (!_uninstallingAppPackages.empty()) {
+        [self setAppsStatus:tr(@"Wait for application uninstall to finish")];
+        if (sender) {
+            NSBeep();
+        }
         return;
     }
     if (!_guestControlClient || !_guestControlClient->ready()) {
@@ -2673,6 +3179,7 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
 }
 
 - (void)applyAppList:(NSArray*)entries {
+    [_allApps removeAllObjects];
     [_apps removeAllObjects];
     [_appNames removeAllObjects];
     [_appIcons removeAllObjects];
@@ -2715,45 +3222,271 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
             _androidSettingsEntry = dict;
             continue;
         }
-        [_apps addObject:dict];
+        [_allApps addObject:dict];
     }
     // Sort by friendly name when available, else by package — names make the
     // list more scannable than raw package ids.
-    [_apps sortUsingComparator:^NSComparisonResult(NSDictionary* a, NSDictionary* b) {
+    [_allApps sortUsingComparator:^NSComparisonResult(NSDictionary* a, NSDictionary* b) {
         NSString* nameA = _appNames[a[@"pkg"]] ?: a[@"pkg"];
         NSString* nameB = _appNames[b[@"pkg"]] ?: b[@"pkg"];
         return [nameA localizedCaseInsensitiveCompare:nameB];
     }];
     _appsLoaded = true;
-    [_appsCollection reloadData];
+    [self applyApplicationSearchFilter];
     for (const auto& binding : _displayAppBindings) {
         [self updateApplicationWindowTitleForDisplay:binding.first];
     }
-    _appsEmptyValue.hidden = _apps.count > 0;
-    [self updateApplicationsSummary];
-    [self updateApplicationActions];
-    NSString* detail = _apps.count == 0
+    NSString* detail = _allApps.count == 0
                            ? tr(@"Android is ready, but no launcher applications were found.")
                            : [NSString stringWithFormat:tr(@"%lu applications are ready to open."),
-                                                        static_cast<unsigned long>(_apps.count)];
+                                                        static_cast<unsigned long>(_allApps.count)];
     [self updateBootPresentation:tr(@"Ready")
                            detail:detail
                             stage:tr(@"READY")
                              busy:NO
                              ready:YES];
     NSLog(@"MacMu application catalog ready (%lu applications; Android Settings %@).",
-          static_cast<unsigned long>(_apps.count),
+          static_cast<unsigned long>(_allApps.count),
           _androidSettingsEntry ? @"available in status menu" : @"not found");
 
 }
 
-- (NSString*)selectedAppComponent {
+- (void)searchApplications:(id)sender {
+    [self applyApplicationSearchFilter];
+}
+
+- (void)applyApplicationSearchFilter {
+    if (!_appsLoaded) {
+        return;
+    }
+
+    NSString* query = [_appsSearchField.stringValue
+        stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    NSMutableArray<NSString*>* terms = [NSMutableArray array];
+    for (NSString* term in
+         [query componentsSeparatedByCharactersInSet:
+                    [NSCharacterSet whitespaceAndNewlineCharacterSet]]) {
+        if (term.length > 0) {
+            [terms addObject:term];
+        }
+    }
+
+    [_apps removeAllObjects];
+    for (NSDictionary* app in _allApps) {
+        NSString* package = [app[@"pkg"] isKindOfClass:[NSString class]] ? app[@"pkg"] : @"";
+        NSString* activity =
+            [app[@"activity"] isKindOfClass:[NSString class]] ? app[@"activity"] : @"";
+        NSString* name = _appNames[package] ?: package;
+        NSString* searchable = [NSString stringWithFormat:@"%@ %@ %@", name, package, activity];
+        BOOL matches = YES;
+        for (NSString* term in terms) {
+            if ([searchable rangeOfString:term
+                                  options:NSCaseInsensitiveSearch | NSDiacriticInsensitiveSearch]
+                    .location == NSNotFound) {
+                matches = NO;
+                break;
+            }
+        }
+        if (matches) {
+            [_apps addObject:app];
+        }
+    }
+
+    _appsCollection.selectionIndexPaths = [NSSet set];
+    [_appsCollection reloadData];
+    _appsEmptyValue.hidden = _apps.count > 0;
+    [self updateApplicationsSummary];
+    [self updateApplicationActions];
+    if (_apps.count == 0) {
+        _appsEmptyValue.stringValue = query.length > 0
+                                         ? [NSString stringWithFormat:
+                                               tr(@"No applications match “%@”."), query]
+                                         : tr(@"Android is ready, but no launcher applications were found.");
+        _appsEmptyValue.hidden = NO;
+    }
+}
+
+- (NSDictionary*)selectedApplication {
     NSIndexPath* indexPath = _appsCollection.selectionIndexPaths.anyObject;
     if (!indexPath || indexPath.item >= _apps.count) {
         return nil;
     }
-    NSDictionary* app = _apps[indexPath.item];
+    return _apps[indexPath.item];
+}
+
+- (NSString*)selectedAppComponent {
+    NSDictionary* app = [self selectedApplication];
+    if (!app) {
+        return nil;
+    }
     return [NSString stringWithFormat:@"%@/%@", app[@"pkg"], app[@"activity"]];
+}
+
+- (void)menuNeedsUpdate:(NSMenu*)menu {
+    if (!_appsCollection || menu != _appsCollection.menu) {
+        return;
+    }
+
+    NSDictionary* app = [self selectedApplication];
+    NSString* package = [app[@"pkg"] isKindOfClass:[NSString class]] ? app[@"pkg"] : nil;
+    NSString* name = package ? (_appNames[package] ?: package) : nil;
+    const std::string packageName = package ? std::string(package.UTF8String) : std::string();
+    const BOOL uninstalling = !packageName.empty() &&
+                              _uninstallingAppPackages.count(packageName) > 0;
+    const BOOL runningOrTransitioning =
+        !packageName.empty() &&
+        (_appDisplayBindings.count(packageName) > 0 ||
+         _pendingAppPackages.count(packageName) > 0 ||
+         _closingAppPackages.count(packageName) > 0);
+
+    const BOOL canOpen = app != nil && _agentConnected && !uninstalling &&
+                         _pendingApkInstalls == 0 && _uninstallingAppPackages.empty();
+    _openAppMenuItem.enabled = canOpen;
+    _openAppWithSizeMenuItem.enabled = canOpen;
+
+    _uninstallAppMenuItem.toolTip = nil;
+    if (!app || !package) {
+        _uninstallAppMenuItem.title = tr(@"Uninstall…");
+        _uninstallAppMenuItem.enabled = NO;
+        return;
+    }
+    if (uninstalling) {
+        _uninstallAppMenuItem.title = tr(@"Uninstalling…");
+        _uninstallAppMenuItem.enabled = NO;
+        return;
+    }
+
+    NSNumber* uninstallableValue = app[@"uninstallable"];
+    const BOOL hasUninstallMetadata =
+        [uninstallableValue isKindOfClass:[NSNumber class]];
+    const BOOL system = [app[@"system"] isKindOfClass:[NSNumber class]] &&
+                        [app[@"system"] boolValue];
+    if (system) {
+        _uninstallAppMenuItem.title = tr(@"System Application — Cannot Uninstall");
+        _uninstallAppMenuItem.toolTip =
+            tr(@"System applications are part of the Android system image.");
+        _uninstallAppMenuItem.enabled = NO;
+        return;
+    }
+    if (!hasUninstallMetadata || !uninstallableValue.boolValue) {
+        _uninstallAppMenuItem.title = tr(@"Uninstall Unavailable");
+        _uninstallAppMenuItem.enabled = NO;
+        return;
+    }
+    if (runningOrTransitioning) {
+        _uninstallAppMenuItem.title = tr(@"Close Application Before Uninstalling");
+        _uninstallAppMenuItem.enabled = NO;
+        return;
+    }
+
+    _uninstallAppMenuItem.title =
+        [NSString stringWithFormat:tr(@"Uninstall “%@”…"), name];
+    _uninstallAppMenuItem.enabled = _agentConnected && _pendingApkInstalls == 0;
+}
+
+- (void)uninstallSelectedApplication:(id)sender {
+    if ([self isShuttingDown]) {
+        return;
+    }
+    NSDictionary* app = [self selectedApplication];
+    NSString* package = [app[@"pkg"] isKindOfClass:[NSString class]] ? app[@"pkg"] : nil;
+    if (!app || !package) {
+        NSBeep();
+        return;
+    }
+    NSString* name = _appNames[package] ?: package;
+    const std::string packageName(package.UTF8String);
+    const BOOL system = [app[@"system"] isKindOfClass:[NSNumber class]] &&
+                        [app[@"system"] boolValue];
+    NSNumber* uninstallable = app[@"uninstallable"];
+    if (system || ![uninstallable isKindOfClass:[NSNumber class]] ||
+        !uninstallable.boolValue) {
+        NSAlert* alert = [[NSAlert alloc] init];
+        alert.alertStyle = NSAlertStyleWarning;
+        alert.messageText = system ? tr(@"Cannot Uninstall System Application")
+                                   : tr(@"Cannot Uninstall Application");
+        alert.informativeText = system
+                                    ? [NSString stringWithFormat:
+                                          tr(@"%@ is part of the Android system image."), name]
+                                    : [NSString stringWithFormat:
+                                          tr(@"MacMu could not verify that %@ is removable."), name];
+        [alert beginSheetModalForWindow:_statusWindow completionHandler:nil];
+        return;
+    }
+    if (_appDisplayBindings.count(packageName) > 0 ||
+        _pendingAppPackages.count(packageName) > 0 ||
+        _closingAppPackages.count(packageName) > 0) {
+        [self setAppsStatus:[NSString stringWithFormat:
+                                  tr(@"Close %@ before uninstalling it."), name]];
+        NSBeep();
+        return;
+    }
+    if (!_guestControlClient || !_guestControlClient->ready() ||
+        _pendingApkInstalls > 0 || _uninstallingAppPackages.count(packageName) > 0) {
+        [self setAppsStatus:tr(@"Waiting for Android…")];
+        NSBeep();
+        return;
+    }
+
+    NSAlert* alert = [[NSAlert alloc] init];
+    alert.alertStyle = NSAlertStyleWarning;
+    alert.messageText = [NSString stringWithFormat:tr(@"Uninstall “%@”?"), name];
+    alert.informativeText = tr(@"This removes the application and its data from Android.");
+    [alert addButtonWithTitle:tr(@"Uninstall")];
+    [alert addButtonWithTitle:tr(@"Cancel")];
+    if (@available(macOS 11.0, *)) {
+        alert.buttons.firstObject.hasDestructiveAction = YES;
+    }
+
+    MacMuAppDelegate* delegate = self;
+    [alert beginSheetModalForWindow:_statusWindow
+                  completionHandler:^(NSModalResponse response) {
+        if (response != NSAlertFirstButtonReturn || [delegate isShuttingDown]) {
+            return;
+        }
+        if (!delegate->_guestControlClient || !delegate->_guestControlClient->ready()) {
+            [delegate setAppsStatus:tr(@"Waiting for Android…")];
+            return;
+        }
+
+        delegate->_uninstallingAppPackages.insert(packageName);
+        [delegate->_appsCollection reloadData];
+        [delegate updateApplicationActions];
+        [delegate setAppsStatus:[NSString stringWithFormat:tr(@"Uninstalling %@…"), name]];
+
+        std::string command = "uninstall " + packageName;
+        delegate->_guestControlClient->request(
+            command, 60000,
+            [delegate, packageName, name](bool ok, std::string payload) {
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    if ([delegate isShuttingDown]) {
+                        return;
+                    }
+                    delegate->_uninstallingAppPackages.erase(packageName);
+                    [delegate->_appsCollection reloadData];
+                    [delegate updateApplicationActions];
+                    if (ok) {
+                        [delegate setAppsStatus:[NSString stringWithFormat:
+                                                     tr(@"%@ uninstalled. Refreshing applications…"),
+                                                     name]];
+                        [delegate refreshApps:nil];
+                        return;
+                    }
+
+                    NSString* detail = payload.empty() ? tr(@"Unknown uninstall error")
+                                                       : ns_string(payload);
+                    [delegate setAppsStatus:[NSString stringWithFormat:
+                                                  tr(@"Could not uninstall %@: %@"), name, detail]];
+                    NSAlert* failure = [[NSAlert alloc] init];
+                    failure.alertStyle = NSAlertStyleWarning;
+                    failure.messageText =
+                        [NSString stringWithFormat:tr(@"Could not uninstall %@"), name];
+                    failure.informativeText = detail;
+                    [failure beginSheetModalForWindow:delegate->_statusWindow
+                                     completionHandler:nil];
+                });
+            });
+    }];
 }
 
 - (void)openSelectedApplication:(id)sender {
@@ -2818,6 +3551,11 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
     }
     const std::string componentValue = [component UTF8String];
     const std::string packageName = package_from_component(componentValue);
+    if (!_uninstallingAppPackages.empty()) {
+        [self setAppsStatus:tr(@"Wait for application uninstall to finish")];
+        NSBeep();
+        return;
+    }
     auto existingApp = _appDisplayBindings.find(packageName);
     if (existingApp != _appDisplayBindings.end()) {
         const uint32_t existingDisplayId = existingApp->second;
@@ -2836,6 +3574,11 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
         [self setAppsStatus:_pendingAppPackages.count(packageName) > 0
                                 ? [NSString stringWithFormat:tr(@"Opening %@…"), name]
                                 : [NSString stringWithFormat:tr(@"%@ is already open"), name]];
+        return;
+    }
+    if (_pendingApkInstalls > 0) {
+        [self setAppsStatus:tr(@"Wait for APK installation to finish")];
+        NSBeep();
         return;
     }
     if (!_agentConnected) {
@@ -3097,9 +3840,12 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
     const BOOL bound = _appDisplayBindings.find(packageName) != _appDisplayBindings.end();
     const BOOL opening = _pendingAppPackages.find(packageName) != _pendingAppPackages.end();
     const BOOL closing = _closingAppPackages.find(packageName) != _closingAppPackages.end();
+    const BOOL uninstalling =
+        _uninstallingAppPackages.find(packageName) != _uninstallingAppPackages.end();
     [item setApplicationRunning:bound && !opening && !closing
                          opening:opening
-                         closing:closing];
+                         closing:closing
+                    uninstalling:uninstalling];
     return item;
 }
 
@@ -3129,7 +3875,7 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
         }
         if (!macmu_system_image_exists(_options)) {
             [self publishBootPresentation:tr(@"System image required")
-                                    detail:tr(@"Import a MacMu Android 16 image to continue.")
+                                    detail:tr(@"Choose the official image or another source to continue.")
                                      stage:tr(@"SETUP")
                                       busy:NO
                                      ready:NO];
@@ -3429,9 +4175,11 @@ static NSUserInterfaceItemIdentifier const kApplicationItemIdentifier =
 - (void)performRuntimeShutdown {
     [self stopDoorbellThread];
     [self stopGuestInputSender];
+    [_apkInstallQueue cancelAllOperations];
     if (_guestControlClient) {
         _guestControlClient->stop();
     }
+    [_apkInstallQueue waitUntilAllOperationsAreFinished];
 
     const pid_t pid = [self currentQemuPid];
     if (pid > 0) {

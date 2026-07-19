@@ -3,12 +3,14 @@
 #ifndef MACMU_SHELL_GUEST_INPUT_SENDER_H
 #define MACMU_SHELL_GUEST_INPUT_SENDER_H
 
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <mutex>
 #include <string>
 #include <thread>
 
+#include "hid_keyboard.h"
 #include "macmu_input_protocol.h"
 
 class GuestInputSender {
@@ -34,6 +36,9 @@ public:
                     int y);
     bool send_mouse_move(uint32_t display_id, int x, int y, uint32_t buttons);
     bool send_mouse_button(uint32_t display_id, int x, int y, uint32_t buttons);
+    bool send_keyboard_report(
+        uint32_t display_id,
+        const std::array<uint8_t, macmu::shell::kHidKeyboardReportSize>& report);
 
 private:
     void accept_thread();

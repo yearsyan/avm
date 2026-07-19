@@ -10,8 +10,12 @@
 //   agent -> host:  "ok\n" handshake reply, then "<id> ok [payload]\n"
 //                   or "<id> err [message]\n"
 // Payloads are single-line (the agent uses JSON for structured data).
-// Commands include app discovery/lifecycle plus "display-state <id>", which
-// returns the Android logical width, height, and rotation for orientation sync.
+// Commands include app discovery/lifecycle/uninstall plus "display-state
+// <id>", which returns the Android logical width, height, and rotation for
+// orientation sync.
+// APK installation is the one binary extension: "<id> install <size>\n" is
+// followed immediately by exactly |size| APK bytes. The response remains an
+// ordinary line, so it shares the existing pending-request machinery.
 
 #ifndef MACMU_SHELL_GUEST_CONTROL_CLIENT_H
 #define MACMU_SHELL_GUEST_CONTROL_CLIENT_H
@@ -49,6 +53,14 @@ class GuestControlClient {
     // |timeout_ms| (approximate; enforced by the reader thread's sweep).
     void request(const std::string& command, uint64_t timeout_ms, ResponseCallback callback);
 
+    // Stream one host APK into the guest and request a replace/test install.
+    // File transfer is synchronous, so callers must invoke this from a worker
+    // thread. Completion remains asynchronous and fires on the reader thread.
+    // At most one APK transfer may be active at a time; normal line requests
+    // fail fast while its binary payload owns the stream.
+    void install_apk(const std::string& apk_path, uint64_t timeout_ms,
+                     ResponseCallback callback);
+
    private:
     void accept_thread();
     void serve_connection(int fd);
@@ -62,6 +74,7 @@ class GuestControlClient {
     std::atomic<bool> stopRequested_{false};
     std::thread acceptThread_;
     std::mutex writeMutex_;
+    std::atomic<bool> fileTransferActive_{false};
     ConnectionCallback connectionCallback_;
     macmu::shell::PendingRequestTable<uint64_t, ResponseCallback> pending_;
     std::atomic<uint64_t> nextRequestId_{1};

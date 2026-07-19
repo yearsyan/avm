@@ -27,9 +27,10 @@ struct ImageImportProgress {
 using ImageImportProgressCallback =
     std::function<void(const ImageImportProgress &progress)>;
 
-// Extracts either a complete MacMu image ZIP or a v2 chunk manifest into
-// |destination_root|. Chunk objects can be local siblings of the manifest or
-// HTTPS resources. Remote objects are resumed and cached under appDataDir.
+// Extracts either a complete MacMu image ZIP, a v2 chunk manifest, or a local
+// directory containing manifest.json into |destination_root|. Chunk objects
+// can be local siblings of the manifest or HTTPS resources. Remote objects are
+// resumed and cached under appDataDir.
 bool macmu_extract_system_image_source(
     const ShellOptions &options, const std::string &source,
     const std::string &destination_root,

@@ -13,7 +13,8 @@ class GuestInputSender;
 MTKView* macmu_input_view_create(NSRect frame,
                                  id<MTLDevice> device,
                                  InputSender* input_sender,
-                                 GuestInputSender* guest_input_sender);
+                                 GuestInputSender* guest_input_sender,
+                                 uint32_t display_id);
 
 void macmu_input_view_set_renderer(MTKView* view, MacMuSurfaceRendererRef renderer);
 void macmu_input_view_reset_state(MTKView* view);

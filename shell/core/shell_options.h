@@ -31,10 +31,11 @@ struct ShellOptions {
     // Optional complete image ZIP, local chunk manifest, or HTTPS chunk
     // manifest imported automatically when the managed system image is absent.
     std::string imageImportSource;
-    // When no explicit imageImportSource is provided, import MacMu's hosted
-    // default manifest on first launch. Development runs can disable this with
-    // --no-auto-image-import or MACMU_AUTO_IMPORT_IMAGE=0.
-    bool autoImportDefaultImage = true;
+    // Opt-in unattended import of MacMu's hosted official manifest when no
+    // explicit imageImportSource is provided. Normal first launch waits for
+    // the user to choose Official Image or Other Source. Automation can enable
+    // this with --auto-image-import or MACMU_AUTO_IMPORT_IMAGE=1.
+    bool autoImportDefaultImage = false;
     // Host Unix domain socket used by the guest MacMu RPC agent through
     // virtio-vsock's pipe:unix transport (input events, fire-and-forget).
     std::string guestRpcSocketPath;

@@ -22,6 +22,7 @@ add_executable(macmu_shell
     core/frame_consumer.cpp
     core/guest_control_client.cpp
     core/guest_input_sender.cpp
+    core/hid_keyboard.cpp
     core/image_importer.mm
     core/input_sender.cpp
     core/machine_manager.cpp
@@ -254,6 +255,27 @@ install(FILES resources/MacMu.icns
 )
 
 if(BUILD_TESTING)
+    add_executable(macmu_hid_keyboard_test
+        tests/hid_keyboard_test.cpp
+        core/hid_keyboard.cpp
+    )
+    target_include_directories(macmu_hid_keyboard_test PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/core"
+    )
+    target_compile_features(macmu_hid_keyboard_test PRIVATE cxx_std_17)
+    add_test(NAME macmu_hid_keyboard_test COMMAND macmu_hid_keyboard_test)
+
+    add_executable(macmu_guest_control_client_test
+        tests/guest_control_client_test.cpp
+        core/guest_control_client.cpp
+    )
+    target_include_directories(macmu_guest_control_client_test PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/core"
+        "${CMAKE_CURRENT_SOURCE_DIR}/protocol"
+    )
+    target_compile_features(macmu_guest_control_client_test PRIVATE cxx_std_17)
+    add_test(NAME macmu_guest_control_client_test COMMAND macmu_guest_control_client_test)
+
     add_executable(macmu_machine_manager_test
         tests/machine_manager_test.cpp
         core/machine_manager.cpp
@@ -264,4 +286,15 @@ if(BUILD_TESTING)
     )
     target_compile_features(macmu_machine_manager_test PRIVATE cxx_std_17)
     add_test(NAME macmu_machine_manager_test COMMAND macmu_machine_manager_test)
+
+    add_executable(macmu_shell_options_test
+        tests/shell_options_test.cpp
+        core/shell_options.cpp
+    )
+    target_include_directories(macmu_shell_options_test PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/core"
+        "${CMAKE_CURRENT_SOURCE_DIR}/protocol"
+    )
+    target_compile_features(macmu_shell_options_test PRIVATE cxx_std_17)
+    add_test(NAME macmu_shell_options_test COMMAND macmu_shell_options_test)
 endif()

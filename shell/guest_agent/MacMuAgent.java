@@ -10,6 +10,7 @@ import android.graphics.Canvas;
 import android.graphics.Point;
 import android.graphics.drawable.Drawable;
 import android.hardware.display.DisplayManager;
+import android.hardware.input.InputManager;
 import android.os.IBinder;
 import android.os.Looper;
 import android.os.SystemClock;
@@ -23,15 +24,21 @@ import android.view.InputEvent;
 import android.view.MotionEvent;
 
 import java.io.BufferedReader;
+import java.io.BufferedInputStream;
 import java.io.BufferedWriter;
 import java.io.ByteArrayOutputStream;
+import java.io.File;
 import java.io.FileDescriptor;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.OutputStreamWriter;
 import java.lang.reflect.Method;
 import java.nio.charset.StandardCharsets;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -48,6 +55,47 @@ public final class MacMuAgent {
     private static final int VSOCK_DATA_NEW_TRANSPORT_PORT = 5002;
     private static final String GOLDFISH_PIPE_DEVICE = "/dev/goldfish_pipe_dprctd";
     private static final long RECONNECT_DELAY_MS = 1000;
+    private static final long MAX_APK_BYTES = 2L * 1024 * 1024 * 1024;
+    private static final int CONTROL_LINE_LIMIT = 64 * 1024;
+    private static final int UHID_CREATE2 = 11;
+    private static final int UHID_INPUT2 = 12;
+    private static final short BUS_VIRTUAL = 0x06;
+    private static final int UHID_EVENT_BYTES = 4380;
+    private static final int HID_KEYBOARD_REPORT_BYTES = 8;
+    private static final byte[] HID_KEYBOARD_REPORT_DESCRIPTOR = new byte[] {
+            0x05, 0x01,       // Usage Page (Generic Desktop)
+            0x09, 0x06,       // Usage (Keyboard)
+            (byte) 0xa1, 0x01, // Collection (Application)
+            0x05, 0x07,       // Usage Page (Keyboard)
+            0x19, (byte) 0xe0, // Usage Minimum (Left Control)
+            0x29, (byte) 0xe7, // Usage Maximum (Right GUI)
+            0x15, 0x00,       // Logical Minimum (0)
+            0x25, 0x01,       // Logical Maximum (1)
+            0x75, 0x01,       // Report Size (1)
+            (byte) 0x95, 0x08, // Report Count (8)
+            (byte) 0x81, 0x02, // Input (Data, Variable, Absolute)
+            0x75, 0x08,       // Report Size (8)
+            (byte) 0x95, 0x01, // Report Count (1)
+            (byte) 0x81, 0x01, // Input (Constant)
+            0x05, 0x08,       // Usage Page (LEDs)
+            0x19, 0x01,       // Usage Minimum (Num Lock)
+            0x29, 0x05,       // Usage Maximum (Kana)
+            0x75, 0x01,       // Report Size (1)
+            (byte) 0x95, 0x05, // Report Count (5)
+            (byte) 0x91, 0x02, // Output (Data, Variable, Absolute)
+            0x75, 0x03,       // Report Size (3)
+            (byte) 0x95, 0x01, // Report Count (1)
+            (byte) 0x91, 0x01, // Output (Constant)
+            0x05, 0x07,       // Usage Page (Keyboard)
+            0x19, 0x00,       // Usage Minimum (0)
+            0x29, 0x65,       // Usage Maximum (Application)
+            0x15, 0x00,       // Logical Minimum (0)
+            0x25, 0x65,       // Logical Maximum (101)
+            0x75, 0x08,       // Report Size (8)
+            (byte) 0x95, 0x06, // Report Count (6)
+            (byte) 0x81, 0x00, // Input (Data, Array)
+            (byte) 0xc0        // End Collection
+    };
 
     private final Object inputManager;
     private final Method injectInputEvent;
@@ -77,6 +125,11 @@ public final class MacMuAgent {
     private float mouseX;
     private float mouseY;
     private long mouseDownTime;
+    private final Map<Integer, UhidKeyboardDevice> uhidKeyboards = new HashMap<>();
+    private InputManager frameworkInputManager;
+    private Method addUniqueIdAssociationByPort;
+    private Method removeUniqueIdAssociationByPort;
+    private Method getDisplayUniqueId;
 
     private MacMuAgent(String socketPath) throws Exception {
         this.socketPath = socketPath;
@@ -148,7 +201,13 @@ public final class MacMuAgent {
                 }
             }
         } finally {
-            resetPointerState();
+            try {
+                resetPointerState();
+            } finally {
+                // Closing /dev/uhid unregisters every virtual keyboard and
+                // implicitly releases its complete report before reconnect.
+                closeAllUhidKeyboards();
+            }
         }
     }
 
@@ -210,8 +269,10 @@ public final class MacMuAgent {
     // ------------------------------------------------------------------
     // Control RPC connection: request/response line protocol used by the host
     // shell for app management ("<id> apps", "<id> launch <component> <display>",
-    // "<id> close <component> <display>"). Kept on a separate host socket so
-    // bulky responses never block input.
+    // "<id> close <component> <display>", "<id> uninstall <package>"). APK
+    // installation extends the line protocol with "<id> install <size>\n"
+    // followed by exactly |size| raw bytes. Kept on a separate host socket so
+    // bulky traffic never blocks input.
     // ------------------------------------------------------------------
 
     private void runControl(String ctrlSocketPath) {
@@ -233,17 +294,19 @@ public final class MacMuAgent {
     }
 
     private void handleControl(FileInputStream input, FileOutputStream output) throws Exception {
-        try (BufferedReader reader =
-                        new BufferedReader(
-                                new InputStreamReader(input, StandardCharsets.US_ASCII), 65536);
+        try (BufferedInputStream reader = new BufferedInputStream(input, 65536);
                 BufferedWriter writer =
                         new BufferedWriter(
                                 new OutputStreamWriter(output, StandardCharsets.US_ASCII),
                                 65536)) {
             String line;
-            while ((line = reader.readLine()) != null) {
+            while ((line = readAsciiLine(reader)) != null) {
                 try {
-                    handleControlLine(line, writer);
+                    handleControlLine(line, reader, writer);
+                } catch (ControlStreamException e) {
+                    // A malformed/truncated binary payload cannot be resynced
+                    // to the next ASCII request. Reconnect the whole pipe.
+                    throw e;
                 } catch (Exception e) {
                     e.printStackTrace(System.err);
                 }
@@ -251,7 +314,8 @@ public final class MacMuAgent {
         }
     }
 
-    private void handleControlLine(String line, BufferedWriter writer) throws Exception {
+    private void handleControlLine(
+            String line, BufferedInputStream input, BufferedWriter writer) throws Exception {
         if (line.isEmpty()) {
             return;
         }
@@ -302,12 +366,190 @@ public final class MacMuAgent {
                 writer.flush();
                 return;
             }
+            if (fields.length == 2 && "uninstall".equals(fields[0])) {
+                String error = uninstallPackage(fields[1]);
+                if (error == null) {
+                    writer.write(id + " ok\n");
+                } else {
+                    writer.write(id + " err " + error.replace('\n', ' ') + "\n");
+                }
+                writer.flush();
+                return;
+            }
+            if (fields.length == 2 && "install".equals(fields[0])) {
+                long byteCount;
+                try {
+                    byteCount = Long.parseLong(fields[1]);
+                } catch (NumberFormatException e) {
+                    throw new ControlStreamException("invalid APK byte count", e);
+                }
+                if (byteCount <= 0 || byteCount > MAX_APK_BYTES) {
+                    throw new ControlStreamException("APK byte count is out of range");
+                }
+                String error = receiveAndInstallApk(input, byteCount);
+                if (error == null) {
+                    writer.write(id + " ok\n");
+                } else {
+                    writer.write(id + " err " + error.replace('\n', ' ') + "\n");
+                }
+                writer.flush();
+                return;
+            }
             writer.write(id + " err unsupported command\n");
             writer.flush();
+        } catch (ControlStreamException e) {
+            throw e;
         } catch (Exception e) {
             writer.write(id + " err " + String.valueOf(e.getMessage()).replace('\n', ' ')
                     + "\n");
             writer.flush();
+        }
+    }
+
+    private static String readAsciiLine(InputStream input) throws IOException {
+        ByteArrayOutputStream line = new ByteArrayOutputStream(256);
+        while (true) {
+            int value = input.read();
+            if (value < 0) {
+                return line.size() == 0
+                        ? null
+                        : new String(line.toByteArray(), StandardCharsets.US_ASCII);
+            }
+            if (value == '\n') {
+                byte[] bytes = line.toByteArray();
+                int length = bytes.length;
+                if (length > 0 && bytes[length - 1] == '\r') {
+                    --length;
+                }
+                return new String(bytes, 0, length, StandardCharsets.US_ASCII);
+            }
+            if (line.size() >= CONTROL_LINE_LIMIT) {
+                throw new ControlStreamException("control request line is too long");
+            }
+            line.write(value);
+        }
+    }
+
+    private String receiveAndInstallApk(InputStream input, long byteCount) throws Exception {
+        File apk = new File("/data/local/tmp",
+                "macmu-install-" + Long.toUnsignedString(System.nanoTime()) + ".apk");
+        try {
+            try (FileOutputStream output = new FileOutputStream(apk)) {
+                byte[] buffer = new byte[256 * 1024];
+                long remaining = byteCount;
+                while (remaining > 0) {
+                    int wanted = (int) Math.min((long) buffer.length, remaining);
+                    int read = input.read(buffer, 0, wanted);
+                    if (read < 0) {
+                        throw new ControlStreamException("APK transfer ended early");
+                    }
+                    output.write(buffer, 0, read);
+                    remaining -= read;
+                }
+                output.getFD().sync();
+            } catch (ControlStreamException e) {
+                throw e;
+            } catch (IOException e) {
+                // The sender will continue with raw bytes after a local write
+                // failure; close and reconnect rather than parsing them as text.
+                throw new ControlStreamException("could not receive APK", e);
+            }
+            return installApkFile(apk);
+        } finally {
+            if (!apk.delete() && apk.exists()) {
+                System.err.println("MacMu could not remove temporary APK " + apk);
+            }
+        }
+    }
+
+    private static String installApkFile(File apk) throws Exception {
+        ProcessBuilder builder = new ProcessBuilder(
+                "/system/bin/cmd", "package", "install", "-r", "-t", "--user", "0",
+                apk.getAbsolutePath());
+        builder.redirectErrorStream(true);
+        Process process = builder.start();
+        boolean success = false;
+        String lastOutput = null;
+        try (BufferedReader reader = new BufferedReader(
+                new InputStreamReader(process.getInputStream(), StandardCharsets.UTF_8))) {
+            String line;
+            while ((line = reader.readLine()) != null) {
+                String trimmed = line.trim();
+                if (!trimmed.isEmpty()) {
+                    lastOutput = trimmed;
+                }
+                if ("Success".equals(trimmed)) {
+                    success = true;
+                }
+            }
+        }
+        int exitCode = process.waitFor();
+        if (exitCode == 0 && success) {
+            return null;
+        }
+        if (lastOutput != null) {
+            return lastOutput;
+        }
+        return "Package installer exited with code " + exitCode;
+    }
+
+    private String uninstallPackage(String packageName) throws Exception {
+        if (!packageName.matches("[A-Za-z0-9_]+(?:\\.[A-Za-z0-9_]+)+")) {
+            return "Invalid application package name";
+        }
+        if (!ensurePackageManager()) {
+            return "Package manager is unavailable";
+        }
+
+        ApplicationInfo info;
+        try {
+            info = pm.getApplicationInfo(packageName, 0);
+        } catch (PackageManager.NameNotFoundException e) {
+            return "Application is no longer installed";
+        }
+        // A `pm uninstall --user` call may merely hide a system package for
+        // one Android user. MacMu's Uninstall action is intentionally reserved
+        // for APKs that can actually be removed from the managed device.
+        if (isSystemApplication(info)) {
+            return "System applications cannot be uninstalled";
+        }
+
+        ProcessBuilder builder = new ProcessBuilder(
+                "/system/bin/cmd", "package", "uninstall", "--user", "0", packageName);
+        builder.redirectErrorStream(true);
+        Process process = builder.start();
+        boolean success = false;
+        String lastOutput = null;
+        try (BufferedReader reader = new BufferedReader(
+                new InputStreamReader(process.getInputStream(), StandardCharsets.UTF_8))) {
+            String line;
+            while ((line = reader.readLine()) != null) {
+                String trimmed = line.trim();
+                if (!trimmed.isEmpty()) {
+                    lastOutput = trimmed;
+                }
+                if ("Success".equals(trimmed)) {
+                    success = true;
+                }
+            }
+        }
+        int exitCode = process.waitFor();
+        if (exitCode == 0 && success) {
+            return null;
+        }
+        if (lastOutput != null) {
+            return lastOutput;
+        }
+        return "Package uninstaller exited with code " + exitCode;
+    }
+
+    private static final class ControlStreamException extends IOException {
+        ControlStreamException(String message) {
+            super(message);
+        }
+
+        ControlStreamException(String message, Throwable cause) {
+            super(message, cause);
         }
     }
 
@@ -394,8 +636,9 @@ public final class MacMuAgent {
 
     // Returns a JSON array of launcher entries. The baseline fields
     // {"pkg", "activity"} come from `cmd package query-activities`; when the
-    // PackageManager is reachable each entry is enriched with {"name", "icon"}
-    // where icon is a base64-encoded PNG (192x192) of the app's launcher icon.
+    // PackageManager is reachable each entry is enriched with
+    // {"name", "icon", "system", "uninstallable"}, where icon is a
+    // base64-encoded PNG (192x192) of the app's launcher icon.
     // Enrichment failures never drop an entry: a missing name/icon simply
     // means the host falls back to pkg/activity for that row.
     private String listLauncherApps() throws Exception {
@@ -427,11 +670,15 @@ public final class MacMuAgent {
         return apps.toString();
     }
 
-    // Best-effort: add "name" and "icon" to |app| for the given package. Any
-    // failure is logged and swallowed so the caller still emits the row.
+    // Best-effort: add presentation and uninstall metadata to |app| for the
+    // given package. Any failure is logged and swallowed so the caller still
+    // emits the row, but the host then keeps Uninstall disabled.
     private void enrichAppEntry(JSONObject app, String pkg) {
         try {
             ApplicationInfo info = pm.getApplicationInfo(pkg, 0);
+            boolean system = isSystemApplication(info);
+            app.put("system", system);
+            app.put("uninstallable", !system);
             CharSequence label = pm.getApplicationLabel(info);
             if (label != null && label.length() > 0) {
                 app.put("name", label.toString());
@@ -443,6 +690,11 @@ public final class MacMuAgent {
         } catch (Exception e) {
             e.printStackTrace(System.err);
         }
+    }
+
+    private static boolean isSystemApplication(ApplicationInfo info) {
+        int systemFlags = ApplicationInfo.FLAG_SYSTEM | ApplicationInfo.FLAG_UPDATED_SYSTEM_APP;
+        return (info.flags & systemFlags) != 0;
     }
 
     // Renders the app launcher icon into a 192x192 ARGB_8888 bitmap and returns
@@ -595,6 +847,7 @@ public final class MacMuAgent {
         // cached emulator->Android id mapping is about to go stale, and the
         // slot may be reused by a later display with a different Android id.
         if (displayId > 0) {
+            closeUhidKeyboard(displayId);
             invalidateDisplayId(displayId);
         }
         return error;
@@ -710,6 +963,249 @@ public final class MacMuAgent {
             float y = Float.parseFloat(fields[3]);
             int buttons = Integer.parseInt(fields[4]);
             injectMouseButton(displayId, x, y, buttons);
+            return;
+        }
+        if (fields.length == 3 && "k".equals(fields[0])) {
+            int emulatorDisplayId = Integer.parseInt(fields[1]);
+            byte[] report = decodeHex(fields[2], HID_KEYBOARD_REPORT_BYTES);
+            writeUhidKeyboardReport(emulatorDisplayId, report);
+        }
+    }
+
+    private static byte[] decodeHex(String value, int expectedBytes) {
+        if (value.length() != expectedBytes * 2) {
+            throw new IllegalArgumentException("invalid HID keyboard report length");
+        }
+        byte[] bytes = new byte[expectedBytes];
+        for (int i = 0; i < expectedBytes; ++i) {
+            int high = Character.digit(value.charAt(i * 2), 16);
+            int low = Character.digit(value.charAt(i * 2 + 1), 16);
+            if (high < 0 || low < 0) {
+                throw new IllegalArgumentException("invalid HID keyboard report");
+            }
+            bytes[i] = (byte) ((high << 4) | low);
+        }
+        return bytes;
+    }
+
+    private synchronized void writeUhidKeyboardReport(
+            int emulatorDisplayId, byte[] report) throws Exception {
+        if (emulatorDisplayId <= 0) {
+            throw new IllegalArgumentException("UHID keyboard requires an application display");
+        }
+        String displayUniqueId = displayUniqueIdFor(emulatorDisplayId);
+        UhidKeyboardDevice device = uhidKeyboards.get(emulatorDisplayId);
+        if (device != null && !device.displayUniqueId.equals(displayUniqueId)) {
+            // Emulator display slots are reused, while Android gives each new
+            // VirtualDisplay a fresh unique id. Never retain the old routing.
+            uhidKeyboards.remove(emulatorDisplayId);
+            closeUhidKeyboardDevice(device);
+            device = null;
+        }
+        if (device == null) {
+            device = createUhidKeyboard(emulatorDisplayId, displayUniqueId);
+            uhidKeyboards.put(emulatorDisplayId, device);
+        }
+        writeUhidEvent(device.fd, buildUhidInput2(report));
+    }
+
+    private String displayUniqueIdFor(int emulatorDisplayId) throws Exception {
+        int androidDisplayId = resolveAndroidDisplayId(emulatorDisplayId);
+        if (androidDisplayId < 0) {
+            throw new IllegalStateException("display " + emulatorDisplayId + " not found");
+        }
+        if (!ensureSystemContext()) {
+            throw new IllegalStateException("system context unavailable");
+        }
+        DisplayManager manager =
+                (DisplayManager) systemContext.getSystemService(Context.DISPLAY_SERVICE);
+        Display display = manager != null ? manager.getDisplay(androidDisplayId) : null;
+        if (display == null) {
+            invalidateDisplayId(emulatorDisplayId);
+            throw new IllegalStateException("Android display " + androidDisplayId + " unavailable");
+        }
+        if (getDisplayUniqueId == null) {
+            getDisplayUniqueId = Display.class.getMethod("getUniqueId");
+        }
+        String uniqueId = (String) getDisplayUniqueId.invoke(display);
+        if (uniqueId == null || uniqueId.isEmpty()) {
+            throw new IllegalStateException("Android display has no unique id");
+        }
+        return uniqueId;
+    }
+
+    private UhidKeyboardDevice createUhidKeyboard(
+            int emulatorDisplayId, String displayUniqueId) throws Exception {
+        if (frameworkInputManager == null) {
+            if (!ensureSystemContext()) {
+                throw new IllegalStateException("system context unavailable");
+            }
+            frameworkInputManager =
+                    (InputManager) systemContext.getSystemService(Context.INPUT_SERVICE);
+        }
+        if (frameworkInputManager == null) {
+            throw new IllegalStateException("input manager unavailable");
+        }
+        if (addUniqueIdAssociationByPort == null) {
+            addUniqueIdAssociationByPort = InputManager.class.getMethod(
+                    "addUniqueIdAssociationByPort", String.class, String.class);
+        }
+
+        String inputPort = "macmu:" + Os.getpid() + ":keyboard:" + emulatorDisplayId;
+        FileDescriptor fd = null;
+        boolean associated = false;
+        try {
+            fd = Os.open("/dev/uhid", OsConstants.O_RDWR, 0);
+            writeUhidEvent(fd, buildUhidCreate2(inputPort));
+            addUniqueIdAssociationByPort.invoke(
+                    frameworkInputManager, inputPort, displayUniqueId);
+            associated = true;
+
+            UhidKeyboardDevice device =
+                    new UhidKeyboardDevice(fd, inputPort, displayUniqueId, emulatorDisplayId);
+            startUhidEventDrainer(device);
+            System.err.println("MacMu UHID keyboard ready for display " + emulatorDisplayId
+                    + " (" + displayUniqueId + ")");
+            return device;
+        } catch (Exception e) {
+            if (fd != null) {
+                try {
+                    Os.close(fd);
+                } catch (Exception ignored) {
+                }
+            }
+            if (associated) {
+                removeUniqueIdAssociation(inputPort);
+            }
+            throw e;
+        }
+    }
+
+    private static byte[] buildUhidCreate2(String inputPort) {
+        // struct uhid_create2_req begins after the four-byte event type:
+        // name[128], phys[64], uniq[64], rd_size, bus, vendor/product/version/
+        // country, followed by the variable-length report descriptor.
+        ByteBuffer buffer = ByteBuffer
+                .allocate(280 + HID_KEYBOARD_REPORT_DESCRIPTOR.length)
+                .order(ByteOrder.nativeOrder());
+        buffer.putInt(UHID_CREATE2);
+        byte[] name = "MacMu Keyboard".getBytes(StandardCharsets.UTF_8);
+        buffer.put(name, 0, Math.min(name.length, 127));
+        buffer.position(4 + 128);
+        byte[] phys = inputPort.getBytes(StandardCharsets.US_ASCII);
+        buffer.put(phys, 0, Math.min(phys.length, 63));
+        buffer.position(4 + 256);
+        buffer.putShort((short) HID_KEYBOARD_REPORT_DESCRIPTOR.length);
+        buffer.putShort(BUS_VIRTUAL);
+        buffer.putInt(0);  // vendor
+        buffer.putInt(0);  // product
+        buffer.putInt(0);  // version
+        buffer.putInt(0);  // country
+        buffer.put(HID_KEYBOARD_REPORT_DESCRIPTOR);
+        return buffer.array();
+    }
+
+    private static byte[] buildUhidInput2(byte[] report) {
+        if (report.length != HID_KEYBOARD_REPORT_BYTES) {
+            throw new IllegalArgumentException("invalid HID keyboard report size");
+        }
+        ByteBuffer buffer = ByteBuffer
+                .allocate(6 + report.length)
+                .order(ByteOrder.nativeOrder());
+        buffer.putInt(UHID_INPUT2);
+        buffer.putShort((short) report.length);
+        buffer.put(report);
+        return buffer.array();
+    }
+
+    private static void writeUhidEvent(FileDescriptor fd, byte[] event) throws IOException {
+        try {
+            int written = Os.write(fd, event, 0, event.length);
+            if (written != event.length) {
+                throw new IOException("short /dev/uhid write: " + written + "/" + event.length);
+            }
+        } catch (android.system.ErrnoException e) {
+            throw new IOException("/dev/uhid write failed", e);
+        }
+    }
+
+    private static void startUhidEventDrainer(UhidKeyboardDevice device) {
+        Thread reader = new Thread(() -> {
+            byte[] event = new byte[UHID_EVENT_BYTES];
+            while (!device.closed) {
+                try {
+                    int read = Os.read(device.fd, event, 0, event.length);
+                    if (read <= 0) {
+                        break;
+                    }
+                    // UHID_START/OPEN/OUTPUT reports must be drained so the
+                    // kernel queue cannot fill. MacMu currently has no host LED
+                    // surface, so keyboard LED output needs no further action.
+                } catch (Exception e) {
+                    if (!device.closed) {
+                        System.err.println("MacMu UHID event read failed: " + e);
+                    }
+                    break;
+                }
+            }
+        }, "macmu-uhid-" + device.emulatorDisplayId);
+        reader.setDaemon(true);
+        reader.start();
+    }
+
+    private synchronized void closeUhidKeyboard(int emulatorDisplayId) {
+        UhidKeyboardDevice device = uhidKeyboards.remove(emulatorDisplayId);
+        if (device != null) {
+            closeUhidKeyboardDevice(device);
+        }
+    }
+
+    private synchronized void closeAllUhidKeyboards() {
+        List<UhidKeyboardDevice> devices = new ArrayList<>(uhidKeyboards.values());
+        uhidKeyboards.clear();
+        for (UhidKeyboardDevice device : devices) {
+            closeUhidKeyboardDevice(device);
+        }
+    }
+
+    private void closeUhidKeyboardDevice(UhidKeyboardDevice device) {
+        device.closed = true;
+        try {
+            Os.close(device.fd);
+        } catch (Exception ignored) {
+        }
+        removeUniqueIdAssociation(device.inputPort);
+    }
+
+    private void removeUniqueIdAssociation(String inputPort) {
+        if (frameworkInputManager == null) {
+            return;
+        }
+        try {
+            if (removeUniqueIdAssociationByPort == null) {
+                removeUniqueIdAssociationByPort = InputManager.class.getMethod(
+                        "removeUniqueIdAssociationByPort", String.class);
+            }
+            removeUniqueIdAssociationByPort.invoke(frameworkInputManager, inputPort);
+        } catch (Exception e) {
+            System.err.println("MacMu could not remove UHID display association: " + e);
+        }
+    }
+
+    private static final class UhidKeyboardDevice {
+        final FileDescriptor fd;
+        final String inputPort;
+        final String displayUniqueId;
+        final int emulatorDisplayId;
+        volatile boolean closed;
+
+        UhidKeyboardDevice(
+                FileDescriptor fd, String inputPort, String displayUniqueId,
+                int emulatorDisplayId) {
+            this.fd = fd;
+            this.inputPort = inputPort;
+            this.displayUniqueId = displayUniqueId;
+            this.emulatorDisplayId = emulatorDisplayId;
         }
     }
 

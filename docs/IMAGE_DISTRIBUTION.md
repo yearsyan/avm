@@ -119,16 +119,19 @@ manifest. Unchanged 64 MiB regions remain CDN and client-cache hits.
 ## MacMu Import
 
 When the managed system image is absent and no explicit source was supplied,
-MacMu automatically initializes from:
+MacMu does not start a download. The setup screen offers **Official Image** and
+**Other Source…**. The official option uses:
 
 ```text
 https://storage.macmu.org/images/aosp16-arm64/manifest.json
 ```
 
-The **Import Image…** picker accepts:
+The other-source picker accepts:
 
 - A local complete `.zip`.
 - A local chunk `manifest.json`.
+- A local directory containing `manifest.json` and its relative `objects/`
+  files.
 
 For a hosted manifest, launch MacMu once with:
 
@@ -137,24 +140,34 @@ build/cmake/distribution/emulator/macmu \
   --import-image https://cdn.example.com/macmu/images/aosp16-arm64/manifest.json
 ```
 
+`--import-image` also accepts a chunk directory directly:
+
+```sh
+build/cmake/distribution/emulator/macmu \
+  --import-image /path/to/macmu-aosp16-arm64-chunked
+```
+
 The equivalent environment variable is:
 
 ```text
 MACMU_IMPORT_IMAGE
 ```
 
-An explicit source overrides the hosted default. Development or offline runs
-can disable the default initialization request with:
+An explicit source starts unattended and bypasses the chooser. Automation that
+wants the official image can opt in with:
 
 ```sh
-build/cmake/distribution/emulator/macmu --no-auto-image-import
+build/cmake/distribution/emulator/macmu --auto-image-import
 ```
 
 or:
 
 ```text
-MACMU_AUTO_IMPORT_IMAGE=0
+MACMU_AUTO_IMPORT_IMAGE=1
 ```
+
+`--no-auto-image-import` or `MACMU_AUTO_IMPORT_IMAGE=0` forces the interactive
+chooser when a launcher or wrapper otherwise enables automatic import.
 
 MacMu imports a source only when its managed system image is absent.
 HTTPS object downloads use eight workers, retries, byte-range resume, compressed

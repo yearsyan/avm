@@ -349,7 +349,8 @@ The product entry point is the shell:
 ```
 
 To exercise first-run import without using the file picker, supply either a
-local complete ZIP, a local manifest, or an HTTPS manifest:
+local complete ZIP, a local manifest, a directory containing `manifest.json`,
+or an HTTPS manifest:
 
 ```sh
 /Users/u/workspace/aemu/build/cmake/distribution/emulator/macmu \
@@ -359,19 +360,26 @@ local complete ZIP, a local manifest, or an HTTPS manifest:
   --import-image /path/to/macmu-aosp16-arm64-chunked/manifest.json
 
 /Users/u/workspace/aemu/build/cmake/distribution/emulator/macmu \
+  --import-image /path/to/macmu-aosp16-arm64-chunked
+
+/Users/u/workspace/aemu/build/cmake/distribution/emulator/macmu \
   --import-image https://cdn.example.com/macmu/aosp16-arm64/manifest.json
 ```
 
 The import option is used only when the managed image directory is absent.
-Without an explicit import option, a fresh MacMu installation automatically
+Without an explicit import option, a fresh MacMu installation waits for the
+user to choose **Official Image** or **Other Source…**. The official option
 uses:
 
 ```text
 https://storage.macmu.org/images/aosp16-arm64/manifest.json
 ```
 
-Use `--no-auto-image-import` or `MACMU_AUTO_IMPORT_IMAGE=0` for offline
-development runs that should remain at the manual import screen.
+Use `--auto-image-import` or `MACMU_AUTO_IMPORT_IMAGE=1` for unattended runs
+that should select the official image automatically. An explicit
+`--import-image` source also starts without the chooser. Use
+`--no-auto-image-import` to force the chooser if a wrapper enables automatic
+import through the environment.
 
 For strict original-image validation, use the original AOSP `ramdisk.img`:
 

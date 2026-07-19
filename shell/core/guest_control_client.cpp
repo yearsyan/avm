@@ -2,6 +2,7 @@
 
 #include "guest_control_client.h"
 
+#include <algorithm>
 #include <cerrno>
 #include <chrono>
 #include <cstdio>
@@ -10,6 +11,7 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/un.h>
 #include <unistd.h>
 #include <vector>
@@ -18,6 +20,9 @@
 #include "unix_listener.h"
 
 namespace {
+
+constexpr uint64_t kMaximumApkBytes = 2ull * 1024 * 1024 * 1024;
+constexpr size_t kApkTransferBufferBytes = 256 * 1024;
 
 void close_fd(int fd) {
     if (fd >= 0) {
@@ -95,13 +100,29 @@ void GuestControlClient::request(const std::string& command, uint64_t timeout_ms
     const std::string line = std::string(prefix) + command + "\n";
 
     bool writeFailed = false;
+    const char* failureMessage = "guest control write failed";
     {
+        // A binary APK payload must remain contiguous with its install header.
+        // Avoid blocking a caller (usually AppKit's main thread) behind a large
+        // transfer: fail fast and let periodic callers retry naturally.
+        std::unique_lock<std::mutex> lock(writeMutex_, std::defer_lock);
+        if (!lock.try_lock()) {
+            if (fileTransferActive_.load(std::memory_order_acquire)) {
+                writeFailed = true;
+                failureMessage = "APK transfer in progress";
+            } else {
+                lock.lock();
+            }
+        }
+        if (!writeFailed && fileTransferActive_.load(std::memory_order_acquire)) {
+            writeFailed = true;
+            failureMessage = "APK transfer in progress";
+        }
         // Re-load the fd under writeMutex_: the accept thread closes a dead
         // client's fd under the same mutex, so the fd sampled here cannot be
         // closed (or reused by the kernel) while we are sending on it.
-        std::lock_guard<std::mutex> lock(writeMutex_);
         const int fd = clientFd_.load(std::memory_order_acquire);
-        if (fd < 0) {
+        if (!writeFailed && fd < 0) {
             writeFailed = true;
         }
         size_t done = 0;
@@ -120,7 +141,133 @@ void GuestControlClient::request(const std::string& command, uint64_t timeout_ms
     if (writeFailed) {
         ResponseCallback failed = pending_.take(requestId);
         if (failed) {
-            failed(false, "guest control write failed");
+            failed(false, failureMessage);
+        }
+    }
+}
+
+void GuestControlClient::install_apk(const std::string& apk_path, uint64_t timeout_ms,
+                                     ResponseCallback callback) {
+    if (fileTransferActive_.exchange(true, std::memory_order_acq_rel)) {
+        if (callback) {
+            callback(false, "another APK transfer is already in progress");
+        }
+        return;
+    }
+    const auto releaseTransfer = [this] {
+        fileTransferActive_.store(false, std::memory_order_release);
+    };
+
+    const int apkFd = open(apk_path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (apkFd < 0) {
+        releaseTransfer();
+        if (callback) {
+            callback(false, std::string("could not open APK: ") + std::strerror(errno));
+        }
+        return;
+    }
+
+    struct stat apkStat = {};
+    if (fstat(apkFd, &apkStat) != 0 || !S_ISREG(apkStat.st_mode) || apkStat.st_size <= 0) {
+        close(apkFd);
+        releaseTransfer();
+        if (callback) {
+            callback(false, "APK must be a non-empty regular file");
+        }
+        return;
+    }
+    const uint64_t apkSize = static_cast<uint64_t>(apkStat.st_size);
+    if (apkSize > kMaximumApkBytes) {
+        close(apkFd);
+        releaseTransfer();
+        if (callback) {
+            callback(false, "APK exceeds the 2 GiB transfer limit");
+        }
+        return;
+    }
+    if (clientFd_.load(std::memory_order_acquire) < 0) {
+        close(apkFd);
+        releaseTransfer();
+        if (callback) {
+            callback(false, "guest agent not connected");
+        }
+        return;
+    }
+
+    const uint64_t requestId = nextRequestId_.fetch_add(1, std::memory_order_relaxed);
+    if (callback) {
+        pending_.add(requestId, std::move(callback), timeout_ms);
+    }
+    const std::string header = std::to_string(requestId) + " install " +
+                               std::to_string(apkSize) + "\n";
+
+    bool writeFailed = false;
+    std::vector<char> buffer(kApkTransferBufferBytes);
+    {
+        // Hold the writer for the header and the entire file. Interleaving even
+        // one ASCII request would corrupt the guest's exact-byte binary read.
+        std::lock_guard<std::mutex> lock(writeMutex_);
+        const int fd = clientFd_.load(std::memory_order_acquire);
+        if (fd < 0) {
+            writeFailed = true;
+        }
+
+        size_t headerDone = 0;
+        while (!writeFailed && headerDone < header.size()) {
+            const ssize_t n = send(fd, header.data() + headerDone, header.size() - headerDone, 0);
+            if (n > 0) {
+                headerDone += static_cast<size_t>(n);
+            } else if (n < 0 && errno == EINTR) {
+                continue;
+            } else {
+                writeFailed = true;
+            }
+        }
+
+        uint64_t remaining = apkSize;
+        while (!writeFailed && remaining > 0 &&
+               !stopRequested_.load(std::memory_order_acquire)) {
+            const size_t wanted = static_cast<size_t>(
+                std::min<uint64_t>(remaining, static_cast<uint64_t>(buffer.size())));
+            const ssize_t bytesRead = read(apkFd, buffer.data(), wanted);
+            if (bytesRead < 0 && errno == EINTR) {
+                continue;
+            }
+            if (bytesRead <= 0) {
+                writeFailed = true;
+                break;
+            }
+            size_t sent = 0;
+            while (sent < static_cast<size_t>(bytesRead)) {
+                const ssize_t n = send(fd, buffer.data() + sent,
+                                       static_cast<size_t>(bytesRead) - sent, 0);
+                if (n > 0) {
+                    sent += static_cast<size_t>(n);
+                } else if (n < 0 && errno == EINTR) {
+                    continue;
+                } else {
+                    writeFailed = true;
+                    break;
+                }
+            }
+            remaining -= static_cast<uint64_t>(bytesRead);
+        }
+        if (remaining != 0) {
+            writeFailed = true;
+        }
+        if (writeFailed && fd >= 0) {
+            // A partial binary message cannot be resynchronized. Force this
+            // agent connection to reconnect before accepting more commands.
+            shutdown(fd, SHUT_RDWR);
+        }
+    }
+    close(apkFd);
+    releaseTransfer();
+
+    if (writeFailed) {
+        ResponseCallback failed = pending_.take(requestId);
+        if (failed) {
+            failed(false, "APK transfer failed");
         }
     }
 }

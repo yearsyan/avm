@@ -1072,6 +1072,18 @@ bool macmu_extract_system_image_source(
     return false;
   }
   localPath = fs::absolute(localPath, ec).string();
+  if (!ec && fs::is_directory(localPath, ec)) {
+    const std::string directoryPath = localPath;
+    localPath = (fs::path(localPath) / "manifest.json").string();
+    ec.clear();
+    if (!fs::is_regular_file(localPath, ec)) {
+      if (error) {
+        *error = "image source directory does not contain manifest.json: " +
+                 directoryPath;
+      }
+      return false;
+    }
+  }
   if (ec || !fs::is_regular_file(localPath, ec)) {
     if (error) {
       *error = "image source does not exist: " + localPath;

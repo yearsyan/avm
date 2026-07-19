@@ -8,6 +8,7 @@
 #include <cstdint>
 
 #include "guest_input_sender.h"
+#include "hid_keyboard.h"
 #include "input_sender.h"
 #include "macmu_input_protocol.h"
 #include "macmu_surface_renderer.h"
@@ -75,13 +76,33 @@ float scroll_axis_value(NSEvent* event, CGFloat delta) {
     return static_cast<float>(delta);
 }
 
+NSEventModifierFlags modifier_flag_for_hid_usage(uint8_t usage) {
+    switch (usage) {
+        case 0xe0:
+        case 0xe4:
+            return NSEventModifierFlagControl;
+        case 0xe1:
+        case 0xe5:
+            return NSEventModifierFlagShift;
+        case 0xe2:
+        case 0xe6:
+            return NSEventModifierFlagOption;
+        case 0xe3:
+        case 0xe7:
+            return NSEventModifierFlagCommand;
+        default:
+            return 0;
+    }
+}
+
 }  // namespace
 
 @interface MacMuInputView : MTKView
 - (instancetype)initWithFrame:(NSRect)frame
                        device:(id<MTLDevice>)device
                   inputSender:(InputSender*)inputSender
-              guestInputSender:(GuestInputSender*)guestInputSender;
+              guestInputSender:(GuestInputSender*)guestInputSender
+                     displayId:(uint32_t)displayId;
 - (void)resetInputState;
 - (BOOL)sendTouchKind:(macmu::InputEventKind)kind
              display:(uint32_t)displayId
@@ -93,11 +114,15 @@ float scroll_axis_value(NSEvent* event, CGFloat delta) {
                                 y:(int)y
                           buttons:(uint32_t)buttons
                         transport:(InputTransport)transport;
+- (BOOL)sendKeyboardReport;
+- (BOOL)synchronizeKeyboardModifiers:(NSEventModifierFlags)flags;
 @end
 
 @implementation MacMuInputView {
     InputSender* _inputSender;  // not owned
     GuestInputSender* _guestInputSender;  // not owned
+    uint32_t _displayId;
+    macmu::shell::HidKeyboardState _keyboardState;
     MacMuSurfaceRendererRef _renderer;
     NSTrackingArea* _trackingArea;
     BOOL _leftTouchActive;
@@ -114,13 +139,15 @@ float scroll_axis_value(NSEvent* event, CGFloat delta) {
 - (instancetype)initWithFrame:(NSRect)frame
                        device:(id<MTLDevice>)device
                   inputSender:(InputSender*)inputSender
-              guestInputSender:(GuestInputSender*)guestInputSender {
+              guestInputSender:(GuestInputSender*)guestInputSender
+                     displayId:(uint32_t)displayId {
     self = [super initWithFrame:frame device:device];
     if (!self) {
         return nil;
     }
     _inputSender = inputSender;
     _guestInputSender = guestInputSender;
+    _displayId = displayId;
     _renderer = nil;
     _leftTouchActive = NO;
     _leftTouchTransport = InputTransport::kNone;
@@ -139,6 +166,9 @@ float scroll_axis_value(NSEvent* event, CGFloat delta) {
 }
 
 - (void)resetInputState {
+    if (_keyboardState.release_all()) {
+        [self sendKeyboardReport];
+    }
     _leftTouchActive = NO;
     _leftTouchTransport = InputTransport::kNone;
     _mouseTransport = InputTransport::kNone;
@@ -150,6 +180,97 @@ float scroll_axis_value(NSEvent* event, CGFloat delta) {
 
 - (BOOL)acceptsFirstMouse:(NSEvent*)event {
     return YES;
+}
+
+- (BOOL)sendKeyboardReport {
+    return _guestInputSender &&
+           _guestInputSender->send_keyboard_report(_displayId, _keyboardState.report());
+}
+
+- (BOOL)synchronizeKeyboardModifiers:(NSEventModifierFlags)flags {
+    struct ModifierGroup {
+        NSEventModifierFlags flag;
+        uint8_t leftUsage;
+        uint8_t rightUsage;
+    };
+    static constexpr ModifierGroup kGroups[] = {
+        {NSEventModifierFlagControl, 0xe0, 0xe4},
+        {NSEventModifierFlagShift, 0xe1, 0xe5},
+        {NSEventModifierFlagOption, 0xe2, 0xe6},
+        {NSEventModifierFlagCommand, 0xe3, 0xe7},
+    };
+
+    BOOL changed = NO;
+    for (const ModifierGroup& group : kGroups) {
+        const bool leftPressed = _keyboardState.is_pressed(group.leftUsage);
+        const bool rightPressed = _keyboardState.is_pressed(group.rightUsage);
+        if ((flags & group.flag) == 0) {
+            changed |= _keyboardState.set_key(group.leftUsage, false);
+            changed |= _keyboardState.set_key(group.rightUsage, false);
+        } else if (!leftPressed && !rightPressed) {
+            // The view may become first responder while a modifier is already
+            // held. Preserve the generic AppKit state as the left-side key;
+            // later flagsChanged events refine it to the physical side.
+            changed |= _keyboardState.set_key(group.leftUsage, true);
+        }
+    }
+    return changed;
+}
+
+- (void)keyDown:(NSEvent*)event {
+    const uint8_t usage = macmu::shell::mac_virtual_key_to_hid_usage(event.keyCode);
+    if (usage == 0) {
+        [super keyDown:event];
+        return;
+    }
+    if (event.isARepeat) {
+        // UHID represents current key state; Android generates repeats while
+        // the usage remains present in subsequent keyboard scans.
+        return;
+    }
+    BOOL changed = [self synchronizeKeyboardModifiers:event.modifierFlags];
+    changed |= _keyboardState.set_key(usage, true);
+    if (changed) {
+        [self sendKeyboardReport];
+    }
+}
+
+- (void)keyUp:(NSEvent*)event {
+    const uint8_t usage = macmu::shell::mac_virtual_key_to_hid_usage(event.keyCode);
+    if (usage == 0) {
+        [super keyUp:event];
+        return;
+    }
+    BOOL changed = [self synchronizeKeyboardModifiers:event.modifierFlags];
+    changed |= _keyboardState.set_key(usage, false);
+    if (changed) {
+        [self sendKeyboardReport];
+    }
+}
+
+- (void)flagsChanged:(NSEvent*)event {
+    const uint8_t usage = macmu::shell::mac_virtual_key_to_hid_usage(event.keyCode);
+    if (usage == 0x39) {
+        // macOS exposes Caps Lock as a toggled flagsChanged event rather than
+        // a conventional down/up pair. Pulse the HID usage so Android toggles
+        // its own physical-keyboard lock state without leaving the key stuck.
+        _keyboardState.set_key(usage, true);
+        [self sendKeyboardReport];
+        _keyboardState.set_key(usage, false);
+        [self sendKeyboardReport];
+        return;
+    }
+    const NSEventModifierFlags flag = modifier_flag_for_hid_usage(usage);
+    if (flag == 0) {
+        [super flagsChanged:event];
+        return;
+    }
+
+    const bool wasPressed = _keyboardState.is_pressed(usage);
+    const bool pressed = !wasPressed && (event.modifierFlags & flag) != 0;
+    if (_keyboardState.set_key(usage, pressed)) {
+        [self sendKeyboardReport];
+    }
 }
 
 - (void)viewDidMoveToWindow {
@@ -448,11 +569,13 @@ float scroll_axis_value(NSEvent* event, CGFloat delta) {
 MTKView* macmu_input_view_create(NSRect frame,
                                  id<MTLDevice> device,
                                  InputSender* input_sender,
-                                 GuestInputSender* guest_input_sender) {
+                                 GuestInputSender* guest_input_sender,
+                                 uint32_t display_id) {
     return [[MacMuInputView alloc] initWithFrame:frame
                                          device:device
                                     inputSender:input_sender
-                                guestInputSender:guest_input_sender];
+                                guestInputSender:guest_input_sender
+                                       displayId:display_id];
 }
 
 void macmu_input_view_set_renderer(MTKView* view, MacMuSurfaceRendererRef renderer) {

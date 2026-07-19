@@ -208,6 +208,25 @@ bool GuestInputSender::send_mouse_button(uint32_t display_id, int x, int y, uint
     return send_line(line, len, true);
 }
 
+bool GuestInputSender::send_keyboard_report(
+    uint32_t display_id,
+    const std::array<uint8_t, macmu::shell::kHidKeyboardReportSize>& report) {
+    static constexpr char kHex[] = "0123456789abcdef";
+    char line[64];
+    const int prefix = std::snprintf(line, sizeof(line), "k %u ", display_id);
+    if (prefix <= 0 ||
+        prefix + static_cast<int>(report.size() * 2) + 1 >= static_cast<int>(sizeof(line))) {
+        return false;
+    }
+    size_t offset = static_cast<size_t>(prefix);
+    for (uint8_t byte : report) {
+        line[offset++] = kHex[byte >> 4];
+        line[offset++] = kHex[byte & 0x0f];
+    }
+    line[offset++] = '\n';
+    return send_line(line, static_cast<int>(offset), true);
+}
+
 void GuestInputSender::accept_thread() {
     while (!m_stopRequested.load(std::memory_order_acquire)) {
         const int listenFd = m_listenFd.load(std::memory_order_acquire);
