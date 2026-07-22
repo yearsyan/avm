@@ -61,6 +61,7 @@ if(NOT MACMU_ANDROID_SDK_ROOT AND DEFINED ENV{ANDROID_HOME})
     set(MACMU_ANDROID_SDK_ROOT "$ENV{ANDROID_HOME}")
 endif()
 find_program(MACMU_JAVAC javac)
+find_program(MACMU_JAVA java)
 find_program(MACMU_JAR jar)
 find_program(MACMU_D8 d8
     HINTS
@@ -255,6 +256,34 @@ install(FILES resources/MacMu.icns
 )
 
 if(BUILD_TESTING)
+    if(MACMU_JAVA AND MACMU_JAVAC AND EXISTS "${MACMU_ANDROID_JAR}")
+        set(MACMU_GUEST_AGENT_PROTOCOL_TEST_CLASSES
+            "${CMAKE_CURRENT_BINARY_DIR}/guest-agent-protocol-test-classes")
+        set(MACMU_GUEST_AGENT_PROTOCOL_TEST_CLASS
+            "${MACMU_GUEST_AGENT_PROTOCOL_TEST_CLASSES}/dev/macmu/agent/MacMuAgentProtocolTest.class")
+        add_custom_command(
+            OUTPUT "${MACMU_GUEST_AGENT_PROTOCOL_TEST_CLASS}"
+            COMMAND "${CMAKE_COMMAND}" -E rm -rf
+                    "${MACMU_GUEST_AGENT_PROTOCOL_TEST_CLASSES}"
+            COMMAND "${CMAKE_COMMAND}" -E make_directory
+                    "${MACMU_GUEST_AGENT_PROTOCOL_TEST_CLASSES}"
+            COMMAND "${MACMU_JAVAC}" --release 17 -classpath "${MACMU_ANDROID_JAR}"
+                    -d "${MACMU_GUEST_AGENT_PROTOCOL_TEST_CLASSES}"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/guest_agent/MacMuAgent.java"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/tests/MacMuAgentProtocolTest.java"
+            DEPENDS
+                "${CMAKE_CURRENT_SOURCE_DIR}/guest_agent/MacMuAgent.java"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/MacMuAgentProtocolTest.java"
+            VERBATIM
+        )
+        add_custom_target(macmu_guest_agent_protocol_test_classes ALL
+            DEPENDS "${MACMU_GUEST_AGENT_PROTOCOL_TEST_CLASS}")
+        add_test(NAME macmu_guest_agent_protocol_test
+            COMMAND "${MACMU_JAVA}" -classpath
+                    "${MACMU_GUEST_AGENT_PROTOCOL_TEST_CLASSES}:${MACMU_ANDROID_JAR}"
+                    dev.macmu.agent.MacMuAgentProtocolTest)
+    endif()
+
     add_executable(macmu_hid_keyboard_test
         tests/hid_keyboard_test.cpp
         core/hid_keyboard.cpp

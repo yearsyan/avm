@@ -34,6 +34,7 @@ import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
+import java.io.OutputStream;
 import java.io.OutputStreamWriter;
 import java.lang.reflect.Method;
 import java.nio.charset.StandardCharsets;
@@ -57,6 +58,7 @@ public final class MacMuAgent {
     private static final long RECONNECT_DELAY_MS = 1000;
     private static final long MAX_APK_BYTES = 2L * 1024 * 1024 * 1024;
     private static final int CONTROL_LINE_LIMIT = 64 * 1024;
+    private static final int CONTROL_BUFFER_BYTES = 64 * 1024;
     private static final int UHID_CREATE2 = 11;
     private static final int UHID_INPUT2 = 12;
     private static final short BUS_VIRTUAL = 0x06;
@@ -294,11 +296,8 @@ public final class MacMuAgent {
     }
 
     private void handleControl(FileInputStream input, FileOutputStream output) throws Exception {
-        try (BufferedInputStream reader = new BufferedInputStream(input, 65536);
-                BufferedWriter writer =
-                        new BufferedWriter(
-                                new OutputStreamWriter(output, StandardCharsets.US_ASCII),
-                                65536)) {
+        try (BufferedInputStream reader = new BufferedInputStream(input, CONTROL_BUFFER_BYTES);
+                BufferedWriter writer = createControlResponseWriter(output)) {
             String line;
             while ((line = readAsciiLine(reader)) != null) {
                 try {
@@ -312,6 +311,15 @@ public final class MacMuAgent {
                 }
             }
         }
+    }
+
+    // Request commands and line framing are ASCII, but response payloads can
+    // contain localized application labels and error messages. Encode the
+    // complete response as UTF-8 so non-ASCII JSON strings survive intact.
+    static BufferedWriter createControlResponseWriter(OutputStream output) {
+        return new BufferedWriter(
+                new OutputStreamWriter(output, StandardCharsets.UTF_8),
+                CONTROL_BUFFER_BYTES);
     }
 
     private void handleControlLine(

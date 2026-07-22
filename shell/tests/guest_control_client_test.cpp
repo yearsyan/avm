@@ -122,6 +122,8 @@ int main() {
         const char rawApkBytes[] = {'P', 'K', '\x03', '\x04', '\0', 'b', 'i', 'n', 'a', 'r', 'y',
                                     '\n', 'l', 'i', 'n',  'e',  '\r', '\n', 'e', 'n', 'd'};
         const std::string apkBytes(rawApkBytes, sizeof(rawApkBytes));
+        const std::string appsJson =
+            R"([{"pkg":"com.example.chat","activity":"com.example.chat.MainActivity","name":"微信"}])";
         {
             std::ofstream apk(files.apkPath, std::ios::binary | std::ios::trunc);
             apk.write(apkBytes.data(), static_cast<std::streamsize>(apkBytes.size()));
@@ -165,7 +167,7 @@ int main() {
                 uint64_t appsId = 0;
                 apps >> appsId >> command;
                 require(command == "apps", "line protocol did not resume after APK payload");
-                send_all(fd, std::to_string(appsId) + " ok []\n");
+                send_all(fd, std::to_string(appsId) + " ok " + appsJson + "\n");
 
                 const std::string uninstallLine = read_line(fd);
                 std::istringstream uninstall(uninstallLine);
@@ -228,7 +230,8 @@ int main() {
             require(responseChanged.wait_for(lock, std::chrono::seconds(3),
                                              [&] { return appsDone; }),
                     "apps response timed out");
-            require(appsOk && appsPayload == "[]", "apps response was malformed");
+            require(appsOk && appsPayload == appsJson,
+                    "UTF-8 apps response was malformed");
         }
 
         bool uninstallDone = false;

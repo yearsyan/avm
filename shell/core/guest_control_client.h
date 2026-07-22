@@ -5,7 +5,7 @@
 // dedicated host Unix socket (separate from the input socket so bulky
 // responses never head-of-line block input events).
 //
-// Wire protocol (ASCII lines):
+// Wire protocol (ASCII framing with UTF-8 response payloads):
 //   host -> agent:  "v\n" handshake, then "<id> <command> [args...]\n"
 //   agent -> host:  "ok\n" handshake reply, then "<id> ok [payload]\n"
 //                   or "<id> err [message]\n"
