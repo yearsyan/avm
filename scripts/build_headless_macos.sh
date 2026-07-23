@@ -110,6 +110,7 @@ shell_cmake_args=(
 cmake "${shell_cmake_args[@]}"
 cmake --build "${SHELL_BUILD_DIR}" --config Release --target \
   macmu_shell \
+  macmu_guest_agent_protocol_test_classes \
   macmu_hid_keyboard_test \
   macmu_guest_control_client_test \
   macmu_shell_options_test \
